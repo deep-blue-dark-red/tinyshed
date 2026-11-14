@@ -235,10 +235,8 @@ def parse_cores(s):
 def host_cores(cfg):
     if cfg.get("cores"):
         return parse_cores(cfg["cores"])
-    try:
-        return sorted(os.sched_getaffinity(0))
-    except AttributeError:  # not linux
-        return list(range(os.cpu_count() or 1))
+    aff = getattr(os, "sched_getaffinity", None)  # linux only
+    return sorted(aff(0)) if aff else list(range(os.cpu_count() or 1))
 
 
 def used_cores(db):
@@ -364,7 +362,7 @@ def session_usage(sids):
                         u[1] += sum(int(x) for x in fields[11:15]) / hz
                 except (OSError, IndexError, ValueError):
                     pass
-        return {k: [v[0] >> 20, v[1]] for k, v in out.items()}
+        return {k: [int(v[0]) >> 20, v[1]] for k, v in out.items()}
     try:  # macOS / BSD: fall back to the process group
         ps = subprocess.run(["ps", "-axo", "pgid=,rss=,time="], capture_output=True, text=True, timeout=10).stdout
         for line in ps.splitlines():
@@ -379,7 +377,7 @@ def session_usage(sids):
                 u[1] += secs + int(d or 0) * 86400
     except (OSError, ValueError, IndexError, subprocess.SubprocessError):
         pass
-    return {k: [v[0] >> 10, v[1]] for k, v in out.items()}
+    return {k: [int(v[0]) >> 10, v[1]] for k, v in out.items()}
 
 
 def session_rss_mb(sids):
@@ -730,7 +728,7 @@ def power_w(db):
             prev = None
         meta(db, "power", json.dumps(dict(ts=time.time(), uj=uj)))
         span = time.time() - prev["ts"] if prev else 0
-        if 0.2 <= span <= 300:
+        if prev and 0.2 <= span <= 300:
             joules = 0
             for n, e in uj.items():
                 d = e - prev["uj"].get(n, e)
@@ -754,10 +752,11 @@ def power_w(db):
         try:
             out = subprocess.run(["ioreg", "-rc", "AppleSmartBattery"], capture_output=True, text=True,
                                  timeout=10).stdout
-            amps = int(re.search(r'"Amperage" = (-?\d+)', out).group(1))  # mA, negative when discharging
-            if amps < 0:  # discharging: battery current is real consumption
-                volts = int(re.search(r'"(?:AppleRaw)?BatteryVoltage" = (\d+)', out).group(1))
-                return -amps * volts / 1e6
+            m = re.search(r'"Amperage" = (-?\d+)', out)  # mA, negative when discharging
+            if m and int(m.group(1)) < 0:  # discharging: battery current is real consumption
+                v = re.search(r'"(?:AppleRaw)?BatteryVoltage" = (\d+)', out)
+                if v:
+                    return -int(m.group(1)) * int(v.group(1)) / 1e6
             w = re.search(r'"Watts"=(\d+)', out)  # plugged in: charger wattage, an upper bound not a reading
             return int(w.group(1)) if w else None
         except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
@@ -896,9 +895,11 @@ def follow(jid):
         os.execvp("tail", ["tail", "-n", "200", "-F", path])
     pager = subprocess.Popen(["less", "-R", "+G"] if shutil.which("less") else ["cat"], stdin=subprocess.PIPE)
     with contextlib.suppress(OSError), zopen(path + ".zst") as f:
-        shutil.copyfileobj(f, pager.stdin)
-    with contextlib.suppress(OSError):
-        pager.stdin.close()
+        if f and pager.stdin:
+            shutil.copyfileobj(f, pager.stdin)
+    if pager.stdin:
+        with contextlib.suppress(OSError):
+            pager.stdin.close()
     pager.wait()
 
 
@@ -1294,7 +1295,7 @@ def config_cmd(a, known):
             raise Fail(r["config_error"])
         return r["config"]
 
-    targets = []
+    targets: list = []
     for name in a.host or [None]:
         if name is None:
             targets.append(("local %s" % P("config.json"), load_cfg, save_cfg))
@@ -1368,13 +1369,15 @@ def mosh_ok(d):
             cmd = "command -v mosh-server >/dev/null && " + REMOTE_PY + "udp-probe"
             with subprocess.Popen(SSH + [d, "sh -c " + shlex.quote(cmd)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                   stderr=subprocess.DEVNULL, text=True) as p:
-                port = int(p.stdout.readline())
+                so = p.stdout
+                assert so  # stdout=PIPE
+                port = int(so.readline())
                 conf = subprocess.run(["ssh", "-G", d], capture_output=True, text=True, timeout=10).stdout
                 addr = next(l.split()[1] for l in conf.splitlines() if l.startswith("hostname "))
                 for info in socket.getaddrinfo(addr, port, type=socket.SOCK_DGRAM):  # every address family the name has
                     with contextlib.suppress(OSError), socket.socket(info[0], socket.SOCK_DGRAM) as sock:
                         sock.sendto(b"tshed", info[4])
-                _mosh[d] = p.stdout.readline().strip() == "ok"
+                _mosh[d] = so.readline().strip() == "ok"
         except (OSError, ValueError, StopIteration, subprocess.SubprocessError):
             pass
     return _mosh[d]
@@ -1430,8 +1433,9 @@ BTOP_DIRS = ("~/.config/btop/themes", "~/.local/share/btop/themes", "/opt/homebr
 
 def btop_dirs():
     dirs = [os.path.join(os.environ["XDG_CONFIG_HOME"], "btop", "themes")] if os.environ.get("XDG_CONFIG_HOME") else []
-    if shutil.which("btop"):  # <prefix>/bin/btop -> <prefix>/share/btop/themes
-        dirs.append(os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(shutil.which("btop")))), "share", "btop", "themes"))
+    btop = shutil.which("btop")
+    if btop:  # <prefix>/bin/btop -> <prefix>/share/btop/themes
+        dirs.append(os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(btop))), "share", "btop", "themes"))
     return [d for d in dict.fromkeys(dirs + [os.path.expanduser(d) for d in BTOP_DIRS]) if os.path.isdir(d)]
 
 
@@ -1876,6 +1880,11 @@ def scheme_cmd(a):
         print("(no overrides; `tshed scheme <preset>` picks one, ROLE=COLOR tweaks it)")
 
 
+# the style constants rebound by apply_theme(); declared so the type checker sees them
+RESET = DIM = BOLD = GREEN = CYAN = RED = MAGENTA = BLUE = BOLD_YELLOW = BOLD_CYAN = BOLD_RED = KEY = HILITE = \
+    YELLOW = HOST = NUM = HEAD = ALT = ""
+HEAD_BAR = SEL_FLAT = False
+STATE_STYLE: dict = {}
 apply_theme("default")
 HOST_HEAD = "%-12s  %-7s %5s %5s  %7s  %10s  %9s  %-8s %4s %4s  %6s  %6s  %s" % ("Host", "State", "Load", "CPU%", "Cores", "Mem free", "Used/Res", "GPU", "Run", "Que", "Seen", "Freq", "Notes")
 JOB_HEAD = "%-11s %3s %4s  %-12s  %-8s  %8s  %5s  %4s  %11s  %-16s  %s" % ("State", "CPU", "Prio", "Host", "ID", "Time", "Try", "CPU%", "Mem", "Name", "Command")
@@ -2066,8 +2075,8 @@ def tui(interval):
     db = sdb()
     apply_theme(paint_bg=True)
     themes = theme_names()
-    st = dict(sel=0, top=0, query="", hide=False, detail=None, scroll=None, msg=("", ""), prompt=None, log=(None, ""),
-              fetching=False, fetched=0, synced=0, row0=0, rows=0, syncing=False)
+    st: dict = dict(sel=0, top=0, query="", hide=False, detail=None, scroll=None, msg=("", ""), prompt=None, log=(None, ""),
+                    fetching=False, fetched=0, synced=0, row0=0, rows=0, syncing=False)
     wake, stop = threading.Event(), threading.Event()
 
     def say(text, style=""):
@@ -2247,7 +2256,7 @@ def tui(interval):
             cur = jobs[st["sel"]] if jobs else None
             if st["detail"] and not (cur and cur["id"] == st["detail"]):
                 st["detail"] = None  # filtered away
-            if st["detail"] and cur["sent"] and cur["host"] in dests and not st["fetching"] and time.time() - st["fetched"] > 2 \
+            if cur and st["detail"] and cur["sent"] and cur["host"] in dests and not st["fetching"] and time.time() - st["fetched"] > 2 \
                     and (cur["state"] == "running" or st["log"][0] != cur["id"]):
                 st["fetching"] = True
                 threading.Thread(target=fetch_log, args=(cur, dests[cur["host"]]), daemon=True).start()

@@ -1833,12 +1833,12 @@ def scheme_cmd(a):
         except OSError:
             pass
         sch = {}
-    names = [p for p in a.pairs if "=" not in p]  # bare tokens: named presets, applied wholesale
-    for n in names:
+    pairs, names = [p for p in a.pairs if "=" in p], [p for p in a.pairs if "=" not in p]
+    for n in names:  # bare tokens: named presets, applied wholesale
         if n not in SCHEMES:
             raise Fail("unknown scheme %r; `tshed scheme` lists them (%s)" % (n, " ".join(SCHEMES)))
         sch = dict(SCHEMES[n])
-    for kv in (p for p in a.pairs if "=" in p):
+    for kv in pairs:
         k, _, v = kv.partition("=")
         if k not in SCHEME_ROLES:
             raise Fail("unknown role %r; scheme roles: %s" % (k, " ".join(SCHEME_ROLES)))
@@ -1855,14 +1855,15 @@ def scheme_cmd(a):
         print("note: TINYSHED_SCHEME=%s overrides the saved scheme in this shell" % os.environ["TINYSHED_SCHEME"], file=sys.stderr)
     styles = dict(ok=GREEN, info=CYAN, err=RED, warn=YELLOW, cancel=MAGENTA, accent=BLUE, host=HOST, key=KEY,
                   dim=DIM, title=BOLD, sel=HILITE, alt=ALT, head=HEAD, sel_fg=HILITE if SEL_FLAT else "")
-    active = next((n for n, d in SCHEMES.items() if d == sch), None) if not os.environ.get("TINYSHED_SCHEME") else None
+    active = None if os.environ.get("TINYSHED_SCHEME") else next(
+        (n for n, d in SCHEMES.items() if d == sch), None)
     print("scheme: %d override(s) on top of theme %s%s" % (len(sch), current_theme(),
                                                            " (%s)" % active if active else ""))
     for r in SCHEME_ROLES:
         st = styles.get(r, "")
         if r in sch:
-            print("%s %-8s %s%-16s%s" % ("*" if r in sch else " ", r, st, sch[r] + " sample", RESET) if st
-                  else "%s %-8s %s" % ("*", r, sch[r]))
+            print("* %-8s %s%-16s%s" % (r, st, sch[r] + " sample", RESET) if st
+                  else "* %-8s %s" % (r, sch[r]))
         elif not (a.pairs or a.clear) and st:
             print("  %-8s %s%-16s%s  (theme default)" % (r, st, "sample", RESET))
     print("presets:")

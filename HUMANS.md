@@ -45,13 +45,17 @@ tshed hosts
 ```
 
 ```
-Host          State    Load  CPU%    Cores    Mem free  GPU       Run  Que    Seen  Notes
-gpu1          ✓ up      0.4    6%    32/32    118/125G  2x 0%       0    0      0s
-gpu2          ✓ up      1.2   12%    16/16      57/62G  -           0    0      0s
+Host          State    Load  CPU%    Cores    Mem free   Used/Res  GPU       Run  Que    Seen    Freq  Notes
+gpu1          ✓ up      0.4    6%    32/32    118/125G   2.0/8.0G  2x 0%       0    0      0s  3.1GHz  65W
+gpu2          ✓ up      1.2   12%    16/16      57/62G   1.5/4.0G  -           0    0      0s  3.2GHz
 ```
 
 `Load` is the machine-wide 1-minute load average; `CPU%` is the busy percentage of the cores
-tinyshed owns (`-` until two polls have happened).
+tinyshed owns (`-` until two polls have happened). `Used/Res` is the live RAM of running jobs over
+their combined `-m` limits; `Mem free` is the whole machine's available/total; `Freq` is the mean
+clock of those cores. A red `CPU%` (>100%) or `Used/Res` (used over reserved) means a limit was
+breached — it should not happen, since the watchdog kills jobs that pass their `-m` limit, and the
+reason appears in Notes, which also carries the host's power draw in watts where the OS reports one.
 
 Turn on tab completion (commands, flags, host names, and job ids described by their command):
 
@@ -64,13 +68,19 @@ eval "$(tshed completion bash)"     # in ~/.bashrc
 ## 2. Your first job
 
 ```sh
-tshed submit -H gpu1 -- 'echo hello from $(hostname); sleep 20; echo bye'
+tshed submit -n hello -H gpu1 -- 'echo hello from $(hostname); sleep 20; echo bye'
 # 3f9a1c2e queued gpu1
 tshed ls
 tshed show 3f9          # state, limits, exit code, times, end of the log
+tshed show hello        # a job's name works wherever an id does
 tshed logs 3f9          # ids can be shortened to any unique prefix
 tshed wait 3f9          # blocks until it finishes; exit code tells you how it went
 ```
+
+While it runs, `ls` shows the job's own `CPU%` (the busy share of the cores it was given, so a
+`-c 2` job using one core reads 50%) and `Mem` (live RAM over its `-m` limit, like `0.3/3.2G`).
+
+`-n` names the job (required; up to 16 characters, no spaces).
 
 Everything after `--` runs on the host through `bash -c`, in your home directory, with stdout and
 stderr captured to `~/.tinyshed/logs/ID.log` on that host. The environment is a plain non-login
@@ -79,7 +89,7 @@ shell: if you need conda or modules, write `bash -lc '…'`, or use `-C dir` and
 ## 3. Limits, priorities, retries
 
 ```sh
-tshed submit -H gpu1 -p 10 -c 8 -m 32G -t 12h -r 2 -C ~/proj -e CUDA_VISIBLE_DEVICES=0 -- python train.py
+tshed submit -n train -H gpu1 -p 10 -c 8 -m 32G -t 12h -r 2 -C ~/proj -e CUDA_VISIBLE_DEVICES=0 -- python train.py
 ```
 
 | flag | effect |
@@ -91,8 +101,17 @@ tshed submit -H gpu1 -p 10 -c 8 -m 32G -t 12h -r 2 -C ~/proj -e CUDA_VISIBLE_DEV
 | `-r 2` | up to 2 retries with doubling backoff, by default only after `error` or `lost` |
 
 A host starts jobs strictly in priority order as cores free up. A big job at the head of the queue
-is not overtaken by small ones, so it cannot starve. Change your mind later with `tshed prio ID 50`
-or `tshed cancel ID`.
+is not overtaken by small ones, so it cannot starve. Change your mind later, while the job is still
+waiting:
+
+```sh
+tshed edit train -p 50          # new priority
+tshed edit train -H gpu2        # move it to another host (-H any: let the server choose)
+tshed edit train --force        # start it now, ahead of the queue, even on busy cores
+tshed cancel train
+```
+
+A move only happens if the job has not started on its current host; otherwise nothing changes.
 
 `lost` means the job's watchdog vanished — typically the host rebooted. With retries left the job
 simply starts again.
@@ -102,7 +121,7 @@ simply starts again.
 Leave out `-H` and the job waits on the server until some host has enough idle cores:
 
 ```sh
-tshed submit -c 16 -- ./simulate.sh        # → pending (waiting for a host)
+tshed submit -n sim -c 16 -- ./simulate.sh        # → pending (waiting for a host)
 ```
 
 This needs a server loop running — either the TUI or, headless:
@@ -127,6 +146,8 @@ Arrow keys or the mouse wheel move, a click selects (click again to open), typin
 | `Enter` / `→` | job detail with a scrollable, live log (`Esc` / `←` back) |
 | `N` | new job (same flags as `submit`) |
 | `K` / `E` / `P` | cancel / rerun / change priority |
+| `F` / `M` | force-start now / move to another host (waiting jobs) |
+| `T` | next color theme (saved; `tshed theme` lists them) |
 | `A` | follow the log on the host (mosh) |
 | `O` | shell on the host (mosh) |
 | `H` / `R` | hide finished / refresh |
@@ -137,6 +158,10 @@ While it is open the TUI is also a server loop, like `tshed serve`.
 For a quick look without opening it, `tshed overview` prints the hosts table and the active-jobs
 table in one screen (equivalent to `hosts | head -30; echo ---LS; ls | head -30`). `-n N` caps
 each table at N lines (30 by default), and `-a` includes finished jobs.
+
+Colors follow your terminal by default. `tshed theme` shows every theme as a sample row: built-in
+catppuccin, dracula, gruvbox, nord, tokyo-night, solarized and friends, plus every installed btop
+theme (`btop:NAME`). Pick one with `tshed theme tokyo-night`.
 
 ## 6. Callbacks
 

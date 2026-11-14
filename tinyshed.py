@@ -18,7 +18,7 @@ Callbacks: put functions in ~/.tinyshed/hooks.py (server and/or host), each taki
   OnJobQueued OnJobStart OnJobCompletion OnJobError OnJobTimeout OnJobOOM OnJobLost OnJobCancel
   OnHostDown OnHostUp (server only)   OnEvent (everything)
 """
-import argparse, contextlib, fcntl, importlib, json, os, shlex, shutil, signal, sqlite3, subprocess, sys, tempfile, threading, time, traceback, uuid
+import argparse, contextlib, fcntl, importlib, json, os, re, shlex, shutil, signal, sqlite3, subprocess, sys, tempfile, threading, time, traceback, uuid
 
 VERSION = "0.2"
 HOME = os.path.abspath(os.path.expanduser(os.environ.get("TINYSHED_HOME") or "~/.tinyshed"))
@@ -30,7 +30,7 @@ HOOKS = {"queued": "OnJobQueued", "start": "OnJobStart", "done": "OnJobCompletio
          "timeout": "OnJobTimeout", "oom": "OnJobOOM", "lost": "OnJobLost", "cancelled": "OnJobCancel",
          "host_down": "OnHostDown", "host_up": "OnHostUp"}
 # job fields that travel server -> host, with defaults
-SPEC = dict(cmd=None, cwd=None, env=None, prio=0, cpus=1, mem_mb=0, timeout=0, retries=0,
+SPEC = dict(name=None, cmd=None, cwd=None, env=None, prio=0, cpus=1, mem_mb=0, timeout=0, retries=0,
             retry_on="error,lost", retry_delay=30, created=None)
 
 
@@ -184,10 +184,10 @@ def size(s):
 
 HOST_SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs(
-  id TEXT PRIMARY KEY, cmd TEXT, cwd TEXT, env TEXT, prio INT, cpus INT, mem_mb INT, timeout REAL,
+  id TEXT PRIMARY KEY, name TEXT, cmd TEXT, cwd TEXT, env TEXT, prio INT, cpus INT, mem_mb INT, timeout REAL,
   retries INT, retry_on TEXT, retry_delay REAL, created REAL,
   state TEXT, attempt INT DEFAULT 0, not_before REAL DEFAULT 0, cores TEXT, pid INT, rc INT,
-  started REAL, ended REAL, peak_mb INT, cancel INT DEFAULT 0);
+  started REAL, ended REAL, peak_mb INT, cancel INT DEFAULT 0, force INT DEFAULT 0);
 CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(state, prio DESC, created);
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, job TEXT, kind TEXT, data TEXT);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
@@ -196,6 +196,14 @@ CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 
 def hdb():
     db = connect("host.db", HOST_SCHEMA)
+    have = {r[1] for r in db.execute("PRAGMA table_info(jobs)")}
+    for col, decl in (("force", "INT DEFAULT 0"), ("name", "TEXT")):  # v0.2 queues predate these
+        if col not in have:
+            try:
+                db.execute("ALTER TABLE jobs ADD COLUMN %s %s" % (col, decl))
+            except sqlite3.OperationalError as e:  # another process migrated first
+                if "duplicate" not in str(e):
+                    raise
     if not meta(db, "epoch"):  # identifies this incarnation of the event log
         db.execute("INSERT OR IGNORE INTO meta VALUES('epoch',?)", (uuid.uuid4().hex,))
     return db
@@ -334,26 +342,86 @@ def events_after(db, after, limit=500):
 
 # ───────────────────────────────────────────────────────────────── host: watchdog (one per running job)
 
-def tree_rss_mb(sid):
-    """Summed RSS of every process in the job's session (shared pages are counted per process)."""
-    total = 0
+def session_usage(sids):
+    """{sid: [RSS MB, CPU seconds]} summed over every process whose session id is in sids (shared
+    pages counted per process). Linux CPU includes reaped children (cutime/cstime); macOS sees only
+    live processes and groups by process group (== session leader pid for our jobs)."""
+    sids = {str(s) for s in sids}
+    out = {s: [0, 0.0] for s in sids}
+    if not sids:
+        return out
     if os.path.isdir("/proc/self"):
-        page = os.sysconf("SC_PAGE_SIZE")
+        page, hz = os.sysconf("SC_PAGE_SIZE"), os.sysconf("SC_CLK_TCK")
         for pid in os.listdir("/proc"):
             if pid.isdigit():
                 try:
                     with open("/proc/%s/stat" % pid) as f:
-                        fields = f.read().rsplit(")", 1)[1].split()  # [0]=state [3]=session [21]=rss pages
-                    if int(fields[3]) == sid:
-                        total += int(fields[21]) * page
+                        # after comm: [0]=state [3]=session [11..14]=utime stime cutime cstime [21]=rss pages
+                        fields = f.read().rsplit(")", 1)[1].split()
+                    if fields[3] in sids:
+                        u = out[fields[3]]
+                        u[0] += int(fields[21]) * page
+                        u[1] += sum(int(x) for x in fields[11:15]) / hz
                 except (OSError, IndexError, ValueError):
                     pass
-        return total >> 20
+        return {k: [v[0] >> 20, v[1]] for k, v in out.items()}
     try:  # macOS / BSD: fall back to the process group
-        out = subprocess.run(["ps", "-axo", "pgid=,rss="], capture_output=True, text=True, timeout=10).stdout
-        return sum(int(l.split()[1]) for l in out.splitlines() if l.split()[:1] == [str(sid)]) >> 10
+        ps = subprocess.run(["ps", "-axo", "pgid=,rss=,time="], capture_output=True, text=True, timeout=10).stdout
+        for line in ps.splitlines():
+            p = line.split()
+            if len(p) >= 3 and p[0] in sids:
+                u = out[p[0]]
+                u[0] += int(p[1])
+                d, _, hms = p[2].rpartition("-")  # [[dd-]hh:]mm:ss.ss
+                secs = 0.0
+                for part in hms.split(":"):
+                    secs = secs * 60 + float(part)
+                u[1] += secs + int(d or 0) * 86400
     except (OSError, ValueError, IndexError, subprocess.SubprocessError):
-        return 0
+        pass
+    return {k: [v[0] >> 10, v[1]] for k, v in out.items()}
+
+
+def session_rss_mb(sids):
+    return sum(v[0] for v in session_usage(sids).values())
+
+
+def tree_rss_mb(sid):
+    """Summed RSS of every process in the job's session (shared pages are counted per process)."""
+    return session_rss_mb({sid})
+
+
+def job_usage(db):
+    """Live usage of running jobs: ({id: [CPU% of its assigned cores or None, RSS MB]}, summed RSS MB,
+    sum of their -m limits MB or None if any running job set no -m). CPU% = CPU-seconds delta since
+    the previous status() call / (elapsed * cores assigned); the baseline lives in host.db meta."""
+    rows = db.execute("SELECT id, pid, cores, cpus, mem_mb FROM jobs WHERE state='running'").fetchall()
+    reserved = None if any(not r["mem_mb"] for r in rows) else sum(r["mem_mb"] for r in rows)
+    use = session_usage({r["pid"] for r in rows if r["pid"]})
+    now = time.time()
+    try:
+        prev = json.loads(meta(db, "jobcpu") or "{}")
+    except ValueError:
+        prev = {}
+    jobs, base = {}, {}
+    for r in rows:
+        rss, cpu = use.get(str(r["pid"]), [0, 0.0]) if r["pid"] else [0, 0.0]
+        ncores = len(parse_cores(r["cores"])) if r["cores"] else max(1, r["cpus"] or 1)
+        pct, b = None, prev.get(r["id"])
+        if b and b[2] == r["pid"]:
+            span, dcpu = now - b[0], cpu - b[1]
+            if span < 0.5:  # too soon for a reading: keep the old baseline and value
+                pct, b2 = b[3], b
+            elif span <= 300:
+                pct, b2 = round(max(0.0, 100 * dcpu / (span * ncores)), 1), None
+            else:
+                b2 = None
+        else:
+            b2 = None
+        base[r["id"]] = b2 or [now, cpu, r["pid"], pct]
+        jobs[r["id"]] = [pct, rss]
+    meta(db, "jobcpu", json.dumps(base))
+    return jobs, sum(v[1] for v in jobs.values()), reserved
 
 
 def kill_group(p, grace=10):
@@ -467,23 +535,25 @@ def reconcile(db):
 
 
 def schedule(db, cfg, kids):
-    """Strict priority order: highest prio first, FIFO within a priority; no backfilling past a job that does not fit."""
+    """Strict priority order: highest prio first, FIFO within a priority; no backfilling past a job that does not fit.
+    Forced jobs (`tshed edit --force`) go first and start at once: idle cores first, then they share busy ones."""
     cores = host_cores(cfg)
     used = used_cores(db)
     free = [c for c in cores if c not in used]
-    for j in db.execute("SELECT id, cpus FROM jobs WHERE state='queued' AND cancel=0 AND not_before<=? "
-                        "ORDER BY prio DESC, created, id", (time.time(),)).fetchall():
+    for j in db.execute("SELECT id, cpus, force FROM jobs WHERE state='queued' AND cancel=0 AND (force=1 OR not_before<=?) "
+                        "ORDER BY force DESC, prio DESC, created, id", (time.time(),)).fetchall():
         need = min(max(1, j["cpus"]), len(cores))
-        if need > len(free):
+        if need > len(free) and not j["force"]:
             break
         f = try_lock(P("run", j["id"] + ".lock"))
         if not f:  # previous attempt's watchdog is still exiting
             continue
         with f:
-            mine, free = free[:need], free[need:]
+            mine = (free + [c for c in cores if c not in free])[:need]
+            free = [c for c in free if c not in mine]
             with tx(db):
-                n = db.execute("UPDATE jobs SET state='running', attempt=attempt+1, cores=?, started=?, ended=NULL, rc=NULL, pid=NULL "
-                               "WHERE id=? AND state='queued' AND cancel=0",
+                n = db.execute("UPDATE jobs SET state='running', attempt=attempt+1, cores=?, started=?, ended=NULL, rc=NULL, pid=NULL, "
+                               "force=0 WHERE id=? AND state='queued' AND cancel=0",
                                (",".join(map(str, mine)), time.time(), j["id"])).rowcount
             if n:  # the watchdog inherits the held lock
                 kids.append(detach(["_run", j["id"]], pass_fds=[f.fileno()]))
@@ -604,7 +674,7 @@ def cpu_util(db, cores):
             total = sum(cur[c][0] - prev["ticks"][c][0] for c in cur)
             idle = sum(cur[c][1] - prev["ticks"][c][1] for c in cur)
             if total > 0 and 0.5 <= span <= 300:
-                pct = round(max(0.0, min(100.0, 100 * (1 - idle / total))), 1)
+                pct = round(max(0.0, 100 * (1 - idle / total)), 1)  # >100% is possible only with bad counters
             elif total == 0 or span < 0.5:
                 return prev.get("pct")  # not enough elapsed: keep the old baseline and reading
             # counters went backwards (reboot) or the baseline is stale: fall through to a fresh one
@@ -614,8 +684,93 @@ def cpu_util(db, cores):
     return pct
 
 
+def cpu_freq_ghz(cores):
+    """Mean current clock (GHz) of the given cores; None where the OS does not report a clock."""
+    try:  # linux: sysfs cpufreq, kHz per core
+        return sum(int(open("/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq" % c).read())
+                   for c in cores) / len(cores) / 1e6
+    except (OSError, ValueError):
+        pass
+    try:  # linux: /proc/cpuinfo, MHz per processor (no sysfs cpufreq on some boards)
+        freqs, cur = {}, None
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                k = k.strip().lower()
+                if k == "processor":
+                    with contextlib.suppress(ValueError):
+                        cur = int(v)
+                elif cur is not None and k in ("cpu mhz", "mhz"):
+                    freqs[cur] = float(v.split()[0])
+        vals = [freqs[c] for c in cores if c in freqs]
+        if vals:
+            return sum(vals) / len(vals) / 1e3
+    except (OSError, ValueError):
+        pass
+    if sys.platform == "darwin":  # intel macs; apple silicon hides the clock
+        with contextlib.suppress(OSError, ValueError, subprocess.SubprocessError):
+            return int(subprocess.run(["sysctl", "-n", "hw.cpufrequency"], capture_output=True, text=True,
+                                      timeout=5).stdout) / 1e9
+    return None
+
+
+def power_w(db):
+    """Whole-host power draw in watts, best effort; None where the OS exposes no power counter.
+    RAPL package energy is a delta between polls, so the last reading lives in host.db meta."""
+    uj = {}
+    with contextlib.suppress(OSError):
+        for n in sorted(os.listdir("/sys/class/powercap")):
+            if n.startswith("intel-rapl") and n.count(":") == 1:  # packages, not subdomains
+                with contextlib.suppress(OSError, ValueError):
+                    uj[n] = int(open("/sys/class/powercap/%s/energy_uj" % n).read())
+    if uj:
+        try:
+            prev = json.loads(meta(db, "power") or "null")
+        except ValueError:
+            prev = None
+        meta(db, "power", json.dumps(dict(ts=time.time(), uj=uj)))
+        span = time.time() - prev["ts"] if prev else 0
+        if 0.2 <= span <= 300:
+            joules = 0
+            for n, e in uj.items():
+                d = e - prev["uj"].get(n, e)
+                if d < 0:  # counters wrap at max_energy_range_uj
+                    with contextlib.suppress(OSError, ValueError):
+                        d += int(open("/sys/class/powercap/%s/max_energy_range_uj" % n).read())
+                if d > 0:
+                    joules += d
+            if joules:
+                return joules / span / 1e6
+    try:  # battery discharge rate
+        for bat in sorted(os.listdir("/sys/class/power_supply")):
+            if bat.startswith("BAT"):
+                with open("/sys/class/power_supply/%s/power_now" % bat) as f:
+                    uw = int(f.read())
+                if uw > 0:
+                    return uw / 1e6
+    except (OSError, ValueError):
+        pass
+    if sys.platform == "darwin":  # ioreg needs no root: battery draw, else the charger's wattage
+        try:
+            out = subprocess.run(["ioreg", "-rc", "AppleSmartBattery"], capture_output=True, text=True,
+                                 timeout=10).stdout
+            amps = int(re.search(r'"Amperage" = (-?\d+)', out).group(1))  # mA, negative when discharging
+            if amps < 0:  # discharging: battery current is real consumption
+                volts = int(re.search(r'"(?:AppleRaw)?BatteryVoltage" = (\d+)', out).group(1))
+                return -amps * volts / 1e6
+            w = re.search(r'"Watts"=(\d+)', out)  # plugged in: charger wattage, an upper bound not a reading
+            return int(w.group(1)) if w else None
+        except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
+            pass
+    return None
+
+
 def status(db, cfg):
     cores = host_cores(cfg)
+    pct = cpu_util(db, cores)
+    job_live, mem_used_mb, mem_reserved_mb = job_usage(db)
+    ghz = cpu_freq_ghz(cores)
+    watts = power_w(db)
     mem_total = mem_avail = None
     try:
         mem_total = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") >> 20
@@ -633,11 +788,24 @@ def status(db, cfg):
             gpus = [dict(zip(("util", "mem_used", "mem_total"), map(int, l.split(",")))) for l in out.splitlines() if l.strip()]
         except (OSError, ValueError, subprocess.SubprocessError):
             pass
+    warn = []
+    if pct is not None and pct > 100:  # impossible with sound counters: jobs are pinned to their cores
+        warn.append("CPU% >100%: limit breach")
+    if mem_reserved_mb is not None and mem_used_mb > mem_reserved_mb:  # watchdog should have killed it
+        warn.append("RAM over reserved")
     return dict(now=time.time(), version=VERSION, ncpu=os.cpu_count(), cores=len(cores), free=len(cores) - len(used_cores(db)),
-                load=os.getloadavg()[0], cpu_pct=cpu_util(db, cores), mem_total_mb=mem_total, mem_avail_mb=mem_avail,
+                load=os.getloadavg()[0], cpu_pct=pct, cpu_ghz=round(ghz, 2) if ghz is not None else None,
+                mem_total_mb=mem_total, mem_avail_mb=mem_avail,
+                mem_used_mb=mem_used_mb, mem_reserved_mb=mem_reserved_mb, jobs=job_live,
+                power_w=round(watts, 1) if watts is not None else None, warnings=warn,
                 disk_free_gb=round(shutil.disk_usage(HOME).free / 2 ** 30, 1), gpus=gpus, agent=agent_alive(),
                 counts={r[0]: r[1] for r in db.execute("SELECT state, count(*) FROM jobs GROUP BY state")},
                 queued_cpus=db.execute("SELECT coalesce(sum(cpus),0) FROM jobs WHERE state='queued'").fetchone()[0])
+
+
+def state_of(db, jid):
+    r = db.execute("SELECT state FROM jobs WHERE id=?", (jid,)).fetchone()
+    return r and r[0]
 
 
 def rpc(req):
@@ -651,6 +819,10 @@ def rpc(req):
                    env=env if isinstance(env, str) else json.dumps(env))
         with tx(db):
             n = db.execute("INSERT OR IGNORE INTO jobs(%s) VALUES(%s)" % (",".join(row), ",".join("?" * len(row))), list(row.values())).rowcount
+            if not n:  # moved away earlier (`withdraw`) and now moved back: queue it again
+                cols = {k: v for k, v in row.items() if k not in ("id", "created")}
+                n = db.execute("UPDATE jobs SET %s, not_before=0, cancel=0, force=0 WHERE id=? AND state='moved'"
+                               % ",".join(k + "=?" for k in cols), list(cols.values()) + [j["id"]]).rowcount
             ev = emit(db, j["id"], "queued") if n else None
         if ev:
             fire(ev)
@@ -664,6 +836,22 @@ def rpc(req):
             fire(ev)
     for jid, prio in (req.get("prio") or {}).items():
         transition(db, jid, "update", prio=int(prio))
+    if "force" in req:  # start now, ignoring priority order and free cores; answer each job's state
+        for jid in req["force"]:
+            with tx(db):
+                n = db.execute("UPDATE jobs SET force=1, not_before=0 WHERE id=? AND state='queued' AND force=0", (jid,)).rowcount
+                ev = emit(db, jid, "update") if n else None
+            if ev:
+                fire(ev)
+        out["forced"] = {jid: state_of(db, jid) for jid in req["force"]}
+    if "withdraw" in req:  # give a queued job up so the server can move it to another host
+        for jid in req["withdraw"]:
+            with tx(db):
+                n = db.execute("UPDATE jobs SET state='moved', ended=? WHERE id=? AND state='queued'", (time.time(), jid)).rowcount
+                ev = emit(db, jid, "moved", dict(final=True)) if n else None
+            if ev:
+                fire(ev)
+        out["withdrawn"] = {jid: state_of(db, jid) for jid in req["withdraw"]}
     if "after" in req:
         out["events"] = events_after(db, req["after"])
     if req.get("status"):
@@ -871,7 +1059,7 @@ def ingest(db, host, epoch, events):
                           (host, ev["eid"], ev["ts"], ev["job"], ev["kind"], pack(d))).rowcount:
                 db.execute("INSERT INTO jobs(id,host,prio,state,created,sent,eid,j) VALUES(?,?,?,?,?,1,?,?) "
                            "ON CONFLICT(id) DO UPDATE SET host=excluded.host, prio=excluded.prio, state=excluded.state, "
-                           "sent=1, eid=excluded.eid, j=excluded.j WHERE excluded.eid > jobs.eid",
+                           "sent=1, eid=excluded.eid, j=excluded.j WHERE excluded.eid > jobs.eid AND jobs.host IS excluded.host",
                            (d["id"], host, d["prio"], d["state"], d["created"], ev["eid"], pack(d)))
                 new.append(dict(ev, host=host))
         if events:
@@ -912,13 +1100,19 @@ def _sync_host(db, name, extra):
     return res
 
 
-def dispatch(db):
-    """Late-bind host-less jobs, highest priority first, to the live host with the most idle cores."""
+def host_caps(db):
+    """Spare cores per live host (idle minus what is already queued or on its way), and total cores."""
     cap, cores = {}, {}
     for h in db.execute("SELECT name, status FROM hosts WHERE err IS NULL AND status IS NOT NULL AND seen>?", (time.time() - 120,)):
         s = json.loads(h["status"])
         unsent = sum(unpack(r["j"]).get("cpus", 1) for r in db.execute("SELECT j FROM jobs WHERE host=? AND sent=0 AND state='pending'", (h["name"],)))
         cap[h["name"]], cores[h["name"]] = s["free"] - s["queued_cpus"] - unsent, s["cores"]
+    return cap, cores
+
+
+def dispatch(db):
+    """Late-bind host-less jobs, highest priority first, to the live host with the most idle cores."""
+    cap, cores = host_caps(db)
     touched = set()
     for r in db.execute("SELECT id, j FROM jobs WHERE host IS NULL AND state='pending' AND cancel=0 ORDER BY prio DESC, created").fetchall():
         if not cap:
@@ -949,8 +1143,20 @@ def sync_all():
 
 # ───────────────────────────────────────────────────────────────── server: operations
 
+NAME_MAX = 16
+
+
+def job_name(s):
+    """A job's name: 1-16 printable characters, no whitespace."""
+    s = str(s).strip()
+    if not s or len(s) > NAME_MAX or not s.isprintable() or any(c.isspace() for c in s):
+        raise argparse.ArgumentTypeError("a job name is 1-%d characters without spaces (got %r)" % (NAME_MAX, s))
+    return s
+
+
 def submit_parser(**kw):
     p = argparse.ArgumentParser(**kw)
+    p.add_argument("-n", "--name", type=job_name, required=True, help="job name, at most %d characters, no spaces" % NAME_MAX)
     p.add_argument("-H", "--host", help="pin to a host (default: first live host with enough idle cores)")
     p.add_argument("-p", "--prio", type=int, default=0, help="higher runs first")
     p.add_argument("-c", "--cpus", type=int, default=1, help="cores to pin with taskset")
@@ -979,7 +1185,7 @@ def submit(db, argv):
     cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
     if not cmd:
         raise Fail("no command given")
-    spec = dict(cmd=cmd[0] if len(cmd) == 1 else shlex.join(cmd), cwd=a.cwd, env=dict(e.split("=", 1) for e in a.env),
+    spec = dict(name=a.name, cmd=cmd[0] if len(cmd) == 1 else shlex.join(cmd), cwd=a.cwd, env=dict(e.split("=", 1) for e in a.env),
                 prio=a.prio, cpus=a.cpus, mem_mb=a.mem, timeout=a.timeout, retries=a.retries, retry_on=a.retry_on,
                 retry_delay=a.retry_delay)
     return add_job(db, spec, a.host)
@@ -1002,8 +1208,79 @@ def set_prio(db, jid, prio):
         db.execute("UPDATE jobs SET prio=?, j=? WHERE id=? AND sent=0", (prio, pack(dict(unpack(r["j"]), prio=prio)), jid))
 
 
+def waiting_job(db, jid, what):
+    r = db.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone()
+    if r["state"] not in ("pending", "queued"):
+        raise Fail("%s is %s: only waiting jobs can be %s" % (jid, r["state"], what))
+    return r
+
+
+def host_answer(res, key, host):
+    if res is None:
+        raise Fail("host %s is unreachable; nothing changed" % host)
+    if key not in res:
+        raise Fail("host %s runs an older tinyshed: run tshed install %s" % (host, host))
+    return res[key]
+
+
+def move_job(db, jid, host):
+    """Re-pin a waiting job to another host (None: any host). A job already queued on a host is withdrawn
+    from it first; that is conditional on it still being queued there, so it never runs twice."""
+    r = waiting_job(db, jid, "moved")
+    if host and not db.execute("SELECT 1 FROM hosts WHERE name=?", (host,)).fetchone():
+        raise Fail("unknown host %r (see: tshed hosts)" % host)
+    if r["host"] == host:
+        return
+    if r["sent"]:
+        state = host_answer(sync_host(r["host"], dict(withdraw=[jid])), "withdrawn", r["host"]).get(jid)
+        if state not in ("moved", None):
+            raise Fail("%s is already %s on %s; not moved" % (jid, state, r["host"]))
+        r = db.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone()
+    # eid=0: event ids are per host; the old host's late events no longer match (ingest checks the host)
+    db.execute("UPDATE jobs SET host=?, sent=0, state='pending', eid=0, cancel=0 WHERE id=?", (host, jid))
+
+
+def force_job(db, jid):
+    """Start a waiting job now: it skips the queue order and takes cores even if they are busy.
+    A host-less job goes to the live host with the most spare cores. Returns the job's state on its host."""
+    r = waiting_job(db, jid, "forced")
+    host = r["host"]
+    if not host:
+        cap, _ = host_caps(db)
+        if not cap:
+            raise Fail("no live host to run %s on" % jid)
+        host = max(cap, key=cap.get)
+        db.execute("UPDATE jobs SET host=? WHERE id=? AND host IS NULL", (host, jid))
+    # one round trip: an undelivered job is submitted, then forced, in the same rpc
+    return host, host_answer(sync_host(host, dict(force=[jid])), "forced", host).get(jid)
+
+
+def edit_job(db, jid, prio=None, host=False, force=False):
+    """`tshed edit`: move (host; None = any), then re-prioritise, then force. Returns what changed."""
+    done = []
+    if host is not False:
+        move_job(db, jid, host)
+        done.append("host %s" % (host or "(any)"))
+    if prio is not None:
+        waiting_job(db, jid, "re-prioritised")
+        set_prio(db, jid, prio)
+        done.append("prio %d" % prio)
+    if force:
+        h, state = force_job(db, jid)
+        done.append("forced on %s (%s)" % (h, "starting" if state == "queued" else state))
+    elif host:
+        sync_host(host)  # deliver now rather than at the next poll
+    return done
+
+
 def resolve(db, prefix):
+    """A job id, from a unique id prefix or else a job name (the unfinished job of that name wins)."""
     rows = db.execute("SELECT id FROM jobs WHERE id LIKE ?", (prefix + "%",)).fetchall()
+    if not rows:
+        named = [r for r in db.execute("SELECT id, state, j FROM jobs").fetchall() if _blob(r).get("name") == prefix]
+        rows = [r for r in named if r["state"] not in TERMINAL] or named
+        if len(rows) > 1:
+            raise Fail("%s: %d jobs have this name; use an id (%s)" % (prefix, len(rows), " ".join(r[0] for r in rows[:6])))
     if len(rows) != 1:
         raise Fail("%s: %s" % (prefix, "ambiguous job id (%s)" % " ".join(r[0] for r in rows[:6]) if rows else "no such job"))
     return rows[0][0]
@@ -1117,14 +1394,263 @@ def attach_argv(dest, jid=None):
 
 # ───────────────────────────────────────────────────────────────── server: presentation (theme, tables, tui)
 
-RESET, DIM, BOLD = "\x1b[0m", "\x1b[2m", "\x1b[1m"
-GREEN, CYAN, RED, MAGENTA, BLUE = "\x1b[32m", "\x1b[36m", "\x1b[31m", "\x1b[35m", "\x1b[34m"
-BOLD_YELLOW, BOLD_CYAN, BOLD_RED = "\x1b[1;33m", "\x1b[1;36m", "\x1b[1;31m"
-KEY, HILITE = "\x1b[1;33m", "\x1b[48;5;237;1m"
-STATE_STYLE = dict(running=(GREEN, "▶"), queued=(BOLD_YELLOW, "◌"), pending=(CYAN, "◌"), done=(GREEN, "✓"),
-                   cancelled=(MAGENTA, "■"))  # every failure: (BOLD_RED, "●")
-HOST_HEAD = "%-12s  %-7s %5s %5s  %7s  %10s  %-8s %4s %4s  %6s  %s" % ("Host", "State", "Load", "CPU%", "Cores", "Mem free", "GPU", "Run", "Que", "Seen", "Notes")
-JOB_HEAD = "%-11s %4s  %-12s  %-8s  %8s  %5s  %s" % ("State", "Prio", "Host", "ID", "Time", "Try", "Command")
+# ── themes. Every color below is a role; apply_theme() rebinds them. 'default' is the 16-color ANSI palette
+# (it follows the terminal's own scheme, after gitss); 'mono' is bold/dim/reverse only; the rest are truecolor
+# palettes of the usual ratatui / editor themes (downsampled to 256 colors where the terminal lacks truecolor).
+# Any btop theme also works, by name (looked up in btop's theme dirs, or `btop:NAME`) or by path to a .theme file.
+THEME_ROLES = ("ok", "info", "err", "warn", "cancel", "accent", "host", "key", "dim", "sel", "title", "fg", "bg")
+THEMES = {  # ok     info   err    warn   cancel accent host   key    dim    sel    title  fg     bg
+    "btop":             "50f095 4897d4 d45454 dcd179 ff40b6 5474e8 80d0a3 b54040 666666 6a2f2f eeeeee cccccc 000000",
+    "cendre":           "99af6b 20c9cb d1766e fcba81 a692cd 58bdff 8bcfff ea9875 73665b 2f1e17 e6d5c2 e6d5c2 171311",
+    "catppuccin":       "a6e3a1 89dceb f38ba8 f9e2af cba6f7 89b4fa 74c7ec fab387 6c7086 45475a cdd6f4 cdd6f4 1e1e2e",
+    "catppuccin-latte": "40a02b 04a5e5 d20f39 df8e1d 8839ef 1e66f5 209fb5 fe640b 8c8fa1 bcc0cc 4c4f69 4c4f69 eff1f5",
+    "dracula":          "50fa7b 8be9fd ff5555 f1fa8c bd93f9 ff79c6 8be9fd ffb86c 6272a4 44475a f8f8f2 f8f8f2 282a36",
+    "everforest":       "a7c080 83c092 e67e80 dbbc7f d699b6 7fbbb3 83c092 e69875 859289 475258 d3c6aa d3c6aa 2d353b",
+    "gruvbox":          "b8bb26 8ec07c fb4934 fabd2f d3869b 83a598 8ec07c fe8019 928374 504945 ebdbb2 ebdbb2 282828",
+    "gruvbox-light":    "79740e 427b58 9d0006 b57614 8f3f71 076678 427b58 af3a03 928374 d5c4a1 3c3836 3c3836 fbf1c7",
+    "kanagawa":         "98bb6c 7fb4ca e46876 e6c384 957fb8 7e9cd8 7aa89f ffa066 727169 2d4f67 dcd7ba dcd7ba 1f1f28",
+    "monokai":          "a6e22e 66d9ef f92672 e6db74 ae81ff 66d9ef 66d9ef fd971f 75715e 49483e f8f8f2 f8f8f2 272822",
+    "nord":             "a3be8c 88c0d0 bf616a ebcb8b b48ead 81a1c1 8fbcbb d08770 616e88 434c5e eceff4 d8dee9 2e3440",
+    "one-dark":         "98c379 56b6c2 e06c75 e5c07b c678dd 61afef 56b6c2 d19a66 5c6370 3e4451 abb2bf abb2bf 282c34",
+    "rose-pine":        "9ccfd8 ebbcba eb6f92 f6c177 c4a7e7 31748f 9ccfd8 f6c177 6e6a86 403d52 e0def4 e0def4 191724",
+    "solarized-dark":   "859900 2aa198 dc322f b58900 d33682 268bd2 2aa198 cb4b16 586e75 073642 93a1a1 839496 002b36",
+    "solarized-light":  "859900 2aa198 dc322f b58900 d33682 268bd2 2aa198 cb4b16 93a1a1 eee8d5 586e75 657b83 fdf6e3",
+    "tokyo-night":      "9ece6a 7dcfff f7768e e0af68 bb9af7 7aa2f7 2ac3de ff9e64 565f89 283457 c0caf5 c0caf5 1a1b26",
+}
+BTOP_DIRS = ("~/.config/btop/themes", "~/.local/share/btop/themes", "/opt/homebrew/share/btop/themes",
+             "/usr/local/share/btop/themes", "/usr/share/btop/themes")
+
+
+def btop_dirs():
+    dirs = [os.path.join(os.environ["XDG_CONFIG_HOME"], "btop", "themes")] if os.environ.get("XDG_CONFIG_HOME") else []
+    if shutil.which("btop"):  # <prefix>/bin/btop -> <prefix>/share/btop/themes
+        dirs.append(os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(shutil.which("btop")))), "share", "btop", "themes"))
+    return [d for d in dict.fromkeys(dirs + [os.path.expanduser(d) for d in BTOP_DIRS]) if os.path.isdir(d)]
+
+
+def btop_themes():
+    """{name: path} of installed btop themes (the first dir wins, so user themes shadow system ones)."""
+    out = {}
+    for d in btop_dirs():
+        for f in sorted(os.listdir(d)):
+            if f.endswith(".theme"):
+                out.setdefault(f[:-6], os.path.join(d, f))
+    return out
+
+
+def theme_names():
+    return ["default", "mono"] + sorted(THEMES) + ["btop:" + n for n in btop_themes()]
+
+
+def parse_btop(path):
+    """A btop .theme file -> roles. Its named colors map directly (title, hi_fg, selected_bg, inactive_fg,
+    main_fg/bg); the semantic ones (ok/err/warn/...) take the theme's color nearest in hue."""
+    import colorsys
+    with open(path) as f:
+        kv = dict(re.findall(r'^\s*theme\[(\w+)\]\s*=\s*"?([^"\n]*)"?', f.read(), re.M))
+
+    def hx(v):
+        v = v.strip().lstrip("#")
+        if re.fullmatch(r"[0-9a-fA-F]{2}", v):
+            return v.lower() * 3  # btop "#cc" = grey
+        if re.fullmatch(r"[0-9a-fA-F]{6}", v):
+            return v.lower()
+        p = v.split()
+        return "%02x%02x%02x" % tuple(map(int, p)) if len(p) == 3 and all(x.isdigit() for x in p) else None
+    cols = {k: c for k, c in ((k, hx(v)) for k, v in kv.items()) if c}
+
+    def hue(target):
+        """The theme's color nearest the target hue (vivid preferred); None (-> fg) if nothing is close."""
+        best = None
+        for c in dict.fromkeys(cols.values()):
+            h, sat, val = colorsys.rgb_to_hsv(*(int(c[i:i + 2], 16) / 255 for i in (0, 2, 4)))
+            if sat < 0.15 or val < 0.3:
+                continue
+            d = min(abs(h * 360 - target), 360 - abs(h * 360 - target)) - 30 * sat * val  # prefer vivid
+            if best is None or d < best[0]:
+                best = (d, c)
+        return best[1] if best and best[0] < 60 else None
+    fg = cols.get("main_fg") or "cccccc"
+    t = dict(ok=hue(120), info=hue(185), err=hue(0), warn=hue(50), cancel=hue(300), accent=hue(220),
+             key=cols.get("hi_fg"), dim=cols.get("inactive_fg"), sel=cols.get("selected_bg"),
+             sel_fg=cols.get("selected_fg"), title=cols.get("title"), fg=fg, bg=cols.get("main_bg"))
+    t["host"] = t["info"] or t["accent"]
+    return {k: v or (fg if k not in ("sel_fg", "bg", "sel") else None) for k, v in t.items()}
+
+
+def _rgb(c):
+    return [int(c[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+
+
+def _hex(v):
+    return "%02x%02x%02x" % tuple(round(min(1, max(0, x)) * 255) for x in v)
+
+
+def _lum(c):  # WCAG relative luminance
+    v = [x / 12.92 if x <= 0.03928 else ((x + 0.055) / 1.055) ** 2.4 for x in _rgb(c)]
+    return 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2]
+
+
+def contrast(a, b):
+    hi, lo = sorted((_lum(a), _lum(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def _mix(a, b, f):
+    return _hex([x * f + y * (1 - f) for x, y in zip(_rgb(a), _rgb(b))])
+
+
+# minimum WCAG contrast of each role (against the background, against the selection bar)
+CONTRAST = dict(fg=(7, 4.5), title=(7, 4.5), dim=(3.2, 2.5))
+CONTRAST_TEXT = (4.5, 3.5)
+
+
+def tune_contrast(t):
+    """Make a palette readable without changing its character: the selection bar becomes a tinted lift of
+    the background (~1.8:1), and a text role that is too faint keeps its hue but moves away from the
+    background (lighter on dark themes, darker on light ones) until it meets CONTRAST against both the
+    background and the selection bar. Colors that already pass are left exactly as designed."""
+    import colorsys
+    t = dict(t)
+    bg = t.get("bg") or ("000000" if _lum(t["fg"]) > 0.2 else "ffffff")  # no bg: assume the opposite of fg
+    step = 0.02 if _lum(bg) < 0.18 else -0.02
+    base = t.get("sel") if t.get("sel") and contrast(t["sel"], bg) >= 1.3 else t["fg"]
+    if not 1.6 <= contrast(base, bg) <= 2.4:  # too faint to see, or a loud bar that fights the text on it
+        # faint: lift it toward fg (keeps its tint); loud: fade it toward bg
+        toward = (lambda f: _mix(t["fg"], base, f)) if contrast(base, bg) < 1.6 else (lambda f: _mix(base, bg, f))
+        f = 0.0
+        while f < 1 and contrast(toward(f), bg) < 1.8:
+            f += 0.02
+        base = toward(f)
+    t["sel"], sel = base, base
+    t.pop("sel_fg", None)  # roles are tuned against the bar itself
+
+    def push(c, need_bg, need_sel):
+        h, l, s_ = colorsys.rgb_to_hls(*_rgb(c))
+        while (contrast(c, bg) < need_bg or contrast(c, sel) < need_sel) and 0 < l < 1:
+            l = min(1.0, max(0.0, l + step))
+            c = _hex(colorsys.hls_to_rgb(h, l, s_))
+        return c
+    for role in THEME_ROLES:
+        if role in ("bg", "sel") or not t.get(role):
+            continue
+        t[role] = push(t[role], *CONTRAST.get(role, CONTRAST_TEXT))
+    if contrast(t["dim"], bg) > contrast(t["fg"], bg) * 0.8:  # dim must still read as dim
+        t["dim"] = _mix(t["fg"], bg, 0.55)
+        t["dim"] = push(t["dim"], *CONTRAST["dim"])
+    return t
+
+
+def load_theme(name):
+    """Theme name/path -> roles dict (contrast-tuned), or 'default' / 'mono'. Raises Fail for unknown names."""
+    if name in ("default", "mono"):
+        return name
+    if name in THEMES:
+        return tune_contrast(dict(zip(THEME_ROLES, THEMES[name].split())))
+    if os.path.isfile(os.path.expanduser(name)):
+        return tune_contrast(parse_btop(os.path.expanduser(name)))
+    path = btop_themes().get(name.removeprefix("btop:"))
+    if path:
+        return tune_contrast(parse_btop(path))
+    raise Fail("unknown theme %r; `tshed theme` lists them" % name)
+
+
+def truecolor():
+    """24-bit color, like btop's truecolor option: TINYSHED_TRUECOLOR=1/0 forces it, else detect the terminal."""
+    force = os.environ.get("TINYSHED_TRUECOLOR")
+    if force in ("0", "1"):
+        return force == "1"
+    t = os.environ.get("TERM", "")
+    return (os.environ.get("COLORTERM") in ("truecolor", "24bit") or "direct" in t or "kitty" in t or "ghostty" in t
+            or os.environ.get("TERM_PROGRAM") in ("iTerm.app", "WezTerm", "ghostty", "vscode", "Hyper", "rio"))
+
+
+def sgr_color(hexc, bg=False):
+    r, g, b = (int(hexc[i:i + 2], 16) for i in (0, 2, 4))
+    if truecolor():
+        return "%d;2;%d;%d;%d" % (48 if bg else 38, r, g, b)
+    lv = (0, 95, 135, 175, 215, 255)  # xterm-256: 6x6x6 cube or the 24-step grey ramp, whichever is nearer
+    q = [min(range(6), key=lambda i: abs(lv[i] - v)) for v in (r, g, b)]
+    gi = min(23, max(0, round(((r + g + b) / 3 - 8) / 10)))
+    dist = lambda c: sum((x - y) ** 2 for x, y in zip(c, (r, g, b)))
+    n = 16 + 36 * q[0] + 6 * q[1] + q[2] if dist([lv[i] for i in q]) <= dist([8 + 10 * gi] * 3) else 232 + gi
+    return "%d;5;%d" % (48 if bg else 38, n)
+
+
+def palette(t, paint_bg=False):
+    """Roles -> the escape sequence of every style constant."""
+    if t == "default":
+        return dict(RESET="\x1b[0m", DIM="\x1b[2m", BOLD="\x1b[1m", GREEN="\x1b[32m", CYAN="\x1b[36m", RED="\x1b[31m",
+                    MAGENTA="\x1b[35m", BLUE="\x1b[34m", BOLD_YELLOW="\x1b[1;33m", BOLD_CYAN="\x1b[1;36m",
+                    BOLD_RED="\x1b[1;31m", KEY="\x1b[1;33m", HILITE="\x1b[48;5;237;1m")
+    if t == "mono":
+        b = "\x1b[1m"
+        return dict(RESET="\x1b[0m", DIM="\x1b[2m", BOLD=b, GREEN="", CYAN="", RED=b, MAGENTA="", BLUE="",
+                    BOLD_YELLOW=b, BOLD_CYAN=b, BOLD_RED=b, KEY=b, HILITE="\x1b[7m")
+    c = lambda role, bold=False: "\x1b[%s%sm" % ("1;" if bold else "", sgr_color(t[role]))
+    base = ""
+    if paint_bg and t.get("bg"):
+        base = "\x1b[%s;%sm" % (sgr_color(t["fg"]), sgr_color(t["bg"], bg=True))
+    sel = "\x1b[1;%s%sm" % (sgr_color(t["sel"], bg=True), ";" + sgr_color(t["sel_fg"]) if t.get("sel_fg") else "") \
+        if t.get("sel") else "\x1b[7m"
+    return dict(RESET="\x1b[0m" + base, DIM=c("dim"), BOLD=c("title", True), GREEN=c("ok"), CYAN=c("info"),
+                RED=c("err"), MAGENTA=c("cancel"), BLUE=c("accent"), BOLD_YELLOW=c("warn", True),
+                BOLD_CYAN=c("host", True), BOLD_RED=c("err", True), KEY=c("key", True), HILITE=sel)
+
+
+def saved_theme():
+    try:
+        with open(P("theme")) as f:
+            return f.read().strip() or "default"
+    except OSError:
+        return "default"
+
+
+def current_theme():
+    return os.environ.get("TINYSHED_THEME") or saved_theme()
+
+
+def apply_theme(name=None, paint_bg=False):
+    """Rebind the style constants. A broken saved theme (e.g. btop uninstalled) falls back to default."""
+    global STATE_STYLE
+    try:
+        t = load_theme(name or current_theme())
+    except (Fail, OSError, ValueError):
+        t = "default"
+    globals().update(palette(t, paint_bg))
+    STATE_STYLE = dict(running=(GREEN, "▶"), queued=(BOLD_YELLOW, "◌"), pending=(CYAN, "◌"), done=(GREEN, "✓"),
+                       cancelled=(MAGENTA, "■"), moved=(CYAN, "→"))  # every failure: (BOLD_RED, "●")
+
+
+def theme_cmd(name):
+    if name:
+        load_theme(name)  # validate
+        if name in ("default", "mono") or name in THEMES or name.startswith("btop:"):
+            pass
+        elif os.path.isfile(os.path.expanduser(name)):
+            name = os.path.abspath(os.path.expanduser(name))
+        else:
+            name = "btop:" + name
+        with open(P("theme"), "w") as f:
+            f.write(name + "\n")
+        print("theme", name)
+        if os.environ.get("TINYSHED_THEME"):
+            print("note: TINYSHED_THEME=%s overrides it in this shell" % os.environ["TINYSHED_THEME"], file=sys.stderr)
+        return
+    cur = current_theme()
+    print("colors: %s (TINYSHED_TRUECOLOR=1/0 to force)" % ("24-bit truecolor" if truecolor() else "256-color approximation"))
+    for n in theme_names():
+        apply_theme(n)
+        mark = "*" if n == cur else " "
+        out([("", "%s %-26s " % (mark, n)), (GREEN, "▶ running "), (BOLD_YELLOW, "◌ queued "), (CYAN, "◌ pending "),
+             (BOLD_RED, "● error "), (MAGENTA, "■ cancelled "), (BOLD_CYAN, "host "), (KEY, "[K]"), ("", " "), (DIM, "dim "),
+             (HILITE, " selected ")])
+    apply_theme()
+
+
+apply_theme("default")
+HOST_HEAD = "%-12s  %-7s %5s %5s  %7s  %10s  %9s  %-8s %4s %4s  %6s  %6s  %s" % ("Host", "State", "Load", "CPU%", "Cores", "Mem free", "Used/Res", "GPU", "Run", "Que", "Seen", "Freq", "Notes")
+JOB_HEAD = "%-11s %3s %4s  %-12s  %-8s  %8s  %5s  %4s  %11s  %-16s  %s" % ("State", "CPU", "Prio", "Host", "ID", "Time", "Try", "CPU%", "Mem", "Name", "Command")
 
 
 def styled(segments, width, base=""):
@@ -1178,16 +1704,22 @@ def load_hosts(db):
 _jcache = {}  # job id -> (stored blob, decoded payload)
 
 
+def _blob(r):
+    if _jcache.get(r["id"], (None,))[0] != r["j"]:
+        _jcache[r["id"]] = (r["j"], unpack(r["j"]))
+    return _jcache[r["id"]][1]
+
+
 def load_jobs(db, hosts):
     skew = {h["name"]: h["s"].get("skew", 0) for h in hosts}
+    live = {h["name"]: h["s"].get("jobs") or {} for h in hosts}
     out = []
     for r in db.execute("SELECT * FROM jobs"):
-        if _jcache.get(r["id"], (None,))[0] != r["j"]:
-            _jcache[r["id"]] = (r["j"], unpack(r["j"]))
-        j = dict(_jcache[r["id"]][1])
+        j = dict(_blob(r))
         j.update(id=r["id"], host=r["host"], state=r["state"], prio=r["prio"], sent=r["sent"], cancel=r["cancel"])
         if j["state"] == "running":
             j["t"] = time.time() + skew.get(r["host"], 0) - (j.get("started") or 0)
+            j["cpu_pct"], j["rss_mb"] = live.get(r["host"], {}).get(r["id"]) or (None, None)
         elif j["state"] in TERMINAL:
             j["t"] = (j.get("ended") or 0) - (j.get("started") or j.get("ended") or 0)
         else:
@@ -1213,21 +1745,54 @@ def host_segs(h):
     gpus = s.get("gpus") or []
     gpu = "%dx %d%%" % (len(gpus), sum(g["util"] for g in gpus) / len(gpus)) if gpus else "-"
     run, que = c.get("running", 0), c.get("queued", 0)
+    used, res = s.get("mem_used_mb"), s.get("mem_reserved_mb")
+    job_mem = "-" if used is None else "%.1f/%.1fG" % (used / 1024, res / 1024) if res is not None else "%.1f/?G" % (used / 1024)
+    over_mem = used is not None and res is not None and used > res
+    hot_cpu = s.get("cpu_pct") is not None and s["cpu_pct"] > 100
+    warnings = s.get("warnings") or []
     notes = h["err"] or "; ".join(n for n in (
         "agent down" if s and not s.get("agent") else "",
-        "v%s, server is v%s: run tshed install" % (s.get("version"), VERSION) if s and s.get("version") != VERSION else "") if n)
+        "v%s, server is v%s: run tshed install" % (s.get("version"), VERSION) if s and s.get("version") != VERSION else "",
+        "%.0fW" % s["power_w"] if s.get("power_w") is not None else "",
+        *warnings) if n)
     return [(BOLD_CYAN, "%-12s" % h["name"][:12]), ("", "  "), (state[0], "%-7s" % state[1]),
             ("", " %5s" % ("%.1f" % s["load"] if s else "-")),
-            ("", " %5s  " % ("%d%%" % s["cpu_pct"] if s and s.get("cpu_pct") is not None else "-")),
+            (BOLD_RED if hot_cpu else "", " %5s  " % ("%d%%" % s["cpu_pct"] if s and s.get("cpu_pct") is not None else "-")),
             (KEY, "%7s" % ("%d/%d" % (s["free"], s["cores"]) if s else "-")),
-            ("", "  %10s  %-8s " % (mem, gpu)), (GREEN if run else DIM, "%4d" % run), ("", " "), (BOLD_YELLOW if que else DIM, "%4d" % que),
-            (DIM, "  %6s  " % (fmt_dur(time.time() - h["seen"]) if h["seen"] else "never")), (BOLD_RED if h["err"] else BOLD_YELLOW, clean(notes))]
+            ("", "  %10s  " % mem), (BOLD_RED if over_mem else "", "%9s  " % job_mem),
+            ("", "%-8s " % gpu), (GREEN if run else DIM, "%4d" % run), ("", " "), (BOLD_YELLOW if que else DIM, "%4d" % que),
+            (DIM, "  %6s  " % (fmt_dur(time.time() - h["seen"]) if h["seen"] else "never")),
+            ("", "%6s  " % ("%.1fGHz" % s["cpu_ghz"] if s.get("cpu_ghz") is not None else "-")),
+            (BOLD_RED if h["err"] else BOLD_YELLOW, clean(notes))]
+
+
+def fmt_mem(used, limit):
+    """Usage against the -m limit in one unit, picked by the larger value: '32/64M', '0.3/3.2G';
+    just '324M' / '3.2G' without a limit."""
+    if used is None:
+        return "-"
+    if max(used, limit or 0) < 1024:
+        return "%d/%dM" % (used, limit) if limit else "%dM" % used
+    g = lambda mb: ("%.1f" % (mb / 1024)).removesuffix(".0")
+    return "%s/%sG" % (g(used), g(limit)) if limit else g(used) + "G"
 
 
 def job_segs(j):
-    return [state_seg(j), (KEY, " %4d" % j["prio"]), ("", "  "), (BOLD_CYAN, "%-12s" % (j["host"] or "(any)")[:12]),
+    """Running jobs show live CPU% (of their assigned cores) and RSS; finished ones their peak RSS."""
+    pct = j.get("cpu_pct")
+    used = j.get("rss_mb") if j["state"] == "running" else j.get("peak_mb") or None if j["state"] in TERMINAL else None
+    over = used is not None and j.get("mem_mb") and used > 0.9 * j["mem_mb"]
+    segs = [state_seg(j), (KEY, " %3d" % (j.get("cpus") or 1)),
+            (KEY, " %4d" % j["prio"]), ("", "  "), (BOLD_CYAN, "%-12s" % (j["host"] or "(any)")[:12]),
             ("", "  %-8s  %8s  " % (j["id"], fmt_dur(j["t"]))), (DIM, "%5s" % ("%d/%d" % (j.get("attempt") or 0, (j.get("retries") or 0) + 1))),
-            (DIM if j["state"] in TERMINAL else "", "  " + clean(j["cmd"]))]
+            (BOLD_RED if pct is not None and pct > 105 else "", "  %4s" % ("-" if pct is None else "%d%%" % round(pct))),
+            (BOLD_RED if over else "", "  %11s" % fmt_mem(used, j.get("mem_mb"))),
+            ("", "  "), (BOLD, "%-16s" % clean(j.get("name") or "-")[:NAME_MAX]), ("", "  " + clean(j["cmd"]))]
+    if j["state"] in TERMINAL and j["state"] != "done":
+        segs = segs[:1] + [(DIM, t) for _, t in segs[1:]]
+    elif j["state"] == "done":
+        segs = [(DIM, t) for _, t in segs]
+    return segs
 
 
 def meta_segs(j):
@@ -1237,6 +1802,8 @@ def meta_segs(j):
             ("", "   Try: %d/%d" % (j.get("attempt") or 0, (j.get("retries") or 0) + 1)),
             ("", "   Cores: "), (KEY, "%s" % (j.get("cores") or j.get("cpus") or "-")),
             ("", "   Mem peak: %s%s" % (lim("peak_mb", lambda v: "%dM" % v), " of %dM" % j["mem_mb"] if j.get("mem_mb") else "")),
+            *([("", "   CPU%%: %s   Mem: %s" % ("-" if j.get("cpu_pct") is None else "%d%%" % round(j["cpu_pct"]),
+                                              fmt_mem(j.get("rss_mb"), j.get("mem_mb"))))] if j["state"] == "running" else []),
             ("", "   Timeout: %s" % lim("timeout", fmt_dur)), ("", "   rc: "),
             (GREEN if j.get("rc") == 0 else BOLD_RED if j.get("rc") else DIM, "-" if j.get("rc") is None else str(j["rc"])),
             ("", "   %s: %s" % ("Waiting" if j["state"] in ("pending", "queued") else "Ran", fmt_dur(j["t"])))]
@@ -1244,7 +1811,7 @@ def meta_segs(j):
 
 def show(j, log):
     t = lambda k: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(j[k])) if j.get(k) else "-"
-    out([("", "Job: "), (BOLD_CYAN, j["id"]), ("", "   Host: "), (BOLD_CYAN, j["host"] or "(any)")])
+    out([("", "Job: "), (BOLD_CYAN, j["id"]), ("", "   Name: "), (BOLD, clean(j.get("name") or "-")), ("", "   Host: "), (BOLD_CYAN, j["host"] or "(any)")])
     out(meta_segs(j))
     out([("", "Cmd: "), (BOLD, j["cmd"])])
     out([(DIM, "cwd %s   env %s   retry on %s   created %s   started %s   ended %s" % (
@@ -1255,7 +1822,7 @@ def show(j, log):
 
 
 ALT_ON = "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h"   # alternate screen, hide cursor, SGR mouse
-ALT_OFF = "\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l"
+ALT_OFF = "\x1b[0m\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l"
 KEYS_UP, KEYS_DOWN = ("\x1b[A", "\x1bOA", "\x10"), ("\x1b[B", "\x1bOB", "\x0e")
 KEYS_PGUP, KEYS_PGDN = ("\x1b[5~", "\x1b[1;5A", "\x1b[1;2A"), ("\x1b[6~", "\x1b[1;5B", "\x1b[1;2B")
 KEYS_LEFT, KEYS_RIGHT = ("\x1b[D", "\x1bOD"), ("\x1b[C", "\x1bOC")
@@ -1269,6 +1836,8 @@ def tui(interval):
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     db = sdb()
+    apply_theme(paint_bg=True)
+    themes = theme_names()
     st = dict(sel=0, top=0, query="", hide=False, detail=None, scroll=None, msg=("", ""), prompt=None, log=(None, ""),
               fetching=False, fetched=0, synced=0, row0=0, rows=0, syncing=False)
     wake, stop = threading.Event(), threading.Event()
@@ -1343,7 +1912,7 @@ def tui(interval):
         label, text, _ = st["prompt"]
         hint = "[Enter: confirm, Esc: cancel, Ctrl-U: clear]"
         if label.startswith("New job"):
-            hint = "[-H host  -p prio  -c cpus  -m mem  -t timeout  -r retries, then the command]"
+            hint = "[-n name (required)  -H host  -p prio  -c cpus  -m mem  -t timeout  -r retries, then the command]"
         text = text[-max(10, W - len(label) - 8):]
         return styled([(BOLD_YELLOW, label + " "), (BOLD_CYAN, text + "█"), ("", "   "), (DIM, hint)], W)
 
@@ -1395,8 +1964,9 @@ def tui(interval):
         L.extend([""] * (H - 3 - len(L)))
         # 4. status message, 5. help line, 6. footer
         L.append(styled([st["msg"]], W))
-        L.append(help_line([("Enter/→", "detail"), ("N", "new"), ("K", "cancel"), ("E", "rerun"), ("P", "prio"), ("A", "attach"), ("O", "shell"),
-                            ("H", "show done" if st["hide"] else "hide done"), ("C", "config"), ("R", "refresh"), ("Esc", "exit")], W))
+        L.append(help_line([("Enter/→", "detail"), ("N", "new"), ("K", "cancel"), ("E", "rerun"), ("P", "prio"), ("F", "force"), ("M", "move"),
+                            ("A", "attach"), ("O", "shell"), ("H", "show done" if st["hide"] else "hide done"), ("C", "config"),
+                            ("T", "theme"), ("R", "refresh"), ("Esc", "exit")], W))
         age = "syncing…" if st["syncing"] and not st["synced"] else "synced %s ago" % fmt_dur(time.time() - st["synced"]) if st["synced"] else "not synced yet"
         L.append(styled([(DIM, "Server: %s   (%d/%d jobs shown)   %s" % (HOME.replace(os.path.expanduser("~"), "~"), len(jobs), total, age))], W))
         return L, H
@@ -1404,7 +1974,7 @@ def tui(interval):
     def draw_detail(j):
         W, H = shutil.get_terminal_size()
         W -= 1
-        L = [prompt_bar(W) if st["prompt"] else styled([("", "Job: "), (BOLD_CYAN, j["id"]), ("", "   Host: "), (BOLD_CYAN, j["host"] or "(any)"), ("", "   "),
+        L = [prompt_bar(W) if st["prompt"] else styled([("", "Job: "), (BOLD_CYAN, j["id"]), ("", "   Name: "), (BOLD, clean(j.get("name") or "-")), ("", "   Host: "), (BOLD_CYAN, j["host"] or "(any)"), ("", "   "),
                                                          (DIM, "(%s on the host)" % ("~/.tinyshed/logs/%s.log" % j["id"]))], W),
              styled(meta_segs(j), W), styled([("", "Cmd: "), (BOLD, clean(j["cmd"]))], W), "─" * W]
         text = st["log"][1] if st["log"][0] == j["id"] else (j.get("tail") or "")
@@ -1421,7 +1991,7 @@ def tui(interval):
         L.append(styled([st["msg"]], W) if st["msg"][1] else styled([(DIM, "Scroll: %d-%d/%d%s" % (
             top + 1, min(len(lines), top + room), len(lines), "   (following)" if st["scroll"] is None and j["state"] == "running" else "")
             if lines else "No output yet" if j["sent"] else "Not on a host yet")], W))
-        L.append(help_line([("Esc/←", "back"), ("↑/↓", "scroll"), ("K", "cancel"), ("E", "rerun"), ("P", "prio"), ("A", "attach"), ("O", "shell"), ("C", "config"), ("R", "refresh")], W))
+        L.append(help_line([("Esc/←", "back"), ("↑/↓", "scroll"), ("K", "cancel"), ("E", "rerun"), ("P", "prio"), ("F", "force"), ("M", "move"), ("A", "attach"), ("O", "shell"), ("C", "config"), ("R", "refresh")], W))
         return L, H
 
     threading.Thread(target=syncer, daemon=True).start()
@@ -1436,7 +2006,7 @@ def tui(interval):
                 counts[j["state"]] = counts.get(j["state"], 0) + 1
             words = st["query"].lower().split()
             jobs = [j for j in everything if not (st["hide"] and j["state"] in TERMINAL)
-                    and all(w in ("%s %s %s %s" % (j["state"], j["host"], j["id"], j["cmd"])).lower() for w in words)]
+                    and all(w in ("%s %s %s %s %s" % (j["state"], j["host"], j["id"], j.get("name") or "", j["cmd"])).lower() for w in words)]
             if st["detail"]:  # stay on the same job even as the list reorders
                 st["sel"] = next((i for i, j in enumerate(jobs) if j["id"] == st["detail"]), st["sel"])
             st["sel"] = max(0, min(st["sel"], len(jobs) - 1))
@@ -1448,7 +2018,7 @@ def tui(interval):
                 st["fetching"] = True
                 threading.Thread(target=fetch_log, args=(cur, dests[cur["host"]]), daemon=True).start()
             L, H = draw_detail(cur) if st["detail"] else draw_main(hosts, jobs, len(everything), counts, cur)
-            OUT.write("\x1b[?2026h\x1b[H" + "\x1b[K\n".join(L[:H]) + "\x1b[K\x1b[J\x1b[?2026l")  # one atomic frame
+            OUT.write("\x1b[?2026h\x1b[H" + RESET + "\x1b[K\n".join(L[:H]) + "\x1b[K\x1b[J\x1b[?2026l")  # one atomic frame
             OUT.flush()
             key = get_key(0.5)
             if not key:
@@ -1507,6 +2077,14 @@ def tui(interval):
                 wake.set()
             elif key == "H":
                 st["hide"] = not st["hide"]
+            elif key == "T":  # next theme, saved; TINYSHED_THEME (if set) only picks the starting point
+                cur_t = current_theme() if st.get("theme") is None else st["theme"]
+                st["theme"] = themes[(themes.index(cur_t) + 1) % len(themes) if cur_t in themes else 0]
+                with open(P("theme"), "w") as f:
+                    f.write(st["theme"] + "\n")
+                os.environ.pop("TINYSHED_THEME", None)
+                apply_theme(st["theme"], paint_bg=True)
+                say("Theme: %s (%d/%d)   [T] next" % (st["theme"], themes.index(st["theme"]) + 1, len(themes)), KEY)
             elif key == "C":
                 ok, msg = edit_cfg(load_cfg(), "local %s" % P("config.json"), save_cfg, run_fg)
                 say(msg, GREEN if ok else BOLD_RED)
@@ -1535,6 +2113,21 @@ def tui(interval):
                     except ValueError:
                         say("Priority must be an integer", BOLD_RED)
                 st["prompt"] = ("Priority for %s (now %d):" % (cur["id"], cur["prio"]), "", prio)
+            elif key == "F" and cur and cur["state"] in ("pending", "queued"):
+                def force(text, jid=cur["id"]):
+                    if text.lower() in ("y", "yes"):
+                        say("Forcing %s…" % jid, BOLD_YELLOW)
+                        background(lambda tdb: say("%s: %s" % (jid, "; ".join(edit_job(tdb, jid, force=True))), GREEN))
+                st["prompt"] = ("Force-start %s now, ahead of the queue (even on busy cores)? [y/N]:" % cur["id"], "", force)
+            elif key == "M" and cur and cur["state"] in ("pending", "queued"):
+                def move(text, jid=cur["id"]):
+                    text = text.strip()
+                    if text:
+                        host = None if text == "any" else text
+                        say("Moving %s to %s…" % (jid, text), BOLD_YELLOW)
+                        background(lambda tdb: say("%s: %s" % (jid, "; ".join(edit_job(tdb, jid, host=host))), GREEN))
+                st["prompt"] = ("Move %s (on %s) to host [%s|any]:" % (cur["id"], cur["host"] or "(any)",
+                                                                      "|".join(n for n in dests if n != cur["host"])), "", move)
             elif key in ("A", "O") and cur and cur["host"] in dests and (key == "O" or cur["sent"]):
                 argv = attach_argv(dests[cur["host"]], cur["id"] if key == "A" else None)
                 run_fg(argv)
@@ -1557,8 +2150,10 @@ def tui(interval):
 EXAMPLES = """examples (tshed = this file, symlinked into PATH):
   tshed install gpu1=gpu1.local,gpu1 gpu2=me@gpu2    install or upgrade hosts (no hosts given: upgrade all)
   tshed hosts                                         ping hosts: load, idle cores, memory, GPUs
-  tshed submit -H gpu1 -p 5 -c 8 -m 32G -t 12h -r 2 -- python train.py
+  tshed submit -n train -H gpu1 -p 5 -c 8 -m 32G -t 12h -r 2 -- python train.py
   tshed ls -a;  tshed show ID;  tshed logs ID;  tshed wait ID;  tshed cancel ID
+  tshed edit ID -p 9 -H gpu2 --force                  re-prioritise, move, or start a waiting job now
+  tshed theme dracula                                 pick a color theme (tshed theme: list them)
   tshed overview                                      hosts + active jobs, one screen
   tshed config --edit                                 edit this machine's config in $EDITOR
   tshed config --host gpu1 --edit                     edit gpu1's config over ssh
@@ -1642,10 +2237,23 @@ def build_parser():
     s = sub.add_parser("prio", help="change a waiting job's priority")
     s.add_argument("id")
     s.add_argument("prio", type=int)
+    s = sub.add_parser("edit", help="change a waiting job: priority, host, or force it to start now",
+                       description="Edit a pending or queued job. -H moves it to another host ('any' unpins it); a job "
+                                   "already queued on a host is withdrawn from there first, only if it has not started. "
+                                   "--force starts it right away, ahead of the queue and even on busy cores.")
+    s.add_argument("id")
+    s.add_argument("-p", "--prio", type=int, help="new priority (higher runs first)")
+    s.add_argument("-H", "--host", help="move to this host; 'any' lets the server pick")
+    s.add_argument("-f", "--force", action="store_true", help="start now: skip the queue order, share busy cores if needed")
     s = sub.add_parser("serve", help="headless server loop: deliver jobs, ingest events, run callbacks")
     s.add_argument("-i", "--interval", type=float, default=10, help="poll seconds")
     s = sub.add_parser("tui", help="interactive dashboard (the default); also the server loop while open")
     s.add_argument("-i", "--interval", type=float, default=5, help="poll seconds")
+    s = sub.add_parser("theme", help="list color themes, or pick one",
+                       description="Without NAME: list the built-in themes and installed btop themes, each as a sample row "
+                                   "(* = current). With NAME (a theme name, btop:NAME, or a path to a btop .theme file): save "
+                                   "it for this server's cli and dashboard. TINYSHED_THEME overrides the saved choice.")
+    s.add_argument("name", nargs="?", metavar="NAME")
     s = sub.add_parser("completion", help="print a shell completion script")
     s.add_argument("shell", choices=("fish", "zsh", "bash"))
     public = [c.dest for c in sub._choices_actions]
@@ -1683,7 +2291,7 @@ def completion(shell, sub, public):
             if act.option_strings and act.dest != "help":
                 flags.append((act.option_strings, act.nargs != 0, act.help))
             elif act.dest in ("id", "ids"):
-                kind = "active" if name in ("wait", "cancel", "prio") else "jobs"
+                kind = "active" if name in ("wait", "cancel", "prio", "edit") else "jobs"
             elif act.dest in ("hosts", "names"):
                 kind = "hosts"
             elif act.dest == "shell":
@@ -1732,7 +2340,8 @@ def complete(db, kind):
     else:
         where = "WHERE state NOT IN (%s)" % ",".join("'%s'" % t for t in TERMINAL) if kind == "active" else ""
         for r in db.execute("SELECT id, host, state, j FROM jobs %s ORDER BY created DESC LIMIT 40" % where):
-            print("%s\t%s %s: %s" % (r["id"], r["state"], r["host"] or "(any)", clean(unpack(r["j"]).get("cmd"))[:50]))
+            b = unpack(r["j"])
+            print("%s\t%s %s %s: %s" % (r["id"], b.get("name") or "-", r["state"], r["host"] or "(any)", clean(b.get("cmd"))[:40]))
 
 
 def main():
@@ -1757,6 +2366,9 @@ def main():
     if a.op == "completion":
         return print(completion(a.shell, sub, public))
 
+    apply_theme()
+    if a.op == "theme":
+        return theme_cmd(a.name)
     zmod()  # fail early, with a clear message, if this machine has no zstd
     db = sdb()
     known = {r["name"]: r["dest"] for r in db.execute("SELECT name, dest FROM hosts")}
@@ -1855,7 +2467,8 @@ def main():
         sync_all()
         jobs = [j for j in load_jobs(db, load_hosts(db)) if a.all or j["state"] not in TERMINAL]
         if a.json:
-            keys = ("id", "host", "state", "prio", "attempt", "rc", "cmd", "created", "started", "ended", "peak_mb")
+            keys = ("id", "name", "host", "state", "prio", "attempt", "rc", "cmd", "created", "started", "ended", "peak_mb",
+                    "cpus", "mem_mb", "cpu_pct", "rss_mb")
             for j in jobs:
                 print(json.dumps({k: j.get(k) for k in keys}))
         elif not jobs:
@@ -1895,6 +2508,12 @@ def main():
         for jid in ids:
             s = db.execute("SELECT state FROM jobs WHERE id=?", (jid,)).fetchone()[0]
             print(jid, s if s in TERMINAL else "cancelling")
+    elif a.op == "edit":
+        jid = resolve(db, a.id)
+        if a.prio is None and a.host is None and not a.force:
+            raise Fail("nothing to change: give -p PRIO, -H HOST or --force")
+        host = False if a.host is None else None if a.host in ("any", "") else a.host
+        print(jid, "; ".join(edit_job(db, jid, a.prio, host, a.force)))
     elif a.op == "prio":
         jid = resolve(db, a.id)
         set_prio(db, jid, a.prio)

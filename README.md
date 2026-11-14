@@ -16,9 +16,9 @@ tinyshed tui | serve  ── ssh: rpc ──▶   agent ──▶ watchdog ─�
 ```sh
 ln -s $PWD/tinyshed.py ~/bin/tshed                                  # the command is `tshed`
 tshed install gpu1=gpu1.local,gpu1 gpu2=me@gpu2 --home me@thisbox   # ~1s per host, in parallel
-tshed hosts                                                         # ping: load, CPU%, idle cores, memory, GPUs
-tshed submit -p 5 -c 8 -m 32G -t 12h -r 2 -- python train.py --lr 3e-4
-tshed submit -H gpu1 -C ~/proj -e CUDA_VISIBLE_DEVICES=0 -- ./run.sh
+tshed hosts                                                         # ping: load, CPU%, used/reserved RAM, freq, idle cores, memory, GPUs
+tshed submit -n lr3e-4 -p 5 -c 8 -m 32G -t 12h -r 2 -- python train.py --lr 3e-4
+tshed submit -n run -H gpu1 -C ~/proj -e CUDA_VISIBLE_DEVICES=0 -- ./run.sh
 tshed                                                               # dashboard
 tshed serve                                                         # or: headless server loop
 ```
@@ -30,10 +30,12 @@ tshed serve                                                         # or: headle
 | `hosts [--json] [--rm NAME]` | ping all hosts |
 | `config [--edit] [--host HOST…]` | show, or edit in `$VISUAL`/`$EDITOR`, this machine's `config.json` (`name`, `cores`, `home`). `--host` (repeatable) reads/writes a registered host's config over ssh; edits are validated before saving. Dashboard: `C` |
 | `overview [-n N] [-a]` | compact, non-interactive digest of `hosts` + `ls`: hosts table, `---LS` divider, active-jobs table, each capped at N lines (default 30). One sync feeds both; `-a` adds finished jobs |
-| `submit [flags] -- CMD` | queue a job |
+| `submit -n NAME [flags] -- CMD` | queue a job. `-n` is required: 1-16 characters, no spaces; it shows in `ls`/the dashboard and can stand in for the id anywhere an ID is taken (an unfinished job of that name wins; several → use the id) |
 | `ls [-a] [--json]`, `show ID`, `logs [-f] ID` | list, inspect, read output (ids may be prefixes) |
 | `wait ID… [-t 2h]` | block; exit 0 done / 1 failed / 2 timeout |
 | `cancel ID…`, `prio ID N` | |
+| `edit ID [-p N] [-H HOST\|any] [--force]` | change a waiting (`pending`/`queued`) job: priority, host (move; `any` unpins), or force it to start now. Dashboard: `P`, `M`, `F` |
+| `theme [NAME]` | list color themes with samples, or pick one (saved in `~/.tinyshed/theme`; `TINYSHED_THEME` overrides). Dashboard: `T` cycles |
 | `completion fish`/`zsh`/`bash` | tab completion, including host names and job ids |
 
 Output is coloured on a terminal and plain in a pipe (`NO_COLOR` is respected). Tutorial: `HUMANS.md`;
@@ -55,7 +57,25 @@ agent skill: `skills/tinyshed/`.
   `host_processor_info`) sampled between polls, so it is an average over the poll interval. It reads
   `-` until two samples exist or where the OS has no per-core counters. On macOS jobs are unpinned
   (no `taskset`), so a configured core subset is only a scheduling budget and its `CPU%` need not
-  track job usage.
+  track job usage. A value above 100% is impossible with sound counters (jobs are pinned to their
+  cores), so it is flagged red and adds a warning to Notes.
+- **Used/Res.** The live RSS of running jobs over the sum of their `-m` RSS limits, in GB
+  (`2.0/8.0G`). It turns red when used exceeds reserved: the watchdog kills a job that passes its
+  `-m` limit, so that should not happen (shared pages are counted per process, which can over-report).
+  `?` means at least one running job set no `-m`. Separate from `Mem free`, which is whole-machine
+  available/total. Both anomalies also appear in `hosts --json` under `warnings`.
+- **Job CPU% / Mem.** Each running job's row in `ls` and the dashboard shows its own usage. `CPU%`
+  is the CPU time of the job's whole process tree since the previous poll, divided by elapsed time ×
+  cores assigned (`-c`): a 2-core job with one busy thread reads 50%. `Mem` is the tree's live RSS over
+  its `-m` limit in one unit (`32/64M`, `0.3/3.2G`, or just `324M` / `3.2G` without `-m`), red above 90% of the limit.
+  Finished jobs show their peak RSS (`-` if the watchdog never sampled it). Both are measured on the host
+  in each status poll (`-` until two polls); on macOS, CPU time of exited children is lost.
+- **Freq / power.** `Freq` is the mean current clock of tinyshed's cores, from per-core OS counters
+  (Linux sysfs `scaling_cur_freq`, else `/proc/cpuinfo`; Intel macOS `hw.cpufrequency`). Apple Silicon
+  hides the clock, so it reads `-` there. Whole-host power draw appears in Notes in watts when the OS
+  exposes a counter: Linux RAPL package energy (a delta between polls) or battery discharge rate. On
+  macOS, where `powermetrics` needs root, the battery's own draw is used while discharging and the
+  charger's wattage when plugged in (an upper bound, not a measured reading).
 - **Transport.** Every server→host interaction is one `ssh host tinyshed.py rpc` call (JSON in/out)
   that delivers pending jobs and cancels, pulls events after the cursor and reads resources. All of it
   is idempotent, so retries are safe. ssh connections are multiplexed (`ControlMaster`), ~0.1s a poll.
@@ -104,8 +124,45 @@ when edited.
 
 Built like `gitss`: alternate screen, atomic synchronized frames, type-to-filter, capital command keys,
 mouse wheel and click. `Enter`/`→` detail with a scrollable live log, `N` new job (same flags as
-`submit`), `K` cancel, `E` rerun, `P` priority, `A` follow the log on the host (mosh), `O` shell on the
+`submit`), `K` cancel, `E` rerun, `P` priority, `F` force-start, `M` move to another host, `T` next theme, `A` follow the log on the host (mosh), `O` shell on the
 host (mosh), `H` hide finished, `R` refresh, `Esc`/`Q` quit. While open, the TUI is also the server loop.
+
+## Editing jobs
+
+- **Move** (`edit -H`, `M`). An undelivered job is just re-pinned. A job already queued on a host is
+  first *withdrawn* there: the host flips it `queued → moved` only if it has not started (a conditional
+  update, like a claim), and the server re-sends it to the new host under the same id. A host that is
+  unreachable, or where the job already started, refuses and nothing changes. Moving a job back to a host
+  that once gave it up re-queues the old row. Retry attempts start over on the new host.
+- **Force** (`edit --force`, `F`). The host marks the job `force`; its scheduler starts forced jobs first,
+  regardless of priority order, retry backoff or free cores: it takes idle cores first, then shares busy
+  ones (so `CPU%` of the sharing jobs drops). A host-less job is placed on the live host with the most
+  spare cores. The flag clears when the job starts, so a retry queues normally.
+- **Priority** (`edit -p`, `P`, `prio`) as before. All three only apply to `pending`/`queued` jobs; the
+  host answers each op with the job's state, and a host running an older tinyshed is reported (upgrade
+  with `tshed install`).
+
+## Themes
+
+`tshed theme` lists every theme as a sample row; `tshed theme NAME` saves the choice for this server
+(cli and dashboard); `T` in the dashboard cycles and saves. `TINYSHED_THEME=NAME` overrides per shell.
+
+- `default`: the terminal's own 16 ANSI colors (the gitss look); `mono`: bold/dim/reverse only.
+- Built-in truecolor palettes: `btop`, `cendre`, `catppuccin`, `catppuccin-latte`, `dracula`, `everforest`,
+  `gruvbox`, `gruvbox-light`, `kanagawa`, `monokai`, `nord`, `one-dark`, `rose-pine`,
+  `solarized-dark`, `solarized-light`, `tokyo-night`.
+- Any btop theme: `btop:NAME` from btop's theme dirs (`~/.config/btop/themes`, `$XDG_CONFIG_HOME`,
+  the btop install prefix, `/usr/share/btop/themes`, …), or a path to a `.theme` file. `title`,
+  `hi_fg` (keys), `selected_bg/fg`, `inactive_fg` and `main_fg/bg` map directly; the state colors
+  (ok/error/warning/…) take the theme's color nearest in hue.
+- Colors stay as the theme designed them. Only a color that is too faint is lightened (dark themes)
+  or darkened (light themes), keeping its hue, to WCAG contrast 4.5:1 against the background and 3.5:1
+  on the selection bar (7:1 plain text and headers, 3.2:1 dim); the selection bar is a tinted lift of
+  the background between 1.6:1 and 2.4:1. Tunables: `CONTRAST`, `CONTRAST_TEXT` in the code.
+
+In the dashboard a theme paints its own background; plain commands only recolor text. Without truecolor
+(`COLORTERM=truecolor`, or a known terminal such as ghostty/kitty/iTerm2/WezTerm) colors are
+downsampled to the 256-color palette; `TINYSHED_TRUECOLOR=1` / `0` forces either (like btop's truecolor option). A saved theme that no longer resolves falls back to `default`.
 
 ## Notes and limits
 

@@ -36,7 +36,7 @@ tshed serve                                                         # or: headle
 | `cancel ID…`, `prio ID N` | |
 | `edit ID [-p N] [-H HOST\|any] [--force]` | change a waiting (`pending`/`queued`) job: priority, host (move; `any` unpins), or force it to start now. Dashboard: `P`, `M`, `F` |
 | `theme [NAME] [--contrast N]` | list color themes with samples, or pick one (saved in `~/.tinyshed/theme`; `TINYSHED_THEME` overrides); `--contrast` stretches the palette: darker darks, lighter lights (level 0-10, default 4). Dashboard: `T` cycles, `B`/`D` contrast |
-| `scheme [ROLE=COLOR…] [--clear]` | list color roles with samples (* = overridden), or set individual colors on top of any theme (saved in `~/.tinyshed/scheme`; `TINYSHED_SCHEME='err=ff0000 …'` overrides). `COLOR` is 6 hex digits or a basic name (`red`, `bright_cyan`, …); `ROLE=default` removes that override |
+| `scheme [PRESET\|ROLE=COLOR…] [--clear]` | list color roles with samples (* = overridden) and the preset schemes, apply a preset wholesale (`neon pastel solarized hicon colorblind`), or set individual colors on top of any theme (saved in `~/.tinyshed/scheme`; `TINYSHED_SCHEME='err=ff0000 …'` overrides). `COLOR` is 6 hex digits or a basic name (`red`, `bright_cyan`, …); `ROLE=default` removes that override |
 | `completion fish`/`zsh`/`bash` | tab completion, including host names and job ids |
 
 Output is coloured on a terminal and plain in a pipe (`NO_COLOR` is respected). Tutorial: `HUMANS.md`;
@@ -189,6 +189,11 @@ tshed scheme err=ff00ff warn=bright_yellow sel=303050
 tshed scheme err=default              # back to the theme's error color
 tshed scheme --clear                  # remove every override
 ```
+
+Or start from a named preset, applied wholesale (`tshed scheme pastel`), and tweak from there
+(`tshed scheme pastel err=ff0055`): `neon`, `pastel`, `solarized`, `hicon` (maximum contrast) and
+`colorblind` (Okabe-Ito, safe for common color-vision types). Presets are tuned for dark palettes;
+`tshed scheme` shows each as a sample row and marks the active one.
 
 Overrides are saved in `~/.tinyshed/scheme` (`TINYSHED_SCHEME='err=ff0000 ok=00ff00'` overrides per
 shell, `err=default` in it drops that role's override). Roles: `ok info err warn cancel accent host

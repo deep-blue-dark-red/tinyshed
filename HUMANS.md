@@ -168,7 +168,9 @@ palette, header bar, striped rows) pick `tailwind-blue`, `-emerald`, `-indigo` o
 Happy with a theme except for one or two colors? Override individual roles on top of any theme:
 `tshed scheme err=ff00ff warn=bright_yellow sel=303050` (saved in `~/.tinyshed/scheme`; they survive
 `T` in the dashboard). `tshed scheme` lists every role with a sample, `tshed scheme err=default`
-undoes one, `--clear` undoes all, and `TINYSHED_SCHEME='err=ff0000'` overrides per shell.
+undoes one, `--clear` undoes all, and `TINYSHED_SCHEME='err=ff0000'` overrides per shell. There are
+also whole-scheme presets: `tshed scheme pastel` applies one, `neon`, `solarized`, `hicon` and
+`colorblind` are the others; `tshed scheme` shows them as sample rows and marks the active one.
 
 ## 6. Callbacks
 

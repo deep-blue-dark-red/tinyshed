@@ -15,6 +15,7 @@ changing the code.
 | `README.md` | reference: design, commands, hooks, limits |
 | `HUMANS.md` | tutorial |
 | `skills/tinyshed/SKILL.md` | agent usage skill |
+| `btop-themes/` | btop `.theme` files matching the built-in `tailwind-*` themes (for btop itself; tinyshed does not read them) |
 | `IDEAS_HEAP.md` | considered, not scheduled (binary packaging). Do not build from it unasked |
 
 ## Invariants — do not break

@@ -148,6 +148,7 @@ Arrow keys or the mouse wheel move, a click selects (click again to open), typin
 | `K` / `E` / `P` | cancel / rerun / change priority |
 | `F` / `M` | force-start now / move to another host (waiting jobs) |
 | `T` | next color theme (saved; `tshed theme` lists them) |
+| `B` / `D` | more / less contrast: darker darks, lighter lights (saved; `tshed theme --contrast N`) |
 | `A` | follow the log on the host (mosh) |
 | `O` | shell on the host (mosh) |
 | `H` / `R` | hide finished / refresh |
@@ -161,7 +162,8 @@ each table at N lines (30 by default), and `-a` includes finished jobs.
 
 Colors follow your terminal by default. `tshed theme` shows every theme as a sample row: built-in
 catppuccin, dracula, gruvbox, nord, tokyo-night, solarized and friends, plus every installed btop
-theme (`btop:NAME`). Pick one with `tshed theme tokyo-night`.
+theme (`btop:NAME`). Pick one with `tshed theme tokyo-night`. For the look of ratatui's own demos (tailwind
+palette, header bar, striped rows) pick `tailwind-blue`, `-emerald`, `-indigo` or `-red`.
 
 ## 6. Callbacks
 

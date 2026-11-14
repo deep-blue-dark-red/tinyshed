@@ -1417,6 +1417,13 @@ THEMES = {  # ok     info   err    warn   cancel accent host   key    dim    sel
     "solarized-light":  "859900 2aa198 dc322f b58900 d33682 268bd2 2aa198 cb4b16 93a1a1 eee8d5 586e75 657b83 fdf6e3",
     "tokyo-night":      "9ece6a 7dcfff f7768e e0af68 bb9af7 7aa2f7 2ac3de ff9e64 565f89 283457 c0caf5 c0caf5 1a1b26",
 }
+# ratatui's own look (its table demo): the tailwind palette it ships in style::palette::tailwind. slate-950
+# buffer, slate-900 alternate rows, slate-200 text, a c900 header bar and a reversed c400 selection bar.
+THEME_EXTRA = {}  # name -> optional roles: head (header bar bg), alt (alternate row bg), sel_fg (flat selected row)
+for _n, _c in dict(blue="60a5fa 1e3a8a", emerald="34d399 064e3b", indigo="818cf8 312e81", red="f87171 7f1d1d").items():
+    _c400, _c900 = _c.split()  # ok=green info=cyan err=red warn=amber cancel=purple (all c400), dim=slate-500
+    THEMES["tailwind-" + _n] = "4ade80 22d3ee f87171 fbbf24 c084fc %s %s %s 64748b %s e2e8f0 e2e8f0 020617" % ((_c400,) * 4)
+    THEME_EXTRA["tailwind-" + _n] = dict(head=_c900, alt="0f172a", sel_fg="020617")
 BTOP_DIRS = ("~/.config/btop/themes", "~/.local/share/btop/themes", "/opt/homebrew/share/btop/themes",
              "/usr/local/share/btop/themes", "/usr/share/btop/themes")
 
@@ -1439,7 +1446,8 @@ def btop_themes():
 
 
 def theme_names():
-    return ["default", "mono"] + sorted(THEMES) + ["btop:" + n for n in btop_themes()]
+    # btop-themes/tailwind-*.theme are btop's copies of the built-in tailwind themes: not listed twice
+    return ["default", "mono"] + sorted(THEMES) + ["btop:" + n for n in btop_themes() if n not in THEME_EXTRA]
 
 
 def parse_btop(path):
@@ -1541,12 +1549,74 @@ def tune_contrast(t):
     return t
 
 
+CONTRAST_DEFAULT, CONTRAST_MAX = 4.0, 10.0
+
+
+def current_contrast():
+    """The contrast level, 0-10: how hard boost() stretches a palette (darker darks, lighter lights).
+    0 = every theme exactly as published. TINYSHED_CONTRAST overrides the saved level."""
+    v = os.environ.get("TINYSHED_CONTRAST")
+    if v is None:
+        try:
+            with open(P("contrast")) as f:
+                v = f.read()
+        except OSError:
+            return CONTRAST_DEFAULT
+    try:
+        return min(CONTRAST_MAX, max(0.0, float(v)))
+    except ValueError:
+        return CONTRAST_DEFAULT
+
+
+def save_contrast(n):
+    n = min(CONTRAST_MAX, max(0.0, float(n)))
+    with open(P("contrast"), "w") as f:
+        f.write("%g\n" % n)
+    os.environ.pop("TINYSHED_CONTRAST", None)
+    return n
+
+
+def boost(t, n):
+    """Contrast level n as a tone curve over the whole palette, backgrounds included: darks get darker and
+    lights get lighter (an S-curve on lightness around the middle, exponent 1 + 0.12n), hues stay, and the
+    state/accent colors gain 5% saturation per level so they get more vivid instead of washing out to
+    white. The curve never clips and keeps the order of shades (background < striped row < bar). Text
+    that still ends up faint is lifted to WCAG 4.5 against the background (dim text: 3)."""
+    import colorsys
+    if not n:
+        return t
+    t = dict(t)
+    g = 1 + 0.12 * n
+    for role in (*THEME_ROLES, "alt", "head", "sel_fg"):
+        if not t.get(role):
+            continue
+        h, l, s_ = colorsys.rgb_to_hls(*_rgb(t[role]))
+        l = 0.5 * (2 * l) ** g if l < 0.5 else 1 - 0.5 * (2 * (1 - l)) ** g
+        if role in ("ok", "info", "err", "warn", "cancel", "accent", "host", "key"):
+            s_ = min(1.0, s_ * (1 + 0.05 * n))
+        t[role] = _hex(colorsys.hls_to_rgb(h, l, s_))
+    bg = t.get("bg") or ("000000" if _lum(t["fg"]) > 0.2 else "ffffff")
+    step = 0.01 if _lum(bg) < 0.18 else -0.01
+    grounds = [bg] + ([t["alt"]] if t.get("alt") else [])
+    for role in THEME_ROLES:
+        if role in ("bg", "sel") or not t.get(role):
+            continue
+        c, need = t[role], 3 if role == "dim" else 4.5
+        h, l, s_ = colorsys.rgb_to_hls(*_rgb(c))
+        while any(contrast(c, x) < need for x in grounds) and 0 < l < 1:
+            l = min(1.0, max(0.0, l + step))
+            c = _hex(colorsys.hls_to_rgb(h, l, s_))
+        t[role] = c
+    return t
+
+
 def load_theme(name):
-    """Theme name/path -> roles dict (contrast-tuned), or 'default' / 'mono'. Raises Fail for unknown names."""
+    """Theme name/path -> roles dict, or 'default' / 'mono'. Raises Fail for unknown names. Built-in palettes
+    are used exactly as published; btop themes are contrast-tuned (their semantic roles are guessed by hue)."""
     if name in ("default", "mono"):
         return name
     if name in THEMES:
-        return tune_contrast(dict(zip(THEME_ROLES, THEMES[name].split())))
+        return dict(zip(THEME_ROLES, THEMES[name].split()), **THEME_EXTRA.get(name, {}))
     if os.path.isfile(os.path.expanduser(name)):
         return tune_contrast(parse_btop(os.path.expanduser(name)))
     path = btop_themes().get(name.removeprefix("btop:"))
@@ -1578,24 +1648,40 @@ def sgr_color(hexc, bg=False):
 
 
 def palette(t, paint_bg=False):
-    """Roles -> the escape sequence of every style constant."""
+    """Roles -> the escape sequence of every style constant. HEAD styles a table header (a full-width bar
+    when HEAD_BAR), ALT is the background of every other row, SEL_FLAT draws the selected row in one color."""
+    d = _palette(t, paint_bg)
+    for k, v in dict(HEAD=d["BOLD"], HEAD_BAR=False, ALT="", SEL_FLAT=False).items():
+        d.setdefault(k, v)
+    return d
+
+
+def _palette(t, paint_bg):
     if t == "default":
         return dict(RESET="\x1b[0m", DIM="\x1b[2m", BOLD="\x1b[1m", GREEN="\x1b[32m", CYAN="\x1b[36m", RED="\x1b[31m",
                     MAGENTA="\x1b[35m", BLUE="\x1b[34m", BOLD_YELLOW="\x1b[1;33m", BOLD_CYAN="\x1b[1;36m",
-                    BOLD_RED="\x1b[1;31m", KEY="\x1b[1;33m", HILITE="\x1b[48;5;237;1m")
+                    BOLD_RED="\x1b[1;31m", KEY="\x1b[1;33m", HILITE="\x1b[48;5;237;1m",
+                    YELLOW="\x1b[33m", HOST="\x1b[36m", NUM="\x1b[33m")
     if t == "mono":
         b = "\x1b[1m"
         return dict(RESET="\x1b[0m", DIM="\x1b[2m", BOLD=b, GREEN="", CYAN="", RED=b, MAGENTA="", BLUE="",
-                    BOLD_YELLOW=b, BOLD_CYAN=b, BOLD_RED=b, KEY=b, HILITE="\x1b[7m")
+                    BOLD_YELLOW=b, BOLD_CYAN=b, BOLD_RED=b, KEY=b, HILITE="\x1b[7m",
+                    YELLOW="", HOST="", NUM="")
     c = lambda role, bold=False: "\x1b[%s%sm" % ("1;" if bold else "", sgr_color(t[role]))
     base = ""
     if paint_bg and t.get("bg"):
         base = "\x1b[%s;%sm" % (sgr_color(t["fg"]), sgr_color(t["bg"], bg=True))
-    sel = "\x1b[1;%s%sm" % (sgr_color(t["sel"], bg=True), ";" + sgr_color(t["sel_fg"]) if t.get("sel_fg") else "") \
+    sel = "\x1b[%s%sm" % (sgr_color(t["sel"], bg=True), ";" + sgr_color(t["sel_fg"]) if t.get("sel_fg") else "") \
         if t.get("sel") else "\x1b[7m"
-    return dict(RESET="\x1b[0m" + base, DIM=c("dim"), BOLD=c("title", True), GREEN=c("ok"), CYAN=c("info"),
+    extra = {}
+    if paint_bg and t.get("head"):
+        extra.update(HEAD="\x1b[1;%s;%sm" % (sgr_color(t["title"]), sgr_color(t["head"], bg=True)), HEAD_BAR=True)
+    if paint_bg and t.get("alt"):
+        extra["ALT"] = "\x1b[%sm" % sgr_color(t["alt"], bg=True)
+    return dict(extra, SEL_FLAT=bool(t.get("sel_fg")), RESET="\x1b[0m" + base, DIM=c("dim"), BOLD=c("title", True), GREEN=c("ok"), CYAN=c("info"),
                 RED=c("err"), MAGENTA=c("cancel"), BLUE=c("accent"), BOLD_YELLOW=c("warn", True),
-                BOLD_CYAN=c("host", True), BOLD_RED=c("err", True), KEY=c("key", True), HILITE=sel)
+                BOLD_CYAN=c("host", True), BOLD_RED=c("err", True), KEY=c("key", True), HILITE=sel,
+                YELLOW=c("warn"), HOST=c("host"), NUM=c("key"))
 
 
 def saved_theme():
@@ -1617,12 +1703,18 @@ def apply_theme(name=None, paint_bg=False):
         t = load_theme(name or current_theme())
     except (Fail, OSError, ValueError):
         t = "default"
+    if isinstance(t, dict):
+        t = boost(t, current_contrast())
     globals().update(palette(t, paint_bg))
-    STATE_STYLE = dict(running=(GREEN, "▶"), queued=(BOLD_YELLOW, "◌"), pending=(CYAN, "◌"), done=(GREEN, "✓"),
+    STATE_STYLE = dict(running=(GREEN, "▶"), queued=(YELLOW, "◌"), pending=(CYAN, "◌"), done=(GREEN, "✓"),
                        cancelled=(MAGENTA, "■"), moved=(CYAN, "→"))  # every failure: (BOLD_RED, "●")
 
 
-def theme_cmd(name):
+def theme_cmd(name, contrast=None):
+    if contrast is not None:
+        print("contrast %g" % save_contrast(contrast))
+        if not name:
+            return
     if name:
         load_theme(name)  # validate
         if name in ("default", "mono") or name in THEMES or name.startswith("btop:"):
@@ -1639,11 +1731,12 @@ def theme_cmd(name):
         return
     cur = current_theme()
     print("colors: %s (TINYSHED_TRUECOLOR=1/0 to force)" % ("24-bit truecolor" if truecolor() else "256-color approximation"))
+    print("contrast: %g (tshed theme --contrast N, 0-%g: darker darks, lighter lights, more vivid colors; 0 = exactly as published; not for default/mono)" % (current_contrast(), CONTRAST_MAX))
     for n in theme_names():
         apply_theme(n)
         mark = "*" if n == cur else " "
-        out([("", "%s %-26s " % (mark, n)), (GREEN, "▶ running "), (BOLD_YELLOW, "◌ queued "), (CYAN, "◌ pending "),
-             (BOLD_RED, "● error "), (MAGENTA, "■ cancelled "), (BOLD_CYAN, "host "), (KEY, "[K]"), ("", " "), (DIM, "dim "),
+        out([("", "%s %-26s " % (mark, n)), (GREEN, "▶ running "), (YELLOW, "◌ queued "), (CYAN, "◌ pending "),
+             (BOLD_RED, "● error "), (MAGENTA, "■ cancelled "), (HOST, "host "), (KEY, "[K]"), ("", " "), (DIM, "dim "),
              (HILITE, " selected ")])
     apply_theme()
 
@@ -1755,15 +1848,15 @@ def host_segs(h):
         "v%s, server is v%s: run tshed install" % (s.get("version"), VERSION) if s and s.get("version") != VERSION else "",
         "%.0fW" % s["power_w"] if s.get("power_w") is not None else "",
         *warnings) if n)
-    return [(BOLD_CYAN, "%-12s" % h["name"][:12]), ("", "  "), (state[0], "%-7s" % state[1]),
+    return [(HOST, "%-12s" % h["name"][:12]), ("", "  "), (state[0], "%-7s" % state[1]),
             ("", " %5s" % ("%.1f" % s["load"] if s else "-")),
             (BOLD_RED if hot_cpu else "", " %5s  " % ("%d%%" % s["cpu_pct"] if s and s.get("cpu_pct") is not None else "-")),
-            (KEY, "%7s" % ("%d/%d" % (s["free"], s["cores"]) if s else "-")),
+            (NUM, "%7s" % ("%d/%d" % (s["free"], s["cores"]) if s else "-")),
             ("", "  %10s  " % mem), (BOLD_RED if over_mem else "", "%9s  " % job_mem),
-            ("", "%-8s " % gpu), (GREEN if run else DIM, "%4d" % run), ("", " "), (BOLD_YELLOW if que else DIM, "%4d" % que),
+            ("", "%-8s " % gpu), (GREEN if run else DIM, "%4d" % run), ("", " "), (YELLOW if que else DIM, "%4d" % que),
             (DIM, "  %6s  " % (fmt_dur(time.time() - h["seen"]) if h["seen"] else "never")),
             ("", "%6s  " % ("%.1fGHz" % s["cpu_ghz"] if s.get("cpu_ghz") is not None else "-")),
-            (BOLD_RED if h["err"] else BOLD_YELLOW, clean(notes))]
+            (BOLD_RED if h["err"] else YELLOW, clean(notes))]
 
 
 def fmt_mem(used, limit):
@@ -1782,12 +1875,12 @@ def job_segs(j):
     pct = j.get("cpu_pct")
     used = j.get("rss_mb") if j["state"] == "running" else j.get("peak_mb") or None if j["state"] in TERMINAL else None
     over = used is not None and j.get("mem_mb") and used > 0.9 * j["mem_mb"]
-    segs = [state_seg(j), (KEY, " %3d" % (j.get("cpus") or 1)),
-            (KEY, " %4d" % j["prio"]), ("", "  "), (BOLD_CYAN, "%-12s" % (j["host"] or "(any)")[:12]),
+    segs = [state_seg(j), (NUM, " %3d" % (j.get("cpus") or 1)),
+            (NUM, " %4d" % j["prio"]), ("", "  "), (HOST, "%-12s" % (j["host"] or "(any)")[:12]),
             ("", "  %-8s  %8s  " % (j["id"], fmt_dur(j["t"]))), (DIM, "%5s" % ("%d/%d" % (j.get("attempt") or 0, (j.get("retries") or 0) + 1))),
             (BOLD_RED if pct is not None and pct > 105 else "", "  %4s" % ("-" if pct is None else "%d%%" % round(pct))),
             (BOLD_RED if over else "", "  %11s" % fmt_mem(used, j.get("mem_mb"))),
-            ("", "  "), (BOLD, "%-16s" % clean(j.get("name") or "-")[:NAME_MAX]), ("", "  " + clean(j["cmd"]))]
+            ("", "  "), ("", "%-16s" % clean(j.get("name") or "-")[:NAME_MAX]), ("", "  " + clean(j["cmd"]))]
     if j["state"] in TERMINAL and j["state"] != "done":
         segs = segs[:1] + [(DIM, t) for _, t in segs[1:]]
     elif j["state"] == "done":
@@ -1798,9 +1891,9 @@ def job_segs(j):
 def meta_segs(j):
     """The one-line summary of a job used by `show` and the detail view."""
     lim = lambda k, f: f(j[k]) if j.get(k) else "-"
-    return [("", "State: "), state_seg(j), ("", "  Prio: "), (KEY, str(j["prio"])),
+    return [("", "State: "), state_seg(j), ("", "  Prio: "), (NUM, str(j["prio"])),
             ("", "   Try: %d/%d" % (j.get("attempt") or 0, (j.get("retries") or 0) + 1)),
-            ("", "   Cores: "), (KEY, "%s" % (j.get("cores") or j.get("cpus") or "-")),
+            ("", "   Cores: "), (NUM, "%s" % (j.get("cores") or j.get("cpus") or "-")),
             ("", "   Mem peak: %s%s" % (lim("peak_mb", lambda v: "%dM" % v), " of %dM" % j["mem_mb"] if j.get("mem_mb") else "")),
             *([("", "   CPU%%: %s   Mem: %s" % ("-" if j.get("cpu_pct") is None else "%d%%" % round(j["cpu_pct"]),
                                               fmt_mem(j.get("rss_mb"), j.get("mem_mb"))))] if j["state"] == "running" else []),
@@ -1916,6 +2009,11 @@ def tui(interval):
         text = text[-max(10, W - len(label) - 8):]
         return styled([(BOLD_YELLOW, label + " "), (BOLD_CYAN, text + "█"), ("", "   "), (DIM, hint)], W)
 
+    def table_head(head, W):
+        if HEAD_BAR:  # a colored bar replaces the rule under the header
+            return [HEAD + head[:W].ljust(W) + RESET]
+        return [BOLD + head[:W] + RESET, "─" * min(W, len(HOST_HEAD) + 12)]
+
     def draw_main(hosts, jobs, total, counts, cur):
         W, H = shutil.get_terminal_size()
         W -= 1
@@ -1931,7 +2029,7 @@ def tui(interval):
             failed = sum(counts.get(k, 0) for k in FAILURES)
             segs = [(BOLD_CYAN, "Tinyshed:"), ("", " "), (BOLD, str(total)), ("", " jobs   "),
                     (GREEN if counts.get("running") else DIM, "%d running" % counts.get("running", 0)), ("", "   "),
-                    (BOLD_YELLOW if counts.get("queued") else DIM, "%d queued" % counts.get("queued", 0))]
+                    (YELLOW if counts.get("queued") else DIM, "%d queued" % counts.get("queued", 0))]
             if counts.get("pending"):
                 segs += [("", "   "), (CYAN, "%d pending" % counts["pending"])]
             if failed:
@@ -1940,25 +2038,26 @@ def tui(interval):
                      ("", "   "), (DIM, "[Type to filter, Esc to exit]")]
             L.append(styled(segs, W))
         # 2. hosts
-        L.append(BOLD + HOST_HEAD[:W] + RESET)
-        L.append("─" * min(W, len(HOST_HEAD) + 12))
+        L.extend(table_head(HOST_HEAD, W))
         shown = hosts[:max(1, H // 3 - 2)]
-        L.extend(styled(host_segs(h), W) for h in shown)
+        L.extend(styled(host_segs(h), W, ALT if i % 2 else "") for i, h in enumerate(shown))
         if not hosts:
             L.append(DIM + "  (no hosts yet: tshed install NAME=DEST)" + RESET)
         elif len(shown) < len(hosts):
             L.append(DIM + "  (+%d more hosts)" % (len(hosts) - len(shown)) + RESET)
         L.append("")
         # 3. jobs
-        L.append(BOLD + JOB_HEAD[:W] + RESET)
-        L.append("─" * min(W, len(HOST_HEAD) + 12))
+        L.extend(table_head(JOB_HEAD, W))
         room = max(1, H - len(L) - 3)
         st["top"] = max(0, min(st["top"], st["sel"], len(jobs) - room))
         if st["sel"] >= st["top"] + room:
             st["top"] = st["sel"] - room + 1
         st.update(row0=len(L) + 1, rows=min(room, len(jobs) - st["top"]))
         for i, j in enumerate(jobs[st["top"]:st["top"] + room], st["top"]):
-            L.append(styled(job_segs(j), W, HILITE if i == st["sel"] else ""))
+            if i == st["sel"]:  # SEL_FLAT (ratatui's reversed row): the bar's own text color, no per-cell colors
+                L.append(styled([("", t) for _, t in job_segs(j)] if SEL_FLAT else job_segs(j), W, HILITE))
+            else:
+                L.append(styled(job_segs(j), W, ALT if i % 2 else ""))
         if not jobs:
             L.append(DIM + ("  (no matching jobs)" if st["query"] or st["hide"] else "  (no jobs yet: press N to submit one)") + RESET)
         L.extend([""] * (H - 3 - len(L)))
@@ -1966,7 +2065,7 @@ def tui(interval):
         L.append(styled([st["msg"]], W))
         L.append(help_line([("Enter/→", "detail"), ("N", "new"), ("K", "cancel"), ("E", "rerun"), ("P", "prio"), ("F", "force"), ("M", "move"),
                             ("A", "attach"), ("O", "shell"), ("H", "show done" if st["hide"] else "hide done"), ("C", "config"),
-                            ("T", "theme"), ("R", "refresh"), ("Esc", "exit")], W))
+                            ("T", "theme"), ("B/D", "contrast"), ("R", "refresh"), ("Esc", "exit")], W))
         age = "syncing…" if st["syncing"] and not st["synced"] else "synced %s ago" % fmt_dur(time.time() - st["synced"]) if st["synced"] else "not synced yet"
         L.append(styled([(DIM, "Server: %s   (%d/%d jobs shown)   %s" % (HOME.replace(os.path.expanduser("~"), "~"), len(jobs), total, age))], W))
         return L, H
@@ -2085,6 +2184,12 @@ def tui(interval):
                 os.environ.pop("TINYSHED_THEME", None)
                 apply_theme(st["theme"], paint_bg=True)
                 say("Theme: %s (%d/%d)   [T] next" % (st["theme"], themes.index(st["theme"]) + 1, len(themes)), KEY)
+            elif key in ("B", "D"):  # more / less contrast, saved
+                n = save_contrast(current_contrast() + (1 if key == "B" else -1))
+                apply_theme(st.get("theme"), paint_bg=True)
+                flat = (st.get("theme") or current_theme()) in ("default", "mono")
+                say("Contrast: %g/%g%s   [B] more  [D] less%s" % (n, CONTRAST_MAX, " (colors as published)" if not n else "",
+                                                             "   (no effect on the %s theme: [T])" % (st.get("theme") or current_theme()) if flat else ""), KEY)
             elif key == "C":
                 ok, msg = edit_cfg(load_cfg(), "local %s" % P("config.json"), save_cfg, run_fg)
                 say(msg, GREEN if ok else BOLD_RED)
@@ -2100,7 +2205,7 @@ def tui(interval):
                 def kill(text, jid=cur["id"]):
                     if text.lower() in ("y", "yes"):
                         cancel(db, jid)
-                        say("Cancelling %s…" % jid, BOLD_YELLOW)
+                        say("Cancelling %s…" % jid, YELLOW)
                         wake.set()
                 st["prompt"] = ("Cancel %s (%s)? [y/N]:" % (cur["id"], clean(cur["cmd"])[:40]), "", kill)
             elif key == "E" and cur:
@@ -2116,7 +2221,7 @@ def tui(interval):
             elif key == "F" and cur and cur["state"] in ("pending", "queued"):
                 def force(text, jid=cur["id"]):
                     if text.lower() in ("y", "yes"):
-                        say("Forcing %s…" % jid, BOLD_YELLOW)
+                        say("Forcing %s…" % jid, YELLOW)
                         background(lambda tdb: say("%s: %s" % (jid, "; ".join(edit_job(tdb, jid, force=True))), GREEN))
                 st["prompt"] = ("Force-start %s now, ahead of the queue (even on busy cores)? [y/N]:" % cur["id"], "", force)
             elif key == "M" and cur and cur["state"] in ("pending", "queued"):
@@ -2124,7 +2229,7 @@ def tui(interval):
                     text = text.strip()
                     if text:
                         host = None if text == "any" else text
-                        say("Moving %s to %s…" % (jid, text), BOLD_YELLOW)
+                        say("Moving %s to %s…" % (jid, text), YELLOW)
                         background(lambda tdb: say("%s: %s" % (jid, "; ".join(edit_job(tdb, jid, host=host))), GREEN))
                 st["prompt"] = ("Move %s (on %s) to host [%s|any]:" % (cur["id"], cur["host"] or "(any)",
                                                                       "|".join(n for n in dests if n != cur["host"])), "", move)
@@ -2254,6 +2359,9 @@ def build_parser():
                                    "(* = current). With NAME (a theme name, btop:NAME, or a path to a btop .theme file): save "
                                    "it for this server's cli and dashboard. TINYSHED_THEME overrides the saved choice.")
     s.add_argument("name", nargs="?", metavar="NAME")
+    s.add_argument("--contrast", type=float, metavar="N",
+                   help="contrast level 0-10 (default 4): each level makes dark shades darker, light ones lighter and colors "
+                        "more vivid. 0 = colors exactly as published. Saved; TINYSHED_CONTRAST overrides")
     s = sub.add_parser("completion", help="print a shell completion script")
     s.add_argument("shell", choices=("fish", "zsh", "bash"))
     public = [c.dest for c in sub._choices_actions]
@@ -2368,7 +2476,7 @@ def main():
 
     apply_theme()
     if a.op == "theme":
-        return theme_cmd(a.name)
+        return theme_cmd(a.name, a.contrast)
     zmod()  # fail early, with a clear message, if this machine has no zstd
     db = sdb()
     known = {r["name"]: r["dest"] for r in db.execute("SELECT name, dest FROM hosts")}
@@ -2413,12 +2521,12 @@ def main():
         for name, dest in pairs:
             r = results[name]
             if isinstance(r, Exception):
-                out([(BOLD_CYAN, "%-12s" % name), ("", "  "), (BOLD_RED, "● FAILED "), ("", str(r) or type(r).__name__)])
+                out([(HOST, "%-12s" % name), ("", "  "), (BOLD_RED, "● FAILED "), ("", str(r) or type(r).__name__)])
                 continue
             db.execute("INSERT INTO hosts(name,dest) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET dest=excluded.dest", (name, dest))
-            out([(BOLD_CYAN, "%-12s" % name), ("", "  "), (GREEN, "✓ ok    ") if r["agent"] else (BOLD_RED, "● BROKEN"),
-                 ("", "%-5s %-8s %-10s " % (r["version"], r["python"], r["zstd"])), (KEY, "%5s" % r["cores"]),
-                 ("", "  %-13s " % ((r["boot"] or "-") + ("+home" if r["phone_home"] else ""))), (BOLD_YELLOW, install_notes(r))])
+            out([(HOST, "%-12s" % name), ("", "  "), (GREEN, "✓ ok    ") if r["agent"] else (BOLD_RED, "● BROKEN"),
+                 ("", "%-5s %-8s %-10s " % (r["version"], r["python"], r["zstd"])), (NUM, "%5s" % r["cores"]),
+                 ("", "  %-13s " % ((r["boot"] or "-") + ("+home" if r["phone_home"] else ""))), (YELLOW, install_notes(r))])
         par(sync_host, [n for n, _ in pairs if not isinstance(results[n], Exception)])
         return 1 if any(isinstance(r, Exception) or not r["agent"] for r in results.values()) else 0
     if a.op == "uninstall":
@@ -2429,11 +2537,11 @@ def main():
                     raise Fail("unknown host")
                 r = json.loads(remote(known[name], ["teardown"] + ["--purge"] * a.purge + ["--force"] * a.force))
             except Exception as e:
-                out([(BOLD_CYAN, "%-12s" % name), ("", "  "), (BOLD_RED, "● FAILED "), ("", "%s" % e)])
+                out([(HOST, "%-12s" % name), ("", "  "), (BOLD_RED, "● FAILED "), ("", "%s" % e)])
                 rc = 1
                 continue
             db.execute("DELETE FROM hosts WHERE name=?", (name,))
-            out([(BOLD_CYAN, "%-12s" % name), ("", "  "), (GREEN, "✓ removed"), ("", "  %s%s" % (
+            out([(HOST, "%-12s" % name), ("", "  "), (GREEN, "✓ removed"), ("", "  %s%s" % (
                 "data purged" if r["purged"] else "data kept in ~/.tinyshed on the host",
                 "; %d unfinished jobs left behind" % r["unfinished"] if r["unfinished"] else ""))])
         return rc

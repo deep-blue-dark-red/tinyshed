@@ -35,7 +35,7 @@ tshed serve                                                         # or: headle
 | `wait ID… [-t 2h]` | block; exit 0 done / 1 failed / 2 timeout |
 | `cancel ID…`, `prio ID N` | |
 | `edit ID [-p N] [-H HOST\|any] [--force]` | change a waiting (`pending`/`queued`) job: priority, host (move; `any` unpins), or force it to start now. Dashboard: `P`, `M`, `F` |
-| `theme [NAME]` | list color themes with samples, or pick one (saved in `~/.tinyshed/theme`; `TINYSHED_THEME` overrides). Dashboard: `T` cycles |
+| `theme [NAME] [--contrast N]` | list color themes with samples, or pick one (saved in `~/.tinyshed/theme`; `TINYSHED_THEME` overrides); `--contrast` stretches the palette: darker darks, lighter lights (level 0-10, default 4). Dashboard: `T` cycles, `B`/`D` contrast |
 | `completion fish`/`zsh`/`bash` | tab completion, including host names and job ids |
 
 Output is coloured on a terminal and plain in a pipe (`NO_COLOR` is respected). Tutorial: `HUMANS.md`;
@@ -151,14 +151,26 @@ host (mosh), `H` hide finished, `R` refresh, `Esc`/`Q` quit. While open, the TUI
 - Built-in truecolor palettes: `btop`, `cendre`, `catppuccin`, `catppuccin-latte`, `dracula`, `everforest`,
   `gruvbox`, `gruvbox-light`, `kanagawa`, `monokai`, `nord`, `one-dark`, `rose-pine`,
   `solarized-dark`, `solarized-light`, `tokyo-night`.
+- ratatui's own look, from the tailwind palette it ships (`ratatui::style::palette::tailwind`) and laid
+  out like its table demo: `tailwind-blue`, `tailwind-emerald`, `tailwind-indigo`, `tailwind-red`.
+  slate-950 background, slate-200 text, and in the dashboard a colored header bar (c900) instead of a
+  rule, alternating slate-900 rows, and a reversed selection bar (c400, one text color).
+  `btop-themes/` has the same four as btop themes, so btop can sit next to the dashboard in matching
+  colors: `cp btop-themes/*.theme ~/.config/btop/themes/`, then pick one in btop's options menu.
 - Any btop theme: `btop:NAME` from btop's theme dirs (`~/.config/btop/themes`, `$XDG_CONFIG_HOME`,
   the btop install prefix, `/usr/share/btop/themes`, …), or a path to a `.theme` file. `title`,
   `hi_fg` (keys), `selected_bg/fg`, `inactive_fg` and `main_fg/bg` map directly; the state colors
   (ok/error/warning/…) take the theme's color nearest in hue.
-- Colors stay as the theme designed them. Only a color that is too faint is lightened (dark themes)
-  or darkened (light themes), keeping its hue, to WCAG contrast 4.5:1 against the background and 3.5:1
-  on the selection bar (7:1 plain text and headers, 3.2:1 dim); the selection bar is a tinted lift of
-  the background between 1.6:1 and 2.4:1. Tunables: `CONTRAST`, `CONTRAST_TEXT` in the code.
+- Contrast is adjustable: `tshed theme --contrast N` (level 0-10, default 4, saved in
+  `~/.tinyshed/contrast`; `TINYSHED_CONTRAST` overrides), or `B` / `D` (more / less) in the dashboard.
+  It is a tone curve over the whole palette: dark shades get darker (the painted background, striped
+  rows, bars), light ones lighter (text), hues stay, and state/accent colors gain 5% saturation per
+  level so they get more vivid rather than washing out. Text that is still faint is lifted to WCAG 4.5
+  (dim: 3). `0` draws every built-in palette exactly as published. Plain commands do not paint a
+  background, so there only the text side shows. No effect on `default` and `mono`.
+- btop themes are additionally normalised first, since their state colors are guessed: faint colors are
+  lifted to 4.5:1 and the selection bar becomes a tinted lift of the background (`CONTRAST`,
+  `CONTRAST_TEXT` in the code).
 
 In the dashboard a theme paints its own background; plain commands only recolor text. Without truecolor
 (`COLORTERM=truecolor`, or a known terminal such as ghostty/kitty/iTerm2/WezTerm) colors are

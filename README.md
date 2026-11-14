@@ -16,7 +16,7 @@ tinyshed tui | serve  ── ssh: rpc ──▶   agent ──▶ watchdog ─�
 ```sh
 ln -s $PWD/tinyshed.py ~/bin/tshed                                  # the command is `tshed`
 tshed install gpu1=gpu1.local,gpu1 gpu2=me@gpu2 --home me@thisbox   # ~1s per host, in parallel
-tshed hosts                                                         # ping: load, idle cores, memory, GPUs
+tshed hosts                                                         # ping: load, CPU%, idle cores, memory, GPUs
 tshed submit -p 5 -c 8 -m 32G -t 12h -r 2 -- python train.py --lr 3e-4
 tshed submit -H gpu1 -C ~/proj -e CUDA_VISIBLE_DEVICES=0 -- ./run.sh
 tshed                                                               # dashboard
@@ -28,6 +28,8 @@ tshed serve                                                         # or: headle
 | `install [[NAME=]DEST…]` | check the host, copy the file, (re)start the agent, start it at boot, register. No hosts = upgrade all. `DEST` may list alternatives tried in order (`gpu1.local,gpu1`: LAN, then tailscale) or be `local[:DIR]`. Options left out keep their installed value |
 | `uninstall NAME… [--purge] [--force]` | stop the agent, remove the boot entry, forget the host; data stays unless `--purge` |
 | `hosts [--json] [--rm NAME]` | ping all hosts |
+| `config [--edit] [--host HOST…]` | show, or edit in `$VISUAL`/`$EDITOR`, this machine's `config.json` (`name`, `cores`, `home`). `--host` (repeatable) reads/writes a registered host's config over ssh; edits are validated before saving. Dashboard: `C` |
+| `overview [-n N] [-a]` | compact, non-interactive digest of `hosts` + `ls`: hosts table, `---LS` divider, active-jobs table, each capped at N lines (default 30). One sync feeds both; `-a` adds finished jobs |
 | `submit [flags] -- CMD` | queue a job |
 | `ls [-a] [--json]`, `show ID`, `logs [-f] ID` | list, inspect, read output (ids may be prefixes) |
 | `wait ID… [-t 2h]` | block; exit 0 done / 1 failed / 2 timeout |
@@ -42,6 +44,18 @@ agent skill: `skills/tinyshed/`.
 - **State.** Each host owns its queue and an append-only event log in `host.db`. The server keeps a
   mirror plus a per-host event cursor. Nothing on a host depends on the server being reachable: the
   agent keeps scheduling, retrying and logging, and the server catches up from the event log later.
+- **Config.** Each host's `~/.tinyshed/config.json` holds `name`, `cores` (the CPU set jobs may use) and
+  `home` (the phone-home command). `install --cores` sets `cores`; `tshed config --edit` or the
+  dashboard's `C` edits the local file in `$EDITOR`, and `tshed config --host NAME --edit` edits a
+  host's over ssh. Edits are validated (JSON + `cores`) before writing; the agent reloads config every
+  second, so no restart is needed. Don't change `name` by hand: it must match the server's host registry.
+- **CPU%.** The `hosts` table has two CPU numbers: `Load` is the system-wide 1-minute load average,
+  and `CPU%` is the measured busy percentage of the cores tinyshed owns (`--cores`, or the process's
+  CPU affinity). It comes from per-core OS tick counters (Linux `/proc/stat`, macOS
+  `host_processor_info`) sampled between polls, so it is an average over the poll interval. It reads
+  `-` until two samples exist or where the OS has no per-core counters. On macOS jobs are unpinned
+  (no `taskset`), so a configured core subset is only a scheduling budget and its `CPU%` need not
+  track job usage.
 - **Transport.** Every server→host interaction is one `ssh host tinyshed.py rpc` call (JSON in/out)
   that delivers pending jobs and cancels, pulls events after the cursor and reads resources. All of it
   is idempotent, so retries are safe. ssh connections are multiplexed (`ControlMaster`), ~0.1s a poll.

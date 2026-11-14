@@ -18,7 +18,7 @@ Callbacks: put functions in ~/.tinyshed/hooks.py (server and/or host), each taki
   OnJobQueued OnJobStart OnJobCompletion OnJobError OnJobTimeout OnJobOOM OnJobLost OnJobCancel
   OnHostDown OnHostUp (server only)   OnEvent (everything)
 """
-import argparse, contextlib, fcntl, importlib, json, os, shlex, shutil, signal, sqlite3, subprocess, sys, threading, time, traceback, uuid
+import argparse, contextlib, fcntl, importlib, json, os, shlex, shutil, signal, sqlite3, subprocess, sys, tempfile, threading, time, traceback, uuid
 
 VERSION = "0.2"
 HOME = os.path.abspath(os.path.expanduser(os.environ.get("TINYSHED_HOME") or "~/.tinyshed"))
@@ -238,6 +238,56 @@ def used_cores(db):
     for r in db.execute("SELECT cores FROM jobs WHERE state='running' AND cores IS NOT NULL"):
         used.update(parse_cores(r[0]))
     return used
+
+
+def check_cfg(cfg):
+    """Reject a config that would break the agent before it reaches disk."""
+    if not isinstance(cfg, dict):
+        raise Fail("config must be a JSON object")
+    try:
+        host_cores(cfg)
+    except (AttributeError, TypeError, ValueError) as e:
+        raise Fail("bad config cores: %s" % e)
+    return cfg
+
+
+def save_cfg(cfg):
+    """Atomically replace this machine's config.json; the agent reloads it every second."""
+    check_cfg(cfg)
+    path, tmp = P("config.json"), P("config.json.tmp")
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, path)
+    return cfg
+
+
+def edit_cfg(cfg, label, put, run=subprocess.call):
+    """Open cfg as JSON in $EDITOR; validate and put() it on save. Returns (ok, message)."""
+    ed = shlex.split(os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi")
+    fd, path = tempfile.mkstemp(prefix="tshed-config-", suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        f.write("// tshed config - edit and save; // lines are ignored\n"
+                "// keys: name, cores (e.g. \"0-15\"), home ({\"dest\",\"cmd\"} or null)\n")
+        json.dump(cfg, f, indent=2, sort_keys=True)
+        f.write("\n")
+    with open(path) as f:
+        before = f.read()
+    rc = run(ed + [path])
+    if isinstance(rc, int) and rc:
+        return False, "editor exited %d; config not changed (your edit is at %s)" % (rc, path)
+    with open(path) as f:
+        after = f.read()
+    if after == before:
+        os.unlink(path)
+        return True, "config unchanged (%s)" % label
+    body = "\n".join(l for l in after.splitlines() if not l.lstrip().startswith("//"))
+    try:
+        put(check_cfg(json.loads(body)))
+    except Exception as e:
+        return False, "config not saved: %s; your edit is at %s" % (e, path)
+    os.unlink(path)
+    return True, "saved config (%s)" % label
 
 
 def emit(db, jid, kind, extra=None):
@@ -493,6 +543,77 @@ def agent():
 
 # ───────────────────────────────────────────────────────────────── host: rpc endpoint + setup
 
+
+def per_core_ticks():
+    """Cumulative [total, idle] CPU ticks per core id, or {} where the OS has no per-core stats.
+    Linux: /proc/stat cpuN lines; macOS: host_processor_info via ctypes (mach/machine.h: IDLE=2)."""
+    try:
+        with open("/proc/stat") as f:
+            out = {}
+            for line in f:
+                p = line.split()
+                if p[0].startswith("cpu") and p[0][3:].isdigit():
+                    v = [int(x) for x in p[1:]]
+                    # guest/guest_nice are already inside user/nice; iowait is idle, not busy
+                    out[int(p[0][3:])] = [sum(v[:8]), v[3] + (v[4] if len(v) > 4 else 0)]
+            return out
+    except OSError:
+        pass
+    if sys.platform != "darwin":
+        return {}
+    import ctypes, ctypes.util
+    lib = ctypes.CDLL(ctypes.util.find_library("System") or "/usr/lib/libSystem.B.dylib")
+    lib.mach_host_self.restype = ctypes.c_uint
+    lib.host_processor_info.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.POINTER(ctypes.c_uint),
+                                        ctypes.POINTER(ctypes.POINTER(ctypes.c_int)), ctypes.POINTER(ctypes.c_uint)]
+    lib.host_processor_info.restype = ctypes.c_int
+    lib.vm_deallocate.argtypes = [ctypes.c_uint, ctypes.c_void_p, ctypes.c_size_t]
+    ncpu, arr, n = ctypes.c_uint(), ctypes.POINTER(ctypes.c_int)(), ctypes.c_uint()
+    if lib.host_processor_info(lib.mach_host_self(), 2, ctypes.byref(ncpu), ctypes.byref(arr), ctypes.byref(n)):
+        return {}
+    try:
+        out = {}
+        for i in range(ncpu.value):
+            t = [arr[i * 4 + j] for j in range(4)]  # user, system, idle, nice
+            out[i] = [sum(t), t[2]]
+        return out
+    finally:
+        with contextlib.suppress(Exception):
+            task = ctypes.c_uint.in_dll(lib, "mach_task_self_")
+            lib.vm_deallocate(task, ctypes.cast(arr, ctypes.c_void_p), n.value * ctypes.sizeof(ctypes.c_int))
+
+
+def cpu_util(db, cores):
+    """Measured busy % of tinyshed's own cores, from per-core tick deltas since the previous status()
+    call. The snapshot lives in host.db meta because every rpc is a fresh process. None until two
+    samples exist, or where the OS exposes no per-core counters."""
+    ticks = per_core_ticks()
+    ids = [c for c in cores if c in ticks]
+    if not ids:
+        return None
+    cur = {str(c): ticks[c] for c in ids}
+    now = time.time()
+    try:
+        prev = json.loads(meta(db, "cpu") or "null")
+    except ValueError:
+        prev = None
+    pct = None
+    if prev and prev.get("cores") == sorted(cur):
+        try:
+            span = now - prev["ts"]
+            total = sum(cur[c][0] - prev["ticks"][c][0] for c in cur)
+            idle = sum(cur[c][1] - prev["ticks"][c][1] for c in cur)
+            if total > 0 and 0.5 <= span <= 300:
+                pct = round(max(0.0, min(100.0, 100 * (1 - idle / total))), 1)
+            elif total == 0 or span < 0.5:
+                return prev.get("pct")  # not enough elapsed: keep the old baseline and reading
+            # counters went backwards (reboot) or the baseline is stale: fall through to a fresh one
+        except (KeyError, TypeError, ValueError):
+            pass
+    meta(db, "cpu", json.dumps(dict(ts=now, cores=sorted(cur), ticks=cur, pct=pct)))
+    return pct
+
+
 def status(db, cfg):
     cores = host_cores(cfg)
     mem_total = mem_avail = None
@@ -513,7 +634,7 @@ def status(db, cfg):
         except (OSError, ValueError, subprocess.SubprocessError):
             pass
     return dict(now=time.time(), version=VERSION, ncpu=os.cpu_count(), cores=len(cores), free=len(cores) - len(used_cores(db)),
-                load=os.getloadavg()[0], mem_total_mb=mem_total, mem_avail_mb=mem_avail,
+                load=os.getloadavg()[0], cpu_pct=cpu_util(db, cores), mem_total_mb=mem_total, mem_avail_mb=mem_avail,
                 disk_free_gb=round(shutil.disk_usage(HOME).free / 2 ** 30, 1), gpus=gpus, agent=agent_alive(),
                 counts={r[0]: r[1] for r in db.execute("SELECT state, count(*) FROM jobs GROUP BY state")},
                 queued_cpus=db.execute("SELECT coalesce(sum(cpus),0) FROM jobs WHERE state='queued'").fetchone()[0])
@@ -549,6 +670,13 @@ def rpc(req):
         out["status"] = status(db, cfg)
     if req.get("logs"):
         out["logs"] = log_tail(req["logs"]["id"], int(req["logs"].get("bytes", 20000)))
+    if req.get("config_get"):
+        out["config"] = load_cfg()
+    if "config_set" in req:
+        try:
+            out["config"] = save_cfg(req["config_set"])
+        except (Fail, OSError) as e:
+            out["config_error"] = str(e)
     if not agent_alive():  # self-heal: any contact from the server revives a dead agent
         detach(["agent"])
     return out
@@ -881,6 +1009,40 @@ def resolve(db, prefix):
     return rows[0][0]
 
 
+def config_cmd(a, known):
+    """Show or, with --edit, open config.json in $EDITOR: locally, or a --host's over ssh."""
+    def remote_cfg(dest, req):
+        r = json.loads(remote(dest, ["rpc"], json.dumps(req)))
+        if r.get("config_error"):
+            raise Fail(r["config_error"])
+        return r["config"]
+
+    targets = []
+    for name in a.host or [None]:
+        if name is None:
+            targets.append(("local %s" % P("config.json"), load_cfg, save_cfg))
+        else:
+            if name not in known:
+                raise Fail("unknown host %r (see: tshed hosts)" % name)
+            dest = known[name]
+            targets.append(("host %s" % name,
+                            lambda d=dest: remote_cfg(d, dict(config_get=True)),
+                            lambda c, d=dest: remote_cfg(d, dict(config_set=c))))
+    if not a.edit:
+        for label, get, _ in targets:
+            cfg = get()
+            if len(targets) > 1:
+                print("# %s" % label)
+            print(json.dumps(cfg, indent=2, sort_keys=True))
+        return 0
+    rc = 0
+    for label, get, put in targets:
+        ok, msg = edit_cfg(get(), label, put)
+        print(msg, file=sys.stdout if ok else sys.stderr)
+        rc |= not ok
+    return rc
+
+
 PREFLIGHT = ("command -v python3 >/dev/null || { echo 'tinyshed: python3 not found on PATH' >&2; exit 1; }; "
              "python3 -c 'import sys; sys.exit(sys.version_info < (3, 12))' || "
              "{ echo \"tinyshed: python >= 3.12 required, found $(python3 -V 2>&1)\" >&2; exit 1; }; "
@@ -961,7 +1123,7 @@ BOLD_YELLOW, BOLD_CYAN, BOLD_RED = "\x1b[1;33m", "\x1b[1;36m", "\x1b[1;31m"
 KEY, HILITE = "\x1b[1;33m", "\x1b[48;5;237;1m"
 STATE_STYLE = dict(running=(GREEN, "▶"), queued=(BOLD_YELLOW, "◌"), pending=(CYAN, "◌"), done=(GREEN, "✓"),
                    cancelled=(MAGENTA, "■"))  # every failure: (BOLD_RED, "●")
-HOST_HEAD = "%-12s  %-7s %5s  %7s  %10s  %-8s %4s %4s  %6s  %s" % ("Host", "State", "Load", "Cores", "Mem free", "GPU", "Run", "Que", "Seen", "Notes")
+HOST_HEAD = "%-12s  %-7s %5s %5s  %7s  %10s  %-8s %4s %4s  %6s  %s" % ("Host", "State", "Load", "CPU%", "Cores", "Mem free", "GPU", "Run", "Que", "Seen", "Notes")
 JOB_HEAD = "%-11s %4s  %-12s  %-8s  %8s  %5s  %s" % ("State", "Prio", "Host", "ID", "Time", "Try", "Command")
 
 
@@ -1055,7 +1217,9 @@ def host_segs(h):
         "agent down" if s and not s.get("agent") else "",
         "v%s, server is v%s: run tshed install" % (s.get("version"), VERSION) if s and s.get("version") != VERSION else "") if n)
     return [(BOLD_CYAN, "%-12s" % h["name"][:12]), ("", "  "), (state[0], "%-7s" % state[1]),
-            ("", " %5s  " % ("%.1f" % s["load"] if s else "-")), (KEY, "%7s" % ("%d/%d" % (s["free"], s["cores"]) if s else "-")),
+            ("", " %5s" % ("%.1f" % s["load"] if s else "-")),
+            ("", " %5s  " % ("%d%%" % s["cpu_pct"] if s and s.get("cpu_pct") is not None else "-")),
+            (KEY, "%7s" % ("%d/%d" % (s["free"], s["cores"]) if s else "-")),
             ("", "  %10s  %-8s " % (mem, gpu)), (GREEN if run else DIM, "%4d" % run), ("", " "), (BOLD_YELLOW if que else DIM, "%4d" % que),
             (DIM, "  %6s  " % (fmt_dur(time.time() - h["seen"]) if h["seen"] else "never")), (BOLD_RED if h["err"] else BOLD_YELLOW, clean(notes))]
 
@@ -1232,7 +1396,7 @@ def tui(interval):
         # 4. status message, 5. help line, 6. footer
         L.append(styled([st["msg"]], W))
         L.append(help_line([("Enter/→", "detail"), ("N", "new"), ("K", "cancel"), ("E", "rerun"), ("P", "prio"), ("A", "attach"), ("O", "shell"),
-                            ("H", "show done" if st["hide"] else "hide done"), ("R", "refresh"), ("Esc", "exit")], W))
+                            ("H", "show done" if st["hide"] else "hide done"), ("C", "config"), ("R", "refresh"), ("Esc", "exit")], W))
         age = "syncing…" if st["syncing"] and not st["synced"] else "synced %s ago" % fmt_dur(time.time() - st["synced"]) if st["synced"] else "not synced yet"
         L.append(styled([(DIM, "Server: %s   (%d/%d jobs shown)   %s" % (HOME.replace(os.path.expanduser("~"), "~"), len(jobs), total, age))], W))
         return L, H
@@ -1257,7 +1421,7 @@ def tui(interval):
         L.append(styled([st["msg"]], W) if st["msg"][1] else styled([(DIM, "Scroll: %d-%d/%d%s" % (
             top + 1, min(len(lines), top + room), len(lines), "   (following)" if st["scroll"] is None and j["state"] == "running" else "")
             if lines else "No output yet" if j["sent"] else "Not on a host yet")], W))
-        L.append(help_line([("Esc/←", "back"), ("↑/↓", "scroll"), ("K", "cancel"), ("E", "rerun"), ("P", "prio"), ("A", "attach"), ("O", "shell"), ("R", "refresh")], W))
+        L.append(help_line([("Esc/←", "back"), ("↑/↓", "scroll"), ("K", "cancel"), ("E", "rerun"), ("P", "prio"), ("A", "attach"), ("O", "shell"), ("C", "config"), ("R", "refresh")], W))
         return L, H
 
     threading.Thread(target=syncer, daemon=True).start()
@@ -1343,6 +1507,9 @@ def tui(interval):
                 wake.set()
             elif key == "H":
                 st["hide"] = not st["hide"]
+            elif key == "C":
+                ok, msg = edit_cfg(load_cfg(), "local %s" % P("config.json"), save_cfg, run_fg)
+                say(msg, GREEN if ok else BOLD_RED)
             elif key == "N":
                 def new(text):
                     try:
@@ -1392,10 +1559,35 @@ EXAMPLES = """examples (tshed = this file, symlinked into PATH):
   tshed hosts                                         ping hosts: load, idle cores, memory, GPUs
   tshed submit -H gpu1 -p 5 -c 8 -m 32G -t 12h -r 2 -- python train.py
   tshed ls -a;  tshed show ID;  tshed logs ID;  tshed wait ID;  tshed cancel ID
+  tshed overview                                      hosts + active jobs, one screen
+  tshed config --edit                                 edit this machine's config in $EDITOR
+  tshed config --host gpu1 --edit                     edit gpu1's config over ssh
   tshed                                                  dashboard
   tshed completion fish > ~/.config/fish/completions/tshed.fish
 
 callbacks: ~/.tinyshed/hooks.py     docs: README.md, HUMANS.md"""
+
+
+def overview(db, n=30, show_all=False):
+    """One-shot snapshot: hosts | head -N; ---LS; ls | head -N, with a single sync_all()."""
+    n = max(1, n)
+    sync_all()
+    hosts = load_hosts(db)
+    jobs = [j for j in load_jobs(db, hosts) if show_all or j["state"] not in TERMINAL]
+    width = shutil.get_terminal_size().columns - 1 if colors() else 10 ** 6
+    if hosts:
+        print(paint(HOST_HEAD, BOLD))
+        for h in hosts[:n - 1]:
+            out(host_segs(h))
+    else:
+        print("no hosts yet: tshed install NAME=DEST ...")
+    print(paint("---LS", DIM))
+    if jobs:
+        print(paint(JOB_HEAD, BOLD))
+        for j in jobs[:n - 1]:
+            print(styled(job_segs(j), width)) if colors() else out(job_segs(j))
+    else:
+        print("no jobs" if show_all else "no active jobs (ls -a shows finished ones)")
 
 
 def build_parser():
@@ -1418,10 +1610,22 @@ def build_parser():
     s = sub.add_parser("hosts", help="ping every host and show resources")
     s.add_argument("--json", action="store_true", help="one JSON object per line")
     s.add_argument("--rm", metavar="NAME", help="forget a host without contacting it")
+    s = sub.add_parser("config", help="show or edit config.json in $EDITOR",
+                       description="Show, or with --edit open in $VISUAL/$EDITOR, this machine's config.json. "
+                                   "With --host, read/write that registered host's config over ssh. Edits are "
+                                   "validated (JSON and cores) before saving; the agent reloads config every "
+                                   "second, so changes apply without restarting it.")
+    s.add_argument("--edit", action="store_true", help="open in $VISUAL/$EDITOR instead of printing")
+    s.add_argument("--host", action="append", metavar="HOST", help="a registered host (repeatable); default: this machine")
     sub.add_parser("submit", help="queue a job", parents=[submit_parser(add_help=False)])
     s = sub.add_parser("ls", help="list jobs")
     s.add_argument("-a", "--all", action="store_true", help="include finished jobs")
     s.add_argument("--json", action="store_true", help="one JSON object per line")
+    s = sub.add_parser("overview", help="one-screen snapshot of hosts and active jobs",
+                       description="Non-interactive digest of `tshed hosts | head -N; echo ---LS; tshed ls | head -N`: "
+                                   "ping once, then print the hosts table and the active-jobs table, each capped at -n lines.")
+    s.add_argument("-n", "--lines", type=int, default=30, help="max lines per table, header included (default 30)")
+    s.add_argument("-a", "--all", action="store_true", help="include finished jobs")
     s = sub.add_parser("show", help="one job in detail, with the end of its log")
     s.add_argument("id")
     s.add_argument("-n", "--bytes", type=int, default=2000, help="how much log to show")
@@ -1556,6 +1760,8 @@ def main():
     zmod()  # fail early, with a clear message, if this machine has no zstd
     db = sdb()
     known = {r["name"]: r["dest"] for r in db.execute("SELECT name, dest FROM hosts")}
+    if a.op == "config":
+        return config_cmd(a, known)
     if a.op == "_complete":
         return complete(db, a.kind)
     if a.op == "ingest":
@@ -1633,6 +1839,8 @@ def main():
             print(paint(HOST_HEAD, BOLD))
             for h in hosts:
                 out(host_segs(h))
+    elif a.op == "overview":
+        overview(db, a.lines, a.all)
     elif a.op == "submit":
         if not known:
             raise Fail("no hosts yet: tshed install NAME=DEST ...")

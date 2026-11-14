@@ -12,12 +12,14 @@ interactive dashboard.
 ## Loop
 
 ```sh
-tshed hosts [--json]          # hosts, up/down, idle cores, memory, GPUs
+tshed hosts [--json]          # hosts, up/down, load, CPU%, idle cores, memory, GPUs
 tshed submit [flags] -- CMD   # prints: ID STATE HOST
 tshed wait ID... [-t 2h]      # blocks; exit 0 all done, 1 any failed, 2 timeout
 tshed show ID                 # state, limits, rc, times + last 2 kB of output
 tshed logs ID [-n BYTES]      # tail of stdout+stderr (default 20000 bytes)
 tshed ls [-a] --json          # one JSON object per job; -a includes finished
+tshed overview [-n N] [-a]    # one-screen snapshot: hosts + active jobs (no dashboard)
+tshed config [--edit] [--host HOST]  # show/edit config.json in $EDITOR (cores, name, home)
 tshed cancel ID...            tshed prio ID N
 ```
 
@@ -49,8 +51,8 @@ priority, so a queued job may wait behind a larger one.
 ## Rules
 
 - The queue is shared with the user and other agents (`tshed ls` shows their jobs too). Do not
-  cancel or reprioritise jobs you did not submit, and do not `tshed install`/`uninstall` or edit
-  `~/.tinyshed/hooks.py`, unless asked.
+  cancel or reprioritise jobs you did not submit, and do not `tshed install`/`uninstall`,
+  `tshed config --edit`, or edit `~/.tinyshed/hooks.py`, unless asked.
 - For jobs longer than a few minutes, do not block on `tshed wait` without `-t`; report the ID and
   stop, or wait with a timeout and check back.
 - `tshed hosts` shows `down` + the ssh error for unreachable hosts. Jobs already on a host keep

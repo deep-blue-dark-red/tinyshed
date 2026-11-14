@@ -45,10 +45,13 @@ tshed hosts
 ```
 
 ```
-Host          State    Load    Cores    Mem free  GPU       Run  Que    Seen  Notes
-gpu1          ✓ up      0.4    32/32    118/125G  2x 0%       0    0      0s
-gpu2          ✓ up      1.2    16/16      57/62G  -           0    0      0s
+Host          State    Load  CPU%    Cores    Mem free  GPU       Run  Que    Seen  Notes
+gpu1          ✓ up      0.4    6%    32/32    118/125G  2x 0%       0    0      0s
+gpu2          ✓ up      1.2   12%    16/16      57/62G  -           0    0      0s
 ```
+
+`Load` is the machine-wide 1-minute load average; `CPU%` is the busy percentage of the cores
+tinyshed owns (`-` until two polls have happened).
 
 Turn on tab completion (commands, flags, host names, and job ids described by their command):
 
@@ -131,6 +134,10 @@ Arrow keys or the mouse wheel move, a click selects (click again to open), typin
 
 While it is open the TUI is also a server loop, like `tshed serve`.
 
+For a quick look without opening it, `tshed overview` prints the hosts table and the active-jobs
+table in one screen (equivalent to `hosts | head -30; echo ---LS; ls | head -30`). `-n N` caps
+each table at N lines (30 by default), and `-a` includes finished jobs.
+
 ## 6. Callbacks
 
 Create `~/.tinyshed/hooks.py` on the server:
@@ -181,6 +188,7 @@ delivered and the server replays everything it missed — your hooks fire then, 
 |---|---|
 | server `~/.tinyshed/server.db` | mirror of all jobs, hosts, ingested events |
 | host `~/.tinyshed/host.db` | that host's queue and event log (the source of truth) |
+| host `~/.tinyshed/config.json` | `name`, `cores`, `home`; edit with `tshed config --edit [--host NAME]` |
 | host `~/.tinyshed/logs/ID.log` | live output; becomes `ID.log.zst` when the job is final |
 | host `~/.tinyshed/agent.log` | agent and watchdog diagnostics |
 | `~/.tinyshed/hooks.py`, `hooks.log` | callbacks and their output |

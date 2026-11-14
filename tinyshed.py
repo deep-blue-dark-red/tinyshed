@@ -1705,7 +1705,16 @@ def apply_theme(name=None, paint_bg=False):
         t = "default"
     if isinstance(t, dict):
         t = boost(t, current_contrast())
-    globals().update(palette(t, paint_bg))
+        t.update(current_scheme())
+    pal = palette(t, paint_bg)
+    if not isinstance(t, dict):  # default/mono: plain terminal colors; scheme overrides the style constants
+        for role, hexc in current_scheme().items():
+            for k in ROLE_STYLES.get(role, ()):
+                if k in pal:
+                    pal[k] = "\x1b[%sm" % sgr_color(hexc)
+            if role == "sel" and pal["HILITE"] not in ("", "\x1b[7m"):
+                pal["HILITE"] = "\x1b[%s;1m" % sgr_color(hexc, bg=True)
+    globals().update(pal)
     STATE_STYLE = dict(running=(GREEN, "▶"), queued=(YELLOW, "◌"), pending=(CYAN, "◌"), done=(GREEN, "✓"),
                        cancelled=(MAGENTA, "■"), moved=(CYAN, "→"))  # every failure: (BOLD_RED, "●")
 
@@ -1723,6 +1732,7 @@ def theme_cmd(name, contrast=None):
             name = os.path.abspath(os.path.expanduser(name))
         else:
             name = "btop:" + name
+        os.makedirs(HOME, exist_ok=True)
         with open(P("theme"), "w") as f:
             f.write(name + "\n")
         print("theme", name)
@@ -1739,6 +1749,105 @@ def theme_cmd(name, contrast=None):
              (BOLD_RED, "● error "), (MAGENTA, "■ cancelled "), (HOST, "host "), (KEY, "[K]"), ("", " "), (DIM, "dim "),
              (HILITE, " selected ")])
     apply_theme()
+
+
+# ── color schemes: user overrides of individual roles, layered onto any theme (~/.tinyshed/scheme,
+# one `role color` per line; TINYSHED_SCHEME="err=ff0000 ..." overrides). The 'default' and 'mono'
+# themes are plain terminal colors, so schemes there cover the text roles only.
+SCHEME_ROLES = THEME_ROLES + ("alt", "head", "sel_fg")
+NAMED_COLORS = dict(black="000000", red="cc0000", green="00cc00", yellow="c4a000", blue="3465a4",
+                    magenta="a45aa4", cyan="06989a", white="cccccc", gray="808080", grey="808080",
+                    bright_black="555555", bright_red="ef2929", bright_green="8ae234", bright_yellow="fce94f",
+                    bright_blue="729fcf", bright_magenta="ad7fa8", bright_cyan="34e2e2", bright_white="eeeeee")
+ROLE_STYLES = dict(ok=("GREEN",), info=("CYAN",), err=("RED", "BOLD_RED"), warn=("YELLOW", "BOLD_YELLOW"),
+                   cancel=("MAGENTA",), accent=("BLUE",), host=("HOST", "BOLD_CYAN"), key=("KEY", "NUM"),
+                   dim=("DIM",), title=("BOLD",))
+
+
+def parse_color(s):
+    """'ff8800' / '#ff8800' or a basic ANSI color name -> hex. 'default' means no override."""
+    c = s.lstrip("#").lower()
+    if c == "default":
+        return None
+    if c in NAMED_COLORS:
+        return NAMED_COLORS[c]
+    if len(c) == 6 and all(ch in "0123456789abcdef" for ch in c):
+        return c
+    raise Fail("bad color %r: use 6 hex digits or a name like %s" % (s, "/".join(sorted(NAMED_COLORS)[:4])))
+
+
+def scheme_dict(env):
+    d = {}
+    for kv in env.split():
+        k, _, v = kv.partition("=")
+        if k not in SCHEME_ROLES:
+            raise Fail("unknown role %r; scheme roles: %s" % (k, " ".join(SCHEME_ROLES)))
+        c = parse_color(v)
+        if c:
+            d[k] = c
+    return d
+
+
+def current_scheme():
+    """role -> hex overrides on top of the theme. TINYSHED_SCHEME overrides the saved file."""
+    env = os.environ.get("TINYSHED_SCHEME")
+    if env is not None:
+        return scheme_dict(env)
+    d = {}
+    try:
+        with open(P("scheme")) as f:
+            for line in f:
+                w = line.split()
+                if len(w) == 2 and w[0] in SCHEME_ROLES:
+                    d[w[0]] = w[1]
+    except OSError:
+        pass
+    return d
+
+
+def save_scheme(d):
+    os.makedirs(HOME, exist_ok=True)
+    with open(P("scheme"), "w") as f:
+        for k in SCHEME_ROLES:
+            if k in d:
+                f.write("%s %s\n" % (k, d[k]))
+
+
+def scheme_cmd(a):
+    sch = current_scheme()
+    if a.clear:
+        try:
+            os.remove(P("scheme"))
+        except OSError:
+            pass
+        sch = {}
+    for kv in a.pairs or []:
+        k, _, v = kv.partition("=")
+        if k not in SCHEME_ROLES:
+            raise Fail("unknown role %r; scheme roles: %s" % (k, " ".join(SCHEME_ROLES)))
+        c = parse_color(v)
+        if c:
+            sch[k] = c
+        else:
+            sch.pop(k, None)
+    if a.pairs or a.clear:
+        save_scheme(sch)
+        os.environ.pop("TINYSHED_SCHEME", None)
+        apply_theme()
+    if os.environ.get("TINYSHED_SCHEME"):
+        print("note: TINYSHED_SCHEME=%s overrides the saved scheme in this shell" % os.environ["TINYSHED_SCHEME"], file=sys.stderr)
+    styles = dict(ok=GREEN, info=CYAN, err=RED, warn=YELLOW, cancel=MAGENTA, accent=BLUE, host=HOST, key=KEY,
+                  dim=DIM, title=BOLD, sel=HILITE, alt=ALT, head=HEAD, sel_fg=HILITE if SEL_FLAT else "")
+    print("scheme: %d override(s) on top of theme %s" % (len(sch), current_theme()))
+    for r in SCHEME_ROLES:
+        st = styles.get(r, "")
+        if r in sch:
+            print("%s %-8s %s%-16s%s" % ("*" if r in sch else " ", r, st, sch[r] + " sample", RESET) if st
+                  else "%s %-8s %s" % ("*", r, sch[r]))
+        elif not (a.pairs or a.clear) and st:
+            print("  %-8s %s%-16s%s  (theme default)" % (r, st, "sample", RESET))
+    if not sch and not a.pairs and not a.clear:
+        print("(no overrides; `tshed scheme err=ff0000 warn=ffc000` sets colors on top of any theme)")
 
 
 apply_theme("default")
@@ -1775,14 +1884,14 @@ def out(segments):
 
 
 def fmt_dur(s):
-    s = int(max(0, s or 0))
+    s = int(max(0, s or 0)) // 5 * 5  # quantize to 5s so displays advance every 5s
     if s < 60:
         return "%ds" % s
     if s < 3600:
-        return "%dm%02ds" % (s // 60, s % 60)
+        return "%dm %02ds" % (s // 60, s % 60)
     if s < 86400:
-        return "%dh%02dm" % (s // 3600, s % 3600 // 60)
-    return "%dd%02dh" % (s // 86400, s % 86400 // 3600)
+        return "%dh %02dm" % (s // 3600, s % 3600 // 60)
+    return "%dd %02dh" % (s // 86400, s % 86400 // 3600)
 
 
 def clean(s):
@@ -2362,6 +2471,15 @@ def build_parser():
     s.add_argument("--contrast", type=float, metavar="N",
                    help="contrast level 0-10 (default 4): each level makes dark shades darker, light ones lighter and colors "
                         "more vivid. 0 = colors exactly as published. Saved; TINYSHED_CONTRAST overrides")
+    s = sub.add_parser("scheme", help="list or set per-role color overrides on top of the theme",
+                       description="Without arguments: list every color role with its current color (* = overridden). "
+                                   "With ROLE=COLOR pairs: override individual colors on top of any theme (saved in "
+                                   "~/.tinyshed/scheme; survives `T` in the dashboard). COLOR is 6 hex digits or a basic "
+                                   "color name (red, bright_cyan, ...); COLOR `default` removes the override. "
+                                   "TINYSHED_SCHEME='err=ff0000 warn=ffc000' overrides per shell.")
+    s.add_argument("pairs", nargs="*", metavar="ROLE=COLOR",
+                   help="roles: " + " ".join(SCHEME_ROLES))
+    s.add_argument("--clear", action="store_true", help="remove every override")
     s = sub.add_parser("completion", help="print a shell completion script")
     s.add_argument("shell", choices=("fish", "zsh", "bash"))
     public = [c.dest for c in sub._choices_actions]
@@ -2477,6 +2595,8 @@ def main():
     apply_theme()
     if a.op == "theme":
         return theme_cmd(a.name, a.contrast)
+    if a.op == "scheme":
+        return scheme_cmd(a)
     zmod()  # fail early, with a clear message, if this machine has no zstd
     db = sdb()
     known = {r["name"]: r["dest"] for r in db.execute("SELECT name, dest FROM hosts")}

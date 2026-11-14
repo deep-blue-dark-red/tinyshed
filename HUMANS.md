@@ -165,6 +165,11 @@ catppuccin, dracula, gruvbox, nord, tokyo-night, solarized and friends, plus eve
 theme (`btop:NAME`). Pick one with `tshed theme tokyo-night`. For the look of ratatui's own demos (tailwind
 palette, header bar, striped rows) pick `tailwind-blue`, `-emerald`, `-indigo` or `-red`.
 
+Happy with a theme except for one or two colors? Override individual roles on top of any theme:
+`tshed scheme err=ff00ff warn=bright_yellow sel=303050` (saved in `~/.tinyshed/scheme`; they survive
+`T` in the dashboard). `tshed scheme` lists every role with a sample, `tshed scheme err=default`
+undoes one, `--clear` undoes all, and `TINYSHED_SCHEME='err=ff0000'` overrides per shell.
+
 ## 6. Callbacks
 
 Create `~/.tinyshed/hooks.py` on the server:

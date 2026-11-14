@@ -36,6 +36,7 @@ tshed serve                                                         # or: headle
 | `cancel ID…`, `prio ID N` | |
 | `edit ID [-p N] [-H HOST\|any] [--force]` | change a waiting (`pending`/`queued`) job: priority, host (move; `any` unpins), or force it to start now. Dashboard: `P`, `M`, `F` |
 | `theme [NAME] [--contrast N]` | list color themes with samples, or pick one (saved in `~/.tinyshed/theme`; `TINYSHED_THEME` overrides); `--contrast` stretches the palette: darker darks, lighter lights (level 0-10, default 4). Dashboard: `T` cycles, `B`/`D` contrast |
+| `scheme [ROLE=COLOR…] [--clear]` | list color roles with samples (* = overridden), or set individual colors on top of any theme (saved in `~/.tinyshed/scheme`; `TINYSHED_SCHEME='err=ff0000 …'` overrides). `COLOR` is 6 hex digits or a basic name (`red`, `bright_cyan`, …); `ROLE=default` removes that override |
 | `completion fish`/`zsh`/`bash` | tab completion, including host names and job ids |
 
 Output is coloured on a terminal and plain in a pipe (`NO_COLOR` is respected). Tutorial: `HUMANS.md`;
@@ -175,6 +176,25 @@ host (mosh), `H` hide finished, `R` refresh, `Esc`/`Q` quit. While open, the TUI
 In the dashboard a theme paints its own background; plain commands only recolor text. Without truecolor
 (`COLORTERM=truecolor`, or a known terminal such as ghostty/kitty/iTerm2/WezTerm) colors are
 downsampled to the 256-color palette; `TINYSHED_TRUECOLOR=1` / `0` forces either (like btop's truecolor option). A saved theme that no longer resolves falls back to `default`.
+
+## Color schemes
+
+A scheme is a set of per-role overrides layered onto whatever theme is active, so one personal tweak
+survives `T` in the dashboard and works on every theme (it does nothing on `default` and `mono` for
+background-ish roles, since those use the terminal's own colors):
+
+```sh
+tshed scheme                          # list every role with a sample (* = overridden)
+tshed scheme err=ff00ff warn=bright_yellow sel=303050
+tshed scheme err=default              # back to the theme's error color
+tshed scheme --clear                  # remove every override
+```
+
+Overrides are saved in `~/.tinyshed/scheme` (`TINYSHED_SCHEME='err=ff0000 ok=00ff00'` overrides per
+shell, `err=default` in it drops that role's override). Roles: `ok info err warn cancel accent host
+key dim sel title fg bg` plus the theme-internal `alt head sel_fg`. Overrides are applied after the
+contrast curve, so they are used exactly as given.
+
 
 ## Notes and limits
 

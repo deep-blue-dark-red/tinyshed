@@ -16,8 +16,9 @@ those are interactive.
    from earlier runs of the same name (`tshed stats NAME --json`: `median`, `p90`), a small trial run,
    or the input size. The timeout defaults to twice this; pass `-t` only with a reason.
 3. **Progress markers in the script**: report a checkpoint after each unit of work of the main loop,
-   as `DONE/TOTAL message` (or `PCT% message`). With `-x` and a reported TOTAL, a job that goes more
-   than 2 × (expected / TOTAL) without a checkpoint is killed as `stalled`.
+   as `DONE/TOTAL message` (or `PCT% message`). With `-x`, a job that goes more than twice the expected
+   time for the progress its last checkpoint made (at least 10 s) without a new one is killed as
+   `stalled`: reporting every item, every Nth item or every few percent all work.
    ```sh
    n=${#files[@]}; i=0
    for f in "${files[@]}"; do
@@ -106,7 +107,7 @@ attempt, pauses excluded) or `wait` (time waiting so far).
 | `-c N` | cores, pinned with taskset (default 1) |
 | `-m 8G` | RSS limit for the process tree → state `oom` |
 | `-t 12h` | runtime limit per attempt → state `timeout` |
-| `--stall DUR` | killed as `stalled` after DUR without a checkpoint, counted from start; `0` = off (default: 2 × expected per step, with `-x` and a TOTAL) |
+| `--stall DUR` | killed as `stalled` after DUR without a checkpoint, counted from start; `0` = off (default with `-x`: 2 × the expected time for the last checkpoint's progress, ≥ 10 s) |
 | `--stall-on-log` | log output also counts as a checkpoint (needs `--stall`) |
 | `-r N` | retries with doubling backoff; `--retry-on error,lost` (default) may add `timeout,oom,stalled` |
 | `--git [PATH]` | run on a snapshot of the repo at PATH (default `.`), see Code and results |

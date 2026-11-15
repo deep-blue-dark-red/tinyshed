@@ -79,7 +79,7 @@ for i, shard in enumerate(shards, 1):
     progress(f"{i}/{len(shards)} {shard}")
 ```
 
-With `-x 3h` and 12 shards, a shard that takes over 2 × 15 min kills the job as `stalled` instead of
+With `-x 3h` and 12 shards, a shard that takes over 2 × 15 min (twice its share of the expected time) kills the job as `stalled` instead of
 letting it hang until the timeout. The dashboard shows percent done and an ETA.
 
 ## Commands
@@ -170,7 +170,7 @@ outside a job, so scripts run unchanged elsewhere.
 | | stall limit |
 |---|---|
 | `--stall 10m` | 10 min without a checkpoint, counted from the start; `0` = never |
-| `-x` and a reported TOTAL, no `--stall` | 2 × expected / TOTAL per step, from the first checkpoint with a total |
+| `-x` and a `DONE/TOTAL` or `PCT%`, no `--stall` | twice the time the expected rate allows for the progress of the last step, at least 10 s. A job reporting 3% per checkpoint with `-x 1h` gets 2 × 3% × 1 h ≈ 3.6 min per checkpoint, however often it reports |
 | `--stall-on-log` (with `--stall`) | log output also counts: for commands you cannot edit that print as they go |
 
 A stalled job is killed (state `stalled`, retryable). Checkpoints become `progress` events at most

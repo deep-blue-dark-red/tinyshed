@@ -128,8 +128,9 @@ done
 ```
 
 `tshed progress` exists on every host inside a job, and does nothing when the script runs outside
-tinyshed. With `-x` and a `DONE/TOTAL` checkpoint, a step that takes more than twice its share of the
-expected time kills the job as `stalled`; `--stall DUR` sets a fixed limit instead. The dashboard's
+tinyshed. With `-x` and a `DONE/TOTAL` (or `PCT%`) checkpoint, a step that takes more than twice its share of
+the expected time kills the job as `stalled`. The share is measured by what each checkpoint advanced, so
+reporting every item, every 1000th or every 10% all work, and the limit is never below 10 s; `--stall DUR` sets a fixed limit instead. The dashboard's
 Progress column shows percent and ETA. For a command you cannot edit that prints as it works,
 `--stall 15m --stall-on-log` treats its output as the heartbeat. Details: README, Progress checkpoints.
 

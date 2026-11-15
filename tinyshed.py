@@ -511,12 +511,16 @@ def repin(sid, cores):
                         setaff(int(tid), want)
 
 
-def stall_limit(j, total):
-    """Seconds without a checkpoint before the job counts as stalled; 0 = no limit.
-    Unset --stall with --expect: twice the expected time per step, once the job has reported its step count."""
+STALL_FLOOR = 10  # seconds: the shortest derived stall limit (the watchdog looks once a second)
+
+
+def stall_limit(j, step):
+    """Seconds without a checkpoint before the job counts as stalled; 0 = no limit. Unset --stall with --expect:
+    twice the time the expected rate allows for the progress the last checkpoint made (step = its share of TOTAL),
+    so a job reporting every item, every 1000th item or every 10% is judged by its own stride."""
     if j["stall"] is not None:
         return j["stall"]
-    return 2 * j["expect"] / total if j["expect"] and total else 0
+    return max(STALL_FLOOR, 2 * j["expect"] * step) if j["expect"] and step else 0
 
 
 def run_job(jid):
@@ -553,7 +557,8 @@ def run_job(jid):
     deadline = time.monotonic() + j["timeout"] if j["timeout"] else None
     kind, why, peak, tick, paused_at = None, "", 0, 0, None
     beat, seen, logsize = time.monotonic(), None, os.fstat(log.fileno()).st_size  # last checkpoint, progress file identity
-    line, total, saved, saved_at = None, None, None, 0.0  # checkpoint text, its step count, last recorded one
+    line, saved, saved_at = None, None, 0.0  # checkpoint text, last recorded one
+    last_done, step = 0.0, None  # DONE of the last checkpoint, and the share of TOTAL its step advanced
 
     def record():
         nonlocal saved, saved_at
@@ -561,7 +566,7 @@ def run_job(jid):
         transition(db, jid, "progress", progress=line, beat=time.time())
 
     def poll():  # a checkpoint = any write to the progress file
-        nonlocal seen, beat, line, total
+        nonlocal seen, beat, line, last_done, step
         with contextlib.suppress(OSError):
             st = os.stat(prog)
             if (st.st_mtime_ns, st.st_ino, st.st_size) != seen:
@@ -570,7 +575,9 @@ def run_job(jid):
                     text = " ".join(f.read(4096).split())[:200]
                 if text:  # empty: a torn write or a bare `touch`, still a heartbeat
                     line = text
-                    total = parse_progress(text)[1] or total
+                    done, total, _ = parse_progress(text)
+                    if done is not None and total and done > last_done:  # same DONE again: keep the stride
+                        step, last_done = (done - last_done) / total, done
 
     while kind is None:
         try:
@@ -585,7 +592,7 @@ def run_job(jid):
                 logsize, beat = n, time.monotonic()
         if line != saved and time.monotonic() - saved_at >= PROGRESS_EVERY:
             record()
-        limit = stall_limit(j, total)
+        limit = stall_limit(j, step)
         if stop:
             kind = "cancelled"
         elif paused_at is not None:  # stopped: no clocks run; wait for cancel or for the agent to hand back cores
@@ -1841,7 +1848,7 @@ def submit_parser(**kw):
     p.add_argument("-m", "--mem", type=size, default=0, help="RSS limit for the whole process tree, e.g. 8G")
     p.add_argument("-t", "--timeout", type=dur, default=0, help="runtime limit per attempt, e.g. 90s 30m 12h 2d (default: twice --expect)")
     p.add_argument("-x", "--expect", type=dur, default=0, help="expected runtime: sets the timeout to twice this, gives an ETA "
-                   "and, without --stall, a stall limit of twice the expected time per reported step")
+                   "and, without --stall, a stall limit of twice the expected time for each checkpoint's progress (at least 10s)")
     p.add_argument("--stall", type=dur, help="kill the job (state stalled) after this long without a checkpoint "
                    "(tshed progress / $TINYSHED_PROGRESS), counted from its start; 0 = never")
     p.add_argument("--stall-on-log", action="store_true", help="log output also counts as a checkpoint (needs --stall)")
@@ -2891,7 +2898,7 @@ def progress_segs(j):
     f, left = job_progress(j)
     stall = j.get("stall")
     stall = ("%s%s" % (fmt_dur(stall, 1), " (or output)" if j.get("stall_on_log") else "")) if stall \
-        else "2x expect/step" if stall is None and j.get("expect") else "-"
+        else "2x expected per step (>=10s)" if stall is None and j.get("expect") else "-"
     ago = j["now"] - j["beat"] if j["state"] in ("running", "paused") and j.get("beat") else None
     return [("", "Progress: "), (BOLD, clean(j.get("progress") or "-")),
             *([("", "   Done: "), (NUM, "%d%%" % (100 * f))] if f is not None else []),

@@ -31,6 +31,13 @@ tshed serve                                                         # or: headle
 | `config [--edit] [--host HOST…]` | show, or edit in `$VISUAL`/`$EDITOR`, this machine's `config.json` (`name`, `cores`, `home`). `--host` (repeatable) reads/writes a registered host's config over ssh; edits are validated before saving. Dashboard: `C` |
 | `overview [-n N] [-a]` | compact, non-interactive digest of `hosts` + `ls`: hosts table, `---LS` divider, active-jobs table, each capped at N lines (default 30). One sync feeds both; `-a` adds finished jobs |
 | `submit -n NAME [flags] -- CMD` | queue a job. `-n` is required: 1-16 characters, no spaces; it shows in `ls`/the dashboard and can stand in for the id anywhere an ID is taken (an unfinished job of that name wins; several → use the id) |
+| `checkout ID [DIR] [--diff [--stat]]` | a `--git` job's exact code from the snapshot store, into DIR (default `./NAME-ID`), or `--diff`: only the uncommitted changes it ran with. Works after the work dir is cleaned; no host contact |
+| `fetch ID [SRC…] [--to DIR]` | copy a job's results from its host now, in any state (a running job gives a snapshot); without SRC its `--pull` list (see Files) |
+| `pause ID…`, `resume ID…` | stop running jobs (SIGSTOP) and give their cores to the queue; resume continues them once cores are free (see Pause). Dashboard: `Z` |
+| `grep PATTERN [ID…] [-i] [-l] [--name N] [--state S] [--since 2d] [-m N]` | search job logs (live and compressed) on every host in parallel; Python regex; exit 1 if nothing matched |
+| `stats [NAME…] [--since 30d] [--json]` | per job name: runs, done, failed, fail %, median / p90 / max runtime of successful runs, latest `-x` (amber when the median is off by more than 50%), peak memory. From the server's records only |
+| `where ID [--json]` | what a running job is doing now: process tree, each bash script's line, python stacks (see Where is it?). Dashboard: `W` |
+| `progress [DONE/TOTAL\|PCT%] [MESSAGE]` | run *inside* a job: report a checkpoint (see Progress checkpoints). Does nothing outside a job |
 | `ls [-a] [--json]`, `show ID`, `logs [-f] ID` | list, inspect, read output (ids may be prefixes) |
 | `wait ID… [-t 2h]` | block; exit 0 done / 1 failed / 2 timeout |
 | `cancel ID…`, `prio ID N` | |
@@ -91,20 +98,140 @@ agent skill: `skills/tinyshed/`.
 - **Watchdog.** One detached process per running job: pins it to its allotted cores with `taskset`,
   captures stdout+stderr to `~/.tinyshed/logs/ID.log` (zstd-compressed when the job ends), enforces the runtime timeout, polls the summed
   RSS of the job's process tree against the memory limit, and kills the whole process group (TERM,
-  then KILL after 10s) on timeout / over-memory / cancel. If the watchdog itself dies (kill -9, reboot)
+  then KILL after 10s) on timeout / over-memory / stall / cancel. If the watchdog itself dies (kill -9, reboot)
   the agent notices, kills the orphans and marks the attempt `lost`.
 - **Retry.** `-r N` retries with exponential backoff on the kinds in `--retry-on` (default
-  `error,lost`; add `timeout,oom` if those are transient for you).
-- **Job states.** `pending` (still on server) → `queued` → `running` → `done | error | timeout | oom |
-  lost | cancelled`. Jobs see `TINYSHED_JOB`, `TINYSHED_ATTEMPT`, `TINYSHED_CORES`.
+  `error,lost`; add `timeout,oom,stalled` if those are transient for you).
+- **Job states.** `pending` (still on server) → `queued` → `running` (⇄ `paused`) → `done | error | timeout | oom |
+  stalled | lost | cancelled`. Jobs see `TINYSHED_JOB`, `TINYSHED_ATTEMPT`, `TINYSHED_CORES`,
+  `TINYSHED_PROGRESS`, and `~/.tinyshed/bin` (a `tshed` shim for this host) first on `PATH`.
+
+## Progress checkpoints
+
+`-x/--expect DUR` declares the expected runtime: the timeout defaults to twice it, and the dashboard
+shows an ETA. A job reports progress by writing one line, `DONE/TOTAL message`, `PCT% message` or any
+text, to the file `$TINYSHED_PROGRESS`; `tshed progress 3/10 msg` does that atomically (about 0.1 s of
+python startup), and a plain `printf '3/10 msg\n' > "$TINYSHED_PROGRESS"` costs nothing for tight loops.
+Every write is a checkpoint, even an empty one (`touch`): the watchdog polls the file's identity
+(mtime, inode, size) every second, so a torn write still counts and needs no locking.
+
+| flag | effect |
+|---|---|
+| `-x 2h` | expected runtime; `-t` defaults to 2 × this |
+| `--stall 10m` | killed as `stalled` after 10 min without a checkpoint, counted from the start; `0` = off |
+| (neither) | with `-x` and a reported TOTAL: stall limit 2 × expected / TOTAL per step, from the first checkpoint with a total |
+| `--stall-on-log` | log output also counts as a checkpoint (needs `--stall`): for opaque commands that print |
+
+A changed checkpoint becomes a `progress` event (hook `OnJobProgress`) at most every 30 s, plus one
+before the final event, so `ls`, `show`, the dashboard (`Progress` column: percent and ETA, amber when
+the ETA runs past the timeout) and `ls --json` (`progress`, `done`, `eta`) see it without growing the
+event log per iteration. A background `while sleep 60; do tshed progress; done &` defeats the point:
+it keeps a hung job alive. Checkpoint after each unit of work instead.
+
+## Files: `--git`, `--push`, `--pull`
+
+The server does all copying, over the same ssh connection as everything else; hosts need `git` and
+`rsync` (`install` notes when one is missing).
+
+```sh
+cd ~/proj/train
+tshed submit -n sweep -H gpu1 -x 3h --git --push ~/data/imgs:data --pull out:~/results/{name}/{id} -- python train.py
+```
+
+- **`--git [PATH]`** snapshots the repository that contains PATH (default `.`) exactly as it is on
+  disk: commits, staged and unstaged changes, and untracked files that are not ignored. It does so
+  without touching your index or files (a throwaway index, `write-tree`, `commit-tree`) and keeps it in
+  tinyshed's snapshot store on the server, `~/.tinyshed/snapshots/NAME-HASH.git` (`refs/tinyshed/ID`):
+  your repository gets no refs, so `git log --all` stays clean (the commit object left in it is
+  unreferenced and goes with git's normal gc). The server pushes it into a bare mirror on the host
+  (`~/.tinyshed/repos/NAME-HASH.git`, so only new objects travel) and checks it out as a detached
+  worktree in `~/.tinyshed/work/ID`. The job runs in the subdirectory you submitted from; `-C` is then
+  relative to the repository root. `show` prints `Code: repo@SHA +uncommitted on BRANCH (base SHA)`.
+  Ignored files (datasets, venvs) are not shipped: use `--push` for them. Untracked files over 100 MB in
+  total stop the submit with the largest ones listed. Submodule contents and git-lfs objects are not
+  shipped.
+- **`--push SRC[:DEST]`** (repeatable) rsyncs a local file or folder into the job's working directory
+  before it starts; DEST (default: SRC's name) is relative to that directory and must stay inside it.
+  Without `--git` the work dir starts empty.
+- **`--pull SRC[:DEST]`** (repeatable): when the job ends in one of `--pull-on` (default
+  `done,error,timeout,oom,stalled,lost`: everything but `cancelled`), SRC (relative to the job's working
+  directory on the host) is rsynced into the local folder DEST. A folder's contents land in DEST, a
+  file lands inside it. DEST may use `{name}` `{id}` `{host}` `{state}`; default `results/{name}/{id}`,
+  relative to where you ran `submit`. Each DEST gets `tinyshed-ID.json` (job, host, state, rc, command,
+  times, git snapshot, source path). A DEST folder that tinyshed creates inside a git work tree gets a
+  `.gitignore` of `*`, so results never ride along in the next `--git` snapshot.
+
+**When it happens.** With `-H`, `submit` stages the files before the job is queued; if that fails,
+nothing is queued. A job without `-H` (or moved with `edit -H`) is staged on its host before it is
+delivered: inline by `submit`, `wait` and `edit`, in a background thread by `serve` and the dashboard;
+quick commands (`ls`, `show`, …) never stage. Pulls run in `serve` and the dashboard as jobs finish,
+and at the end of `tshed wait` for the jobs it waited on (its output then says `pulled SRC → DEST`);
+`tshed fetch` pulls on demand. Failed staging or pulls are retried once a minute and shown by `show`.
+Every step is idempotent; a checkout interrupted halfway is redone, never trusted.
+
+**Cleanup.** A job's work dir (checkout, pushed files, outputs) is scratch: once the job has ended and
+its `--pull` for that end state succeeded (or it wants none, e.g. `cancelled`), the server deletes it on
+every host that holds a copy, including hosts the job was moved away from. That happens next to the
+pulls: in `serve`, the dashboard and at the end of `tshed wait`. A failed pull keeps the work dir (and
+is retried); `--keep-work` keeps it for good. Files you did not `--pull` go with it. What stays,
+forever: the snapshot (store on the server, mirror on the host; a snapshot stores only what differs
+from history, so this is the modified files), the log, and the job's record. `tshed checkout ID`
+rebuilds the code any time; `tshed checkout ID --diff` shows just its changes. Snapshots from before
+the store existed live as `refs/tinyshed/ID` in your repository; drop them with
+`git for-each-ref --format='%(refname)' refs/tinyshed | xargs -n1 git update-ref -d`.
+
+## Durations
+
+The Time column (and `Ran:` in `show`) counts from the start of the current attempt and leaves out time
+spent paused. Waiting jobs show their waiting time in brackets, `(12m 05s)`: since submission, or since
+the previous attempt ended for a retry; a job cancelled before it ever ran shows how long it waited.
+`ls --json` carries it as `ran` or `wait` (seconds).
+
+## Pause
+
+`tshed pause ID` (dashboard: `Z`) sends SIGSTOP to the job's process group, marks it `paused` and
+releases its cores, so the scheduler can start queued jobs on them. Memory stays held, and `Mem` keeps
+showing it. `tshed resume ID` does not restart it at once: a resumed job competes for cores in priority
+order exactly like a queued job, and when it fits it gets free cores (re-pinned with
+`sched_setaffinity` on Linux, every thread of the session) and SIGCONT. `pause` again before that
+cancels the pending resume. Paused time stops the timeout, the stall limit and the run time; the log
+records `=== tinyshed: paused …` and `resumed after Ns, cores=…`. Cancelling a paused job works (it is
+woken so the TERM lands). Pause and resume need the host to be reachable (like `prio`); hooks:
+`OnJobPaused`, `OnJobResumed`.
+
+## Where is it?
+
+`tshed where ID` asks the host what a running job is doing, at three levels of detail:
+
+- **Process tree** (always): every process of the job (descendants plus its session/process group),
+  with state, elapsed time and command line. Usually enough on its own: you see which step is running.
+- **Script line** (bash, no setup): bash reads a script through fd 255 and, before running a command,
+  seeks it back to just past that command. `where` reads that offset (`/proc/PID/fdinfo/255`, `lsof -o` on
+  macOS) and prints `at script.sh:N` with the line's text. Exact for top-level commands; inside a loop,
+  function or `if` it is the block's last line, because bash parses a whole block before running it.
+  Not available for `bash -c '…'` one-liners (no script file).
+- **Exact line, function stack and command** (opt-in, `submit --trace-lines`): the watchdog points
+  `BASH_ENV` at `~/.tinyshed/bin/trace.bash`, which every non-interactive bash of the job reads. It
+  sources the job's own `BASH_ENV` first, then sets a DEBUG trap that writes `file:line`, `FUNCNAME` and
+  `$BASH_COMMAND` before each command to `run/ID.where/PID`, one file per bash process. So nested scripts
+  read like a stack (`outer.sh:4 in stage` → `inner.sh:3 python3 …`) and parallel ones do not overwrite
+  each other. `$?` and `$_` are preserved and a failed write never affects the script. Costs about 0.1 ms
+  per bash command (a pure-bash loop of 20 000 empty iterations: 0.04 s → 2.4 s), which is negligible for
+  scripts that mostly run programs. Needs bash >= 4 (macOS `/bin/bash` 3.2 records nothing); `sh`/dash
+  scripts and scripts that set their own DEBUG trap are not traced; `set -T` is on in traced shells.
+- **Python stacks**: when `py-spy` is installed on the host, `where` adds `py-spy dump` for up to four
+  python processes of the job (the dump pauses each briefly). On Linux it needs ptrace permission (root,
+  or `kernel.yama.ptrace_scope=0`); in a container, `--cap-add SYS_PTRACE`.
+
+`where` only reads, at the moment you ask: levels 1, 2 and 4 cost the job nothing in between.
 
 ## Callbacks
 
 Put a `hooks.py` in `~/.tinyshed/` on the server (fires when an event is ingested) and/or on a host
 (fires when it happens). Define any of:
 
-`OnJobQueued` `OnJobStart` `OnJobCompletion` `OnJobError` `OnJobTimeout` `OnJobOOM` `OnJobLost`
-`OnJobCancel` `OnHostDown` `OnHostUp` (server) `OnEvent` (everything)
+`OnJobQueued` `OnJobStart` `OnJobCompletion` `OnJobError` `OnJobTimeout` `OnJobOOM` `OnJobStalled`
+`OnJobLost` `OnJobCancel` `OnJobProgress` `OnJobPaused` `OnJobResumed` `OnHostDown` `OnHostUp` (server) `OnEvent` (everything)
 
 ```python
 import subprocess
@@ -126,7 +253,21 @@ when edited.
 Built like `gitss`: alternate screen, atomic synchronized frames, type-to-filter, capital command keys,
 mouse wheel and click. `Enter`/`→` detail with a scrollable live log, `N` new job (same flags as
 `submit`), `K` cancel, `E` rerun, `P` priority, `F` force-start, `M` move to another host, `T` next theme, `A` follow the log on the host (mosh), `O` shell on the
-host (mosh), `H` hide finished, `R` refresh, `Esc`/`Q` quit. While open, the TUI is also the server loop.
+host (mosh), `H` hide finished, `R` refresh, `W` where (process tree and script lines, see Where is it?), `Esc`/`Q` quit.
+While open, the TUI is also the server loop.
+
+`Z` pauses the selected running job, or resumes a paused one.
+
+**Marking several jobs.** `X` marks or unmarks the selected job and moves down; ctrl- or alt-click
+toggles a row; `Ctrl-A` marks every job shown (filter first, e.g. type `error`), again to unmark them;
+`U` (or `Esc`, before it quits) clears all marks. Marks follow the job, not the row, and survive
+filtering. With marks set, `E` reruns every marked job as a new one, asking for the host: `Enter`
+keeps each job's own host, `any` lets the server pick, or a host name. `K` cancels every marked job that is not finished, `P` sets
+the priority of every marked waiting job, `Z` pauses the marked running ones and resumes the marked
+paused ones. `Y` copies the marked jobs'
+commands, one per line (the selected job's when nothing is marked), with `pbcopy` / `wl-copy` /
+`xclip` / `xsel` in a local session, else through the terminal with OSC 52 (works over ssh; inside tmux
+it needs `set -g set-clipboard on`).
 
 ## Editing jobs
 
@@ -222,7 +363,7 @@ contrast curve, so they are used exactly as given.
   dropped by a firewall → `ssh -t` instead. (On macOS hosts the application firewall decides per
   program, so the probe can say "blocked" while mosh itself is allowed; the fallback is still safe.)
 - GPUs are reported (`nvidia-smi`) but not allocated; pass `CUDA_VISIBLE_DEVICES` with `-e`.
-- **Retention.** Nothing is ever pruned. To keep that cheap, everything at rest is zstd: job and event
+- **Retention.** Nothing is ever pruned except `--git`/`--push` work dirs, once their results are pulled (see Files). To keep that cheap, everything at rest is zstd: job and event
   payloads are zstd blobs in sqlite, and a job's log becomes `logs/ID.log.zst` once the job is final
   (`logs`, the TUI and `A` read either form). Read a payload by hand with
   `sqlite3 host.db "select writefile('/dev/stdout', data) from events where id=1" | zstd -d`.

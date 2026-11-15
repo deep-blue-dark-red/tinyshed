@@ -14,8 +14,12 @@ draining its own queue. Hosts can also phone home (`ssh server tinyshed.py inges
 Each job runs under a watchdog process (taskset pinning, runtime timeout, RSS limit, stdout/stderr
 capture, retry with backoff) that is detached from the agent, so agents can be upgraded mid-job.
 
+Progress checkpoints: a job writes `DONE/TOTAL message` to $TINYSHED_PROGRESS (or runs `tshed progress`);
+--stall kills a job that stops checkpointing, --expect sets the timeout to twice the expected runtime.
+
 Callbacks: put functions in ~/.tinyshed/hooks.py (server and/or host), each taking one event dict:
-  OnJobQueued OnJobStart OnJobCompletion OnJobError OnJobTimeout OnJobOOM OnJobLost OnJobCancel
+  OnJobQueued OnJobStart OnJobCompletion OnJobError OnJobTimeout OnJobOOM OnJobStalled OnJobLost OnJobCancel
+  OnJobProgress OnJobPaused OnJobResumed
   OnHostDown OnHostUp (server only)   OnEvent (everything)
 """
 import argparse, contextlib, fcntl, importlib, json, os, re, shlex, shutil, signal, sqlite3, subprocess, sys, tempfile, threading, time, traceback, uuid
@@ -24,14 +28,16 @@ VERSION = "0.2"
 HOME = os.path.abspath(os.path.expanduser(os.environ.get("TINYSHED_HOME") or "~/.tinyshed"))
 SELF = os.path.abspath(__file__)
 OUT = sys.stdout
-FAILURES = ("error", "timeout", "oom", "lost")
+FAILURES = ("error", "timeout", "oom", "stalled", "lost")
 TERMINAL = ("done", "cancelled") + FAILURES
 HOOKS = {"queued": "OnJobQueued", "start": "OnJobStart", "done": "OnJobCompletion", "error": "OnJobError",
-         "timeout": "OnJobTimeout", "oom": "OnJobOOM", "lost": "OnJobLost", "cancelled": "OnJobCancel",
-         "host_down": "OnHostDown", "host_up": "OnHostUp"}
+         "timeout": "OnJobTimeout", "oom": "OnJobOOM", "stalled": "OnJobStalled", "lost": "OnJobLost", "cancelled": "OnJobCancel",
+         "progress": "OnJobProgress", "paused": "OnJobPaused", "resumed": "OnJobResumed", "host_down": "OnHostDown", "host_up": "OnHostUp"}
 # job fields that travel server -> host, with defaults
+# stall: None = derived from expect once the job reports a total, 0 = off
 SPEC = dict(name=None, cmd=None, cwd=None, env=None, prio=0, cpus=1, mem_mb=0, timeout=0, retries=0,
-            retry_on="error,lost", retry_delay=30, created=None)
+            retry_on="error,lost", retry_delay=30, created=None, expect=0, stall=None, stall_on_log=0, trace_lines=0, work=0)
+PROGRESS_EVERY = 30  # seconds: a changed checkpoint becomes a `progress` event at most this often
 
 
 class Fail(Exception):
@@ -180,6 +186,19 @@ def size(s):
     return int(float(s[:-1]) * mult) if mult else int(float(s))
 
 
+_STEP = re.compile(r"(\d+(?:\.\d+)?)(?:/(\d+(?:\.\d+)?)|(%))$")
+
+
+def parse_progress(s):
+    """A checkpoint line: 'DONE/TOTAL message', 'PCT% message' or just a message -> (done, total, message).
+    done/total are None when the first word is not a step."""
+    head, _, rest = (s or "").strip().partition(" ")
+    m = _STEP.match(head)
+    if not m or (m[2] and float(m[2]) <= 0):
+        return None, None, (s or "").strip()
+    return float(m[1]), float(m[2]) if m[2] else 100.0, rest.strip()
+
+
 # ───────────────────────────────────────────────────────────────── host: state
 
 HOST_SCHEMA = """
@@ -187,7 +206,9 @@ CREATE TABLE IF NOT EXISTS jobs(
   id TEXT PRIMARY KEY, name TEXT, cmd TEXT, cwd TEXT, env TEXT, prio INT, cpus INT, mem_mb INT, timeout REAL,
   retries INT, retry_on TEXT, retry_delay REAL, created REAL,
   state TEXT, attempt INT DEFAULT 0, not_before REAL DEFAULT 0, cores TEXT, pid INT, rc INT,
-  started REAL, ended REAL, peak_mb INT, cancel INT DEFAULT 0, force INT DEFAULT 0);
+  started REAL, ended REAL, peak_mb INT, cancel INT DEFAULT 0, force INT DEFAULT 0,
+  expect REAL DEFAULT 0, stall REAL, stall_on_log INT DEFAULT 0, progress TEXT, beat REAL, trace_lines INT DEFAULT 0,
+  pause INT DEFAULT 0, paused_at REAL, paused_s REAL DEFAULT 0, work INT DEFAULT 0);
 CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(state, prio DESC, created);
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, job TEXT, kind TEXT, data TEXT);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
@@ -197,7 +218,10 @@ CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 def hdb():
     db = connect("host.db", HOST_SCHEMA)
     have = {r[1] for r in db.execute("PRAGMA table_info(jobs)")}
-    for col, decl in (("force", "INT DEFAULT 0"), ("name", "TEXT")):  # v0.2 queues predate these
+    for col, decl in (("force", "INT DEFAULT 0"), ("name", "TEXT"),  # v0.2 queues predate these
+                      ("expect", "REAL DEFAULT 0"), ("stall", "REAL"), ("stall_on_log", "INT DEFAULT 0"),  # and these
+                      ("progress", "TEXT"), ("beat", "REAL"), ("trace_lines", "INT DEFAULT 0"),
+                      ("pause", "INT DEFAULT 0"), ("paused_at", "REAL"), ("paused_s", "REAL DEFAULT 0"), ("work", "INT DEFAULT 0")):
         if col not in have:
             try:
                 db.execute("ALTER TABLE jobs ADD COLUMN %s %s" % (col, decl))
@@ -393,7 +417,7 @@ def job_usage(db):
     """Live usage of running jobs: ({id: [CPU% of its assigned cores or None, RSS MB]}, summed RSS MB,
     sum of their -m limits MB or None if any running job set no -m). CPU% = CPU-seconds delta since
     the previous status() call / (elapsed * cores assigned); the baseline lives in host.db meta."""
-    rows = db.execute("SELECT id, pid, cores, cpus, mem_mb FROM jobs WHERE state='running'").fetchall()
+    rows = db.execute("SELECT id, pid, cores, cpus, mem_mb FROM jobs WHERE state IN ('running','paused')").fetchall()  # paused: RAM still held
     reserved = None if any(not r["mem_mb"] for r in rows) else sum(r["mem_mb"] for r in rows)
     use = session_usage({r["pid"] for r in rows if r["pid"]})
     now = time.time()
@@ -425,6 +449,7 @@ def job_usage(db):
 def kill_group(p, grace=10):
     try:
         os.killpg(p.pid, signal.SIGTERM)
+        os.killpg(p.pid, signal.SIGCONT)  # a paused job handles TERM only once it runs again
         p.wait(timeout=grace)
     except (OSError, subprocess.TimeoutExpired):
         pass
@@ -433,57 +458,181 @@ def kill_group(p, grace=10):
     p.wait()
 
 
+# --trace-lines: every bash process of the job (BASH_ENV is read by each non-interactive bash) records the
+# command it is about to run in run/ID.where/PID. Subshells skip it (BASHPID != $$); $? survives a DEBUG trap
+# by itself, $_ is restored by hand; a failed write (or set -e) never affects the script.
+TRACE_BASH = r"""# tinyshed --trace-lines (see tshed where); sources the job's own BASH_ENV first
+[ -n "$TINYSHED_BASH_ENV" ] && . "$TINYSHED_BASH_ENV"
+set -T
+trap '_tshed_u=$_; [ "$BASHPID" = "$$" ] && { printf "%s:%s\t%s\t%.300s\n" "${BASH_SOURCE[0]:-bash -c}" "$LINENO" "${FUNCNAME[*]}" "$BASH_COMMAND" > "$TINYSHED_WHERE/$$"; } 2>/dev/null || :; : "$_tshed_u"' DEBUG
+"""
+
+
+def host_bin():
+    """~/.tinyshed/bin on the host: a `tshed` shim (so jobs can call `tshed progress` whatever their PATH holds)
+    and the --trace-lines BASH_ENV file. Rewritten only when they differ, atomically."""
+    files = {"tshed": "#!/bin/sh\nexec %s %s \"$@\"\n" % (shlex.quote(sys.executable), shlex.quote(P("tinyshed.py"))),
+             "trace.bash": TRACE_BASH}
+    os.makedirs(P("bin"), exist_ok=True)
+    for name, body in files.items():
+        path = P("bin", name)
+        with contextlib.suppress(OSError):
+            with open(path) as f:
+                if f.read() == body:
+                    continue
+        with open(path + ".%d" % os.getpid(), "w") as f:
+            f.write(body)
+        os.chmod(f.name, 0o755)
+        os.replace(f.name, path)
+    return P("bin")
+
+
+def job_cwd(j):
+    """A job's working directory on this host: -C (default ~), or inside its staged work dir (--git/--push)."""
+    if j["work"]:
+        return os.path.normpath(os.path.join(P("work", j["id"]), os.path.expanduser(j["cwd"] or ".")))
+    return os.path.expanduser(j["cwd"] or "~")
+
+
+def repin(sid, cores):
+    """Move every thread of a job's session to new cores (a resumed job gets whatever cores are free). Linux only."""
+    setaff = getattr(os, "sched_setaffinity", None)
+    if not setaff or not cores:
+        return
+    want = set(parse_cores(cores))
+    for pid in os.listdir("/proc"):
+        if pid.isdigit():
+            with contextlib.suppress(OSError, IndexError, ValueError):
+                with open("/proc/%s/stat" % pid) as f:
+                    if f.read().rsplit(")", 1)[1].split()[3] != str(sid):
+                        continue
+                for tid in os.listdir("/proc/%s/task" % pid):
+                    with contextlib.suppress(OSError):
+                        setaff(int(tid), want)
+
+
+def stall_limit(j, total):
+    """Seconds without a checkpoint before the job counts as stalled; 0 = no limit.
+    Unset --stall with --expect: twice the expected time per step, once the job has reported its step count."""
+    if j["stall"] is not None:
+        return j["stall"]
+    return 2 * j["expect"] / total if j["expect"] and total else 0
+
+
 def run_job(jid):
     """The watchdog. Inherits a held flock on run/<jid>.lock from the agent: lock released == watchdog dead."""
     db = hdb()
     j = db.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone()
     stop = []
     signal.signal(signal.SIGTERM, lambda *a: stop.append(1))
-    logp = P("logs", jid + ".log")
+    logp, prog, trace = P("logs", jid + ".log"), P("run", jid + ".progress"), P("run", jid + ".where")
     log = open(logp, "ab")
     log.write(("=== tinyshed %s attempt %d cores=%s %s ===\n" % (jid, j["attempt"], j["cores"], time.strftime("%F %T"))).encode())
     log.flush()
+    with contextlib.suppress(OSError):  # a new attempt starts without checkpoints or traces
+        os.remove(prog)
+    shutil.rmtree(trace, ignore_errors=True)
     cmd = ["bash", "-c", j["cmd"]]
     if j["cores"] and shutil.which("taskset"):
         cmd = ["taskset", "-c", j["cores"]] + cmd
     env = dict(os.environ, **json.loads(j["env"] or "{}"))
-    env.update(TINYSHED_JOB=jid, TINYSHED_ATTEMPT=str(j["attempt"]), TINYSHED_CORES=j["cores"] or "")
+    env.update(TINYSHED_JOB=jid, TINYSHED_ATTEMPT=str(j["attempt"]), TINYSHED_CORES=j["cores"] or "", TINYSHED_PROGRESS=prog)
+    with contextlib.suppress(OSError):
+        env["PATH"] = host_bin() + os.pathsep + env.get("PATH", os.defpath)
+        if j["trace_lines"]:
+            os.makedirs(trace, exist_ok=True)
+            env.update(TINYSHED_WHERE=trace, TINYSHED_BASH_ENV=env.get("BASH_ENV", ""), BASH_ENV=P("bin", "trace.bash"))
     try:
         p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, env=env,
-                             cwd=os.path.expanduser(j["cwd"] or "~"), start_new_session=True)
+                             cwd=job_cwd(j), start_new_session=True)
     except OSError as e:
         log.write(("tinyshed: cannot start: %s\n" % e).encode())
         log.flush()
         return finish(db, jid, "error", rc=127, tail=str(e))
-    transition(db, jid, "start", pid=p.pid)
+    transition(db, jid, "start", pid=p.pid, progress=None, beat=None)
     deadline = time.monotonic() + j["timeout"] if j["timeout"] else None
-    kind, peak, tick = None, 0, 0
+    kind, why, peak, tick, paused_at = None, "", 0, 0, None
+    beat, seen, logsize = time.monotonic(), None, os.fstat(log.fileno()).st_size  # last checkpoint, progress file identity
+    line, total, saved, saved_at = None, None, None, 0.0  # checkpoint text, its step count, last recorded one
+
+    def record():
+        nonlocal saved, saved_at
+        saved, saved_at = line, time.monotonic()
+        transition(db, jid, "progress", progress=line, beat=time.time())
+
+    def poll():  # a checkpoint = any write to the progress file
+        nonlocal seen, beat, line, total
+        with contextlib.suppress(OSError):
+            st = os.stat(prog)
+            if (st.st_mtime_ns, st.st_ino, st.st_size) != seen:
+                seen, beat = (st.st_mtime_ns, st.st_ino, st.st_size), time.monotonic()
+                with open(prog, errors="replace") as f:
+                    text = " ".join(f.read(4096).split())[:200]
+                if text:  # empty: a torn write or a bare `touch`, still a heartbeat
+                    line = text
+                    total = parse_progress(text)[1] or total
+
     while kind is None:
         try:
             p.wait(timeout=1)
             break
         except subprocess.TimeoutExpired:
             tick += 1
+        poll()
+        if j["stall_on_log"]:
+            n = os.fstat(log.fileno()).st_size
+            if n != logsize:
+                logsize, beat = n, time.monotonic()
+        if line != saved and time.monotonic() - saved_at >= PROGRESS_EVERY:
+            record()
+        limit = stall_limit(j, total)
         if stop:
             kind = "cancelled"
+        elif paused_at is not None:  # stopped: no clocks run; wait for cancel or for the agent to hand back cores
+            if tick % 2 == 0:
+                r = db.execute("SELECT cancel, state, cores FROM jobs WHERE id=?", (jid,)).fetchone()
+                if r["cancel"]:
+                    kind = "cancelled"
+                elif r["state"] == "running":  # resumed: the agent assigned cores
+                    repin(p.pid, r["cores"])
+                    with contextlib.suppress(OSError):
+                        os.killpg(p.pid, signal.SIGCONT)
+                    d = time.monotonic() - paused_at
+                    deadline, beat, paused_at = deadline and deadline + d, beat + d, None
+                    log.write(("=== tinyshed: resumed after %.0fs, cores=%s %s ===\n" % (d, r["cores"], time.strftime("%F %T"))).encode())
+                    log.flush()
         elif deadline and time.monotonic() > deadline:
-            kind = "timeout"
+            kind, why = "timeout", ": ran %.0fs" % j["timeout"]
+        elif limit and time.monotonic() - beat > limit:
+            kind, why = "stalled", ": no checkpoint%s for %s" % (" or output" if j["stall_on_log"] else "", "%.0fs" % (time.monotonic() - beat))
         elif tick % 2 == 0:
             if j["mem_mb"] or tick % 10 == 0:
                 peak = max(peak, tree_rss_mb(p.pid))
+            r = db.execute("SELECT cancel, pause FROM jobs WHERE id=?", (jid,)).fetchone()
             if j["mem_mb"] and peak > j["mem_mb"]:
                 kind = "oom"
-            elif db.execute("SELECT cancel FROM jobs WHERE id=?", (jid,)).fetchone()[0]:
+            elif r["cancel"]:
                 kind = "cancelled"
+            elif r["pause"]:  # stop the whole group and give the cores back to the scheduler
+                with contextlib.suppress(OSError):
+                    os.killpg(p.pid, signal.SIGSTOP)
+                paused_at = time.monotonic()
+                transition(db, jid, "paused", state="paused", cores=None, paused_at=time.time())
+                log.write(("=== tinyshed: paused %s ===\n" % time.strftime("%F %T")).encode())
+                log.flush()
     if kind:
-        log.write(("=== tinyshed: killing job (%s) ===\n" % kind).encode())
+        log.write(("=== tinyshed: killing job (%s%s) ===\n" % (kind, why)).encode())
         log.flush()
         kill_group(p)
     else:
         kind = "done" if p.returncode == 0 else "error"
         with contextlib.suppress(OSError):  # no stragglers outlive the job
             os.killpg(p.pid, signal.SIGKILL)
+    poll()
+    if line != saved:  # the final event carries the last checkpoint
+        record()
     finish(db, jid, kind, rc=p.returncode, peak_mb=peak, tail=log_tail(jid))
+    shutil.rmtree(trace, ignore_errors=True)  # only meaningful while the job runs
 
 
 # ───────────────────────────────────────────────────────────────── host: agent (the local scheduler)
@@ -515,13 +664,13 @@ def agent_alive():
 
 def reconcile(db):
     """A 'running' job whose watchdog lock is free has lost its watchdog (crash, kill -9, reboot)."""
-    for j in db.execute("SELECT id FROM jobs WHERE state='running'").fetchall():
+    for j in db.execute("SELECT id FROM jobs WHERE state IN ('running','paused')").fetchall():
         f = try_lock(P("run", j["id"] + ".lock"))
         if not f:
             continue
         with f:
             j = db.execute("SELECT * FROM jobs WHERE id=?", (j["id"],)).fetchone()
-            if j["state"] != "running":  # the watchdog finished normally in the meantime
+            if j["state"] not in ("running", "paused"):  # the watchdog finished normally in the meantime
                 continue
             try:  # kill the orphaned job, but only if the pid provably still is our job (linux)
                 with open("/proc/%d/environ" % j["pid"], "rb") as e:
@@ -538,11 +687,22 @@ def schedule(db, cfg, kids):
     cores = host_cores(cfg)
     used = used_cores(db)
     free = [c for c in cores if c not in used]
-    for j in db.execute("SELECT id, cpus, force FROM jobs WHERE state='queued' AND cancel=0 AND (force=1 OR not_before<=?) "
-                        "ORDER BY force DESC, prio DESC, created, id", (time.time(),)).fetchall():
+    for j in db.execute("SELECT id, cpus, force, state FROM jobs WHERE cancel=0 AND ((state='queued' AND (force=1 OR not_before<=?)) "
+                        "OR (state='paused' AND pause=0)) ORDER BY force DESC, prio DESC, created, id", (time.time(),)).fetchall():
         need = min(max(1, j["cpus"]), len(cores))
         if need > len(free) and not j["force"]:
             break
+        if j["state"] == "paused":  # resume: its watchdog is alive (holds the lock); it re-pins and continues the job
+            mine = free[:need]
+            free = free[need:]
+            with tx(db):
+                n = db.execute("UPDATE jobs SET state='running', cores=?, paused_s=coalesce(paused_s,0)+?-paused_at, paused_at=NULL "
+                               "WHERE id=? AND state='paused' AND pause=0 AND cancel=0",
+                               (",".join(map(str, mine)), time.time(), j["id"])).rowcount
+                ev = emit(db, j["id"], "resumed") if n else None
+            if ev:
+                fire(ev)
+            continue
         f = try_lock(P("run", j["id"] + ".lock"))
         if not f:  # previous attempt's watchdog is still exiting
             continue
@@ -551,7 +711,7 @@ def schedule(db, cfg, kids):
             free = [c for c in free if c not in mine]
             with tx(db):
                 n = db.execute("UPDATE jobs SET state='running', attempt=attempt+1, cores=?, started=?, ended=NULL, rc=NULL, pid=NULL, "
-                               "force=0 WHERE id=? AND state='queued' AND cancel=0",
+                               "force=0, pause=0, paused_at=NULL, paused_s=0 WHERE id=? AND state='queued' AND cancel=0",
                                (",".join(map(str, mine)), time.time(), j["id"])).rowcount
             if n:  # the watchdog inherits the held lock
                 kids.append(detach(["_run", j["id"]], pass_fds=[f.fileno()]))
@@ -807,6 +967,226 @@ def state_of(db, jid):
     return r and r[0]
 
 
+def script_pos(pids):
+    """{pid: (script path, byte offset)} for bash processes running a script file. bash reads a script through fd
+    255 and, before running a command, seeks it back to just past that command: the offset says how far it got."""
+    out = {}
+    if os.path.isdir("/proc/self"):
+        for pid in pids:
+            with contextlib.suppress(OSError, ValueError, IndexError):
+                path = os.readlink("/proc/%d/fd/255" % pid)
+                with open("/proc/%d/fdinfo/255" % pid) as f:
+                    out[pid] = (path, int(f.read().split("pos:")[1].split()[0]))
+        return out
+    if not pids or not shutil.which("lsof"):
+        return out
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        r = subprocess.run(["lsof", "-a", "-p", ",".join(map(str, pids)), "-d", "255", "-o", "-Fpon"],
+                           capture_output=True, text=True, timeout=10).stdout
+        pid = off = None
+        for line in r.splitlines():
+            k, v = line[:1], line[1:]
+            if k == "p":
+                pid, off = int(v), None
+            elif k == "o":
+                off = int(v[2:]) if v.startswith("0t") else int(v, 16)
+            elif k == "n" and pid and off is not None:
+                out[pid] = (v, off)
+    return out
+
+
+def script_line(path, off):
+    """(line number, source text) of the command that ends just before byte off."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(min(off, 64 << 20))
+    except OSError:
+        return None, None
+    if not head or not os.path.isfile(path):
+        return None, None
+    n = head.count(b"\n") + (0 if head.endswith(b"\n") else 1)
+    return n, head.rstrip(b"\n").rsplit(b"\n", 1)[-1].decode("utf-8", "replace").strip()
+
+
+def where_info(db, jid):
+    """Where a running job is: its process tree, each bash script's position (fd 255 offset), the exact
+    --trace-lines record per bash process, and a py-spy dump of python processes when py-spy is installed."""
+    j = db.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone()
+    if not j:
+        raise Fail("no job %s on this host" % jid)
+    out: dict = dict(id=jid, state=j["state"], trace_lines=bool(j["trace_lines"]), procs=[], pyspy={})
+    if j["state"] != "running" or not j["pid"]:
+        return out
+    linux = os.path.isdir("/proc/self")
+    cols = ["pid", "ppid", "pgid"] + (["sid"] if linux else []) + ["stat", "etime", "command"]
+    try:
+        ps = subprocess.run(["ps", "-axo", ",".join(c + "=" for c in cols)], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError) as e:
+        raise Fail("ps failed: %s" % e)
+    procs: dict[int, dict] = {}
+    for line in ps.splitlines():
+        f = line.split(None, len(cols) - 1)
+        if len(f) == len(cols):
+            r = dict(zip(cols, f))
+            procs[int(r["pid"])] = dict(r, pid=int(r["pid"]), ppid=int(r["ppid"]))
+    root = j["pid"]
+    kids: dict[int, list[int]] = {}
+    for p in procs.values():
+        kids.setdefault(p["ppid"], []).append(p["pid"])
+    mine, todo = set(), [root]
+    while todo:  # descendants, plus anything still in the job's session/process group (reparented)
+        pid = todo.pop()
+        if pid in procs and pid not in mine:
+            mine.add(pid)
+            todo += kids.get(pid, [])
+    mine |= {p["pid"] for p in procs.values() if str(root) in (p["pgid"], p.get("sid"))}
+    pos = script_pos(sorted(mine))
+    order = []
+
+    def walk(pid, depth):
+        order.append((pid, depth))
+        for k in sorted(kids.get(pid, [])):
+            if k in mine:
+                walk(k, depth + 1)
+    for pid in sorted(p for p in mine if procs[p]["ppid"] not in mine):
+        walk(pid, 0)
+    for pid, depth in order:
+        p = procs[pid]
+        rec = dict(pid=pid, depth=depth, stat=p["stat"], etime=p["etime"], cmd=p["command"][:300])
+        if pid in pos:
+            rec["script"] = pos[pid][0]
+            rec["line"], rec["text"] = script_line(*pos[pid])
+        with contextlib.suppress(OSError):
+            tp = P("run", jid + ".where", str(pid))
+            with open(tp, errors="replace") as f:
+                loc, _, rest = f.read().partition("\t")
+            funcs, _, cmd = rest.partition("\t")
+            fs = funcs.split()
+            rec["trace"] = dict(at=loc.strip(), funcs=fs[:-1] if fs[-1:] == ["main"] else fs,  # main = the script body
+                                cmd=" ".join(cmd.split()), age=time.time() - os.path.getmtime(tp))
+        out["procs"].append(rec)
+    spy = shutil.which("py-spy")
+    pys = [r["pid"] for r in out["procs"] if re.search(r"(?i)python[\d.]*$", os.path.basename(r["cmd"].split()[0]))]
+    for pid in pys[:4]:
+        if not spy:
+            break
+        try:
+            r = subprocess.run([spy, "dump", "--pid", str(pid)], capture_output=True, text=True, timeout=20)
+            out["pyspy"][pid] = r.stdout.strip() if r.returncode == 0 else "py-spy: " + ((r.stderr.strip().splitlines() or ["exit %d" % r.returncode])[-1])
+        except (OSError, subprocess.SubprocessError) as e:
+            out["pyspy"][pid] = "py-spy: %s" % e
+    if spy and len(pys) > 4:
+        out["pyspy_skipped"] = len(pys) - 4
+    out["pyspy_missing"] = bool(pys) and not spy
+    return out
+
+
+def git_run(*args, cwd=None, env=None):
+    r = subprocess.run(["git", *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=600)
+    if r.returncode:
+        raise Fail("git %s: %s" % (args[0], (r.stderr.strip().splitlines() or ["exit %d" % r.returncode])[-1]))
+    return r.stdout.strip()
+
+
+def ensure_bare(repo):
+    """Create a bare repository at repo unless it exists; safe against a concurrent creator."""
+    if not os.path.isdir(repo):
+        os.makedirs(os.path.dirname(repo), exist_ok=True)
+        tmp = "%s.tmp%d" % (repo, os.getpid())
+        git_run("init", "-q", "--bare", tmp)
+        with contextlib.suppress(OSError):  # someone else may have won
+            os.rename(tmp, repo)
+        shutil.rmtree(tmp, ignore_errors=True)
+    return repo
+
+
+def clean_work(jid):
+    """Delete a job's work dir (checkout, pushed files, outputs) and its worktree record in the mirror.
+    The snapshot commit stays in the mirror, so the code can always be checked out again."""
+    work = P("work", jid)
+    with contextlib.suppress(OSError):
+        with open(os.path.join(work, ".git")) as f:  # "gitdir: <mirror>/worktrees/<name>"
+            mirror = os.path.dirname(os.path.dirname(f.read().split(":", 1)[1].strip()))
+        with contextlib.suppress(Fail):
+            git_run("--git-dir", mirror, "worktree", "remove", "--force", work)
+            git_run("--git-dir", mirror, "worktree", "prune")
+    existed = os.path.exists(work)
+    shutil.rmtree(work, ignore_errors=True)
+    with contextlib.suppress(OSError):
+        os.remove(work + ".checked-out")
+    return "cleaned" if existed else "absent"
+
+
+def stage_host(req):
+    """Prepare a job's work dir (~/.tinyshed/work/ID). With key and no sha: make sure the bare mirror
+    repos/KEY.git exists, so the server can push into it. With sha: check the snapshot out there as a
+    detached worktree (idempotent). Then create the parent dirs that --push targets need."""
+    jid, key, sha = req["id"], req.get("key"), req.get("sha")
+    work = P("work", jid)
+    out = dict(work=work)
+    if key:
+        repo = out["repo"] = ensure_bare(P("repos", key + ".git"))
+        if sha:
+            ok = work + ".checked-out"  # written last: a checkout interrupted halfway is redone, never trusted
+            if os.path.exists(ok):
+                if git_run("rev-parse", "HEAD", cwd=work) != sha:
+                    raise Fail("work dir %s already holds another checkout" % work)
+            else:
+                if os.path.exists(work):  # leftovers of an interrupted staging; the job has not started yet
+                    with contextlib.suppress(Fail):
+                        git_run("--git-dir", repo, "worktree", "remove", "--force", work)
+                    shutil.rmtree(work, ignore_errors=True)
+                    with contextlib.suppress(Fail):
+                        git_run("--git-dir", repo, "worktree", "prune")
+                git_run("--git-dir", repo, "worktree", "add", "-q", "--detach", "--force", work, sha)
+                open(ok, "w").close()
+    if not key or sha:
+        os.makedirs(work, exist_ok=True)
+        for d in req.get("dirs", []):
+            os.makedirs(os.path.normpath(os.path.join(work, d)), exist_ok=True)
+    return out
+
+
+def host_paths(db, jid, rels):
+    """Absolute paths on this host of a job's files (relative to its working directory): {rel: [abs, is dir, exists]}."""
+    j = db.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone()
+    if not j:
+        raise Fail("no job %s on this host" % jid)
+    base = job_cwd(j)
+    out = {}
+    for rel in rels:
+        path = os.path.normpath(os.path.join(base, os.path.expanduser(rel)))
+        out[rel] = [path, os.path.isdir(path), os.path.exists(path)]
+    return out
+
+
+def grep_logs(req):
+    """Search the logs of the given jobs on this host (plain or zstd). {id: [[line number, text], ...]}, capped."""
+    rx = re.compile(req["pattern"], re.I if req.get("ignore_case") else 0)
+    per, total, out = int(req.get("per_job", 20)), int(req.get("max", 500)), {}
+    for jid in req.get("ids", []):
+        if total <= 0:
+            break
+        path = P("logs", jid + ".log")
+        try:
+            f = open(path, "rb") if os.path.exists(path) else zopen(path + ".zst")
+        except OSError:
+            continue
+        hits, n = [], 0
+        with contextlib.suppress(OSError, EOFError):
+            with f:
+                for n, raw in enumerate(f, 1):
+                    line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                    if rx.search(line):
+                        hits.append([n, line[:400]])
+                        if len(hits) >= min(per, total):
+                            break
+        if hits:
+            out[jid] = hits
+            total -= len(hits)
+    return out
+
+
 def rpc(req):
     """Everything the server can ask of a host, in one idempotent request."""
     db, cfg = hdb(), load_cfg()
@@ -833,6 +1213,12 @@ def rpc(req):
         if ev:
             compress_log(jid)
             fire(ev)
+    # pause on a paused job waiting for cores cancels its pending resume
+    for op, flag, states in (("pause", 1, ("running", "paused")), ("resume", 0, ("paused", "running"))):
+        if op in req:  # a flag the watchdog (pause) or the scheduler (resume) acts on within ~2s
+            for jid in req[op]:
+                db.execute("UPDATE jobs SET pause=? WHERE id=? AND state IN (%s)" % ",".join("?" * len(states)), (flag, jid) + states)
+            out[op + "d"] = {jid: state_of(db, jid) for jid in req[op]}
     for jid, prio in (req.get("prio") or {}).items():
         transition(db, jid, "update", prio=int(prio))
     if "force" in req:  # start now, ignoring priority order and free cores; answer each job's state
@@ -855,6 +1241,19 @@ def rpc(req):
         out["events"] = events_after(db, req["after"])
     if req.get("status"):
         out["status"] = status(db, cfg)
+    if req.get("where"):
+        out["where"] = where_info(db, req["where"])
+    if req.get("grep"):
+        out["grep"] = grep_logs(req["grep"])
+    if req.get("stage"):
+        out["stage"] = stage_host(req["stage"])
+    if req.get("paths"):
+        out["paths"] = host_paths(db, req["paths"]["id"], req["paths"]["rels"])
+    if "clean" in req:  # only jobs that are over here (finished, or moved to another host) lose their work dir
+        out["cleaned"] = {}
+        for jid in req["clean"]:
+            state = state_of(db, jid)
+            out["cleaned"][jid] = clean_work(jid) if state in TERMINAL + ("moved",) or state is None else state
     if req.get("logs"):
         out["logs"] = log_tail(req["logs"]["id"], int(req["logs"].get("bytes", 20000)))
     if req.get("config_get"):
@@ -972,6 +1371,7 @@ def setup(a):
         time.sleep(0.1)
     print(json.dumps(dict(status(db, cfg), python=sys.version.split()[0], zstd=("stdlib" if z.__name__.startswith("compression") else z.__name__) if z else "binary",
                           taskset=bool(shutil.which("taskset")), mosh=bool(shutil.which("mosh-server")), boot=boot,
+                          git=bool(shutil.which("git")), rsync=bool(shutil.which("rsync")),
                           phone_home=bool(cfg.get("home")), cores_cfg=cfg.get("cores"))))
 
 
@@ -998,7 +1398,7 @@ SERVER_SCHEMA = """
 CREATE TABLE IF NOT EXISTS hosts(name TEXT PRIMARY KEY, dest TEXT, epoch TEXT, cursor INT DEFAULT 0,
   seen REAL DEFAULT 0, err TEXT, status TEXT);
 CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, host TEXT, prio INT, state TEXT, created REAL,
-  sent INT DEFAULT 0, cancel INT DEFAULT 0, eid INT DEFAULT 0, j TEXT);
+  sent INT DEFAULT 0, cancel INT DEFAULT 0, eid INT DEFAULT 0, j TEXT, stage TEXT);
 CREATE TABLE IF NOT EXISTS events(host TEXT, eid INT, ts REAL, job TEXT, kind TEXT, data TEXT, PRIMARY KEY(host, eid));
 """
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=15",
@@ -1007,7 +1407,14 @@ REMOTE_PY = "python3 .tinyshed/tinyshed.py "
 
 
 def sdb():
-    return connect("server.db", SERVER_SCHEMA)
+    db = connect("server.db", SERVER_SCHEMA)
+    if "stage" not in {r[1] for r in db.execute("PRAGMA table_info(jobs)")}:  # v0.2 servers predate file staging
+        try:
+            db.execute("ALTER TABLE jobs ADD COLUMN stage TEXT")
+        except sqlite3.OperationalError as e:
+            if "duplicate" not in str(e):
+                raise
+    return db
 
 
 def is_local(dest):
@@ -1078,7 +1485,16 @@ def sync_host(name, extra=None):
 
 def _sync_host(db, name, extra):
     h = db.execute("SELECT * FROM hosts WHERE name=?", (name,)).fetchone()
-    submit = [unpack(r["j"]) for r in db.execute("SELECT j FROM jobs WHERE host=? AND sent=0 AND cancel=0 AND state='pending'", (name,))]
+    submit = []
+    for r in db.execute("SELECT id, j, stage FROM jobs WHERE host=? AND sent=0 AND cancel=0 AND state='pending'", (name,)).fetchall():
+        st = json.loads(r["stage"]) if r["stage"] else None
+        if needs_stage(st, name):  # files first: the job is delivered once its work dir is ready on this host
+            if STAGE_MODE == "bg":
+                stage_bg(r["id"], name, st)
+            elif STAGE_MODE == "sync" and stage_once(db, r["id"], name, st):
+                submit.append(unpack(r["j"]))
+        else:
+            submit.append(unpack(r["j"]))
     cancel = [r["id"] for r in db.execute("SELECT id FROM jobs WHERE host=? AND sent=1 AND cancel=1 AND state NOT IN (%s)"
                                           % ",".join("?" * len(TERMINAL)), (name,) + TERMINAL)]
     req = dict(status=True, after=h["cursor"], submit=submit, cancel=cancel, **(extra or {}))
@@ -1142,6 +1558,267 @@ def sync_all():
         par(sync_host, dispatch(db))
 
 
+# ── file staging (--git / --push before a job starts, --pull after it ends). The server does all copying:
+# git push into a bare mirror per repo on the host + a detached worktree per job, and rsync over the same ssh.
+
+STAGE_RUNTIME = ("staged", "err", "err_at", "pulled", "pull_err", "pull_at", "pulled_to", "stale", "cleaned", "clean_err")
+SNAPSHOT_MAX_MB = 100  # untracked files a --git snapshot may carry
+_staging, _stage_lock, _pulling = set(), threading.Lock(), threading.Lock()
+# who stages waiting jobs during sync: "bg" (serve, the dashboard: a thread, so sync never blocks on an upload),
+# "sync" (submit, wait, edit, fetch: inline, the command waits for it), None (ls and other quick reads: never,
+# so a short-lived process cannot die halfway through an upload)
+STAGE_MODE = None
+
+
+def needs_stage(st, host):
+    return bool(st and (st.get("git") or st.get("push")) and st.get("staged") != host)
+
+
+def set_stage(db, jid, **upd):
+    with tx(db):
+        r = db.execute("SELECT stage FROM jobs WHERE id=?", (jid,)).fetchone()
+        st = dict(json.loads(r["stage"]) if r and r["stage"] else {}, **upd)
+        db.execute("UPDATE jobs SET stage=? WHERE id=?", (json.dumps(st), jid))
+    return st
+
+
+def over_ssh(dest, argv_for, env=None, timeout=3600):
+    """Run a transfer command (rsync, git push) against a host: argv_for(prefix) gets '' for local hosts, else
+    'sshdest:' for each alternative in turn (the one that last worked first). Returns stdout or raises Fail."""
+    alts = [""] if is_local(dest) else sorted(dest.split(","), key=lambda d: d != _route.get(dest))
+    err = "no route"
+    for d in alts:
+        r = subprocess.run(argv_for(d + ":" if d else ""), capture_output=True, text=True, timeout=timeout, env=env)
+        if r.returncode == 0:
+            if d:
+                _route[dest] = d
+            return r.stdout
+        err = (r.stderr.strip().splitlines() or ["exit %d" % r.returncode])[-1]
+    raise Fail(err)
+
+
+def rsync_argv(src, dst):
+    return ["rsync", "-a", "-e", shlex.join(SSH), src, dst]
+
+
+def git_snapshot(path, jid):
+    """Commit the working tree as it is (tracked changes + untracked files that are not ignored) without touching
+    the index or the files: a throwaway index, write-tree, commit-tree. Kept alive by refs/tinyshed/ID."""
+    path = os.path.abspath(os.path.expanduser(path))
+    try:
+        top = git_run("rev-parse", "--show-toplevel", cwd=path)
+    except (Fail, OSError) as e:
+        raise Fail("--git: %s is not in a git repository (%s)" % (path, e))
+    head = subprocess.run(["git", "rev-parse", "-q", "--verify", "HEAD"], cwd=top, capture_output=True, text=True).stdout.strip() or None
+    sizes = []
+    for f in git_run("ls-files", "-z", "--others", "--exclude-standard", cwd=top).split("\0"):
+        with contextlib.suppress(OSError):
+            if f:
+                sizes.append((os.path.getsize(os.path.join(top, f)), f))
+    if sum(n for n, _ in sizes) > SNAPSHOT_MAX_MB << 20:
+        big = ", ".join("%s (%s)" % (f, fmt_mem(n >> 20, None)) for n, f in sorted(sizes, reverse=True)[:5])
+        raise Fail("--git: untracked files add up to more than %dM (%s); .gitignore them, or ship them with --push" % (SNAPSHOT_MAX_MB, big))
+    with tempfile.TemporaryDirectory() as tmp:
+        index = os.path.join(tmp, "index")
+        real = os.path.join(top, git_run("rev-parse", "--git-path", "index", cwd=top))
+        if os.path.exists(real):
+            shutil.copy(real, index)
+        env = dict(os.environ, GIT_INDEX_FILE=index, GIT_AUTHOR_NAME="tinyshed", GIT_AUTHOR_EMAIL="tinyshed@localhost",
+                   GIT_COMMITTER_NAME="tinyshed", GIT_COMMITTER_EMAIL="tinyshed@localhost")
+        git_run("add", "-A", cwd=top, env=env)
+        tree = git_run("write-tree", cwd=top, env=env)
+        if head and tree == git_run("rev-parse", "HEAD^{tree}", cwd=top):
+            sha = head
+        else:
+            sha = git_run("commit-tree", tree, *(["-p", head] if head else []), "-m", "tinyshed snapshot for job " + jid, cwd=top, env=env)
+    branch = subprocess.run(["git", "symbolic-ref", "-q", "--short", "HEAD"], cwd=top, capture_output=True, text=True).stdout.strip()
+    key = re.sub(r"[^\w.-]", "_", os.path.basename(top)) + "-" + uuid.uuid5(uuid.NAMESPACE_URL, top).hex[:8]
+    # kept in tinyshed's own store, not as a ref in your repo (no clutter in `git log --all`); the commit
+    # object left in your repo is unreferenced and goes with git's normal gc
+    store = ensure_bare(P("snapshots", key + ".git"))
+    git_run("push", "-q", "--no-verify", store, "%s:refs/tinyshed/%s" % (sha, jid), cwd=top)
+    return dict(repo=top, store=store, key=key, sha=sha, base=head, dirty=sha != head, branch=branch or None,
+                sub=os.path.relpath(path, top))
+
+
+def stage_job(dest, jid, st, cwd):
+    """Put a job's files on its host: the --git snapshot as a worktree, then each --push path under the job's
+    working directory. Every step is idempotent, so a failed or repeated staging is simply run again."""
+    base = cwd or "."
+    rpc_ = lambda **kw: json.loads(remote(dest, ["rpc"], json.dumps(dict(stage=dict(id=jid, **kw)))))["stage"]
+    g = st.get("git")
+    if g:
+        repo = rpc_(key=g["key"])["repo"]
+        src = g.get("store") or g["repo"]  # snapshots from before the store lived as refs in the repo itself
+        with contextlib.suppress(Fail, OSError):  # a rerun keeps the same snapshot under its own ref too
+            git_run("--git-dir" if g.get("store") else "-C", src, "update-ref", "refs/tinyshed/" + jid, g["sha"])
+        over_ssh(dest, lambda pre: ["git", "--git-dir" if g.get("store") else "-C", src, "push", "-q", "--no-verify", pre + repo,
+                                    "%s:refs/tinyshed/%s" % (g["sha"], jid)], env=dict(os.environ, GIT_SSH_COMMAND=shlex.join(SSH)))
+    pushes = [(src, os.path.normpath(os.path.join(base, d)), isdir) for src, d, isdir in st.get("push") or []]
+    work = rpc_(key=g and g["key"], sha=g and g["sha"], dirs=[t if isdir else os.path.dirname(t) or "." for _, t, isdir in pushes])["work"]
+    for src, target, isdir in pushes:
+        if not os.path.exists(src):
+            raise Fail("--push %s: no longer exists here" % src)
+        over_ssh(dest, lambda pre: rsync_argv(src + ("/" if isdir else ""), pre + os.path.join(work, target) + ("/" if isdir else "")))
+
+
+def stage_once(db, jid, host, st):
+    """Stage a waiting job on host and record the outcome. True when its files are in place."""
+    if st.get("err_at") and time.time() - st["err_at"] < 60:  # retry failed staging once a minute
+        return False
+    r = db.execute("SELECT j FROM jobs WHERE id=?", (jid,)).fetchone()
+    dest = db.execute("SELECT dest FROM hosts WHERE name=?", (host,)).fetchone()["dest"]
+    try:
+        stage_job(dest, jid, st, unpack(r["j"]).get("cwd"))
+    except Exception as e:
+        set_stage(db, jid, err="%s: %s" % (host, e), err_at=time.time())
+        return False
+    old = st.get("staged")
+    set_stage(db, jid, staged=host, err=None, err_at=None,
+              stale=sorted(set(st.get("stale") or []) | ({old} if old and old != host else set())))
+    return True
+
+
+def stage_bg(jid, host, st):
+    """Stage a waiting job in the background (sync must not block on a big upload), then deliver it."""
+    if st.get("err_at") and time.time() - st["err_at"] < 60:  # retry failed staging once a minute
+        return
+    with _stage_lock:
+        if jid in _staging:
+            return
+        _staging.add(jid)
+
+    def go():
+        try:
+            with contextlib.closing(sdb()) as db:
+                if not stage_once(db, jid, host, st):
+                    return
+            sync_host(host)
+        finally:
+            with _stage_lock:
+                _staging.discard(jid)
+    threading.Thread(target=go, daemon=True).start()
+
+
+def self_ignore(path):
+    """A results folder tinyshed creates inside a git work tree ignores itself, so results never ride along in
+    the next --git snapshot (or in a commit)."""
+    parent = os.path.dirname(path)
+    inside = subprocess.run(["git", "-C", parent, "rev-parse", "--is-inside-work-tree"], capture_output=True, text=True)
+    if inside.returncode == 0 and subprocess.run(["git", "-C", parent, "check-ignore", "-q", path]).returncode != 0:
+        with open(os.path.join(path, ".gitignore"), "w") as f:
+            f.write("# results pulled by tinyshed: kept out of git and out of --git snapshots\n*\n")
+
+
+def pull_job(db, jid, to=None, srcs=None):
+    """Copy a job's results from its host into local folders: the job's --pull list, or srcs into `to`.
+    A directory's contents land in the folder, a file lands inside it. Each folder gets tinyshed-ID.json."""
+    r = db.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone()
+    st, b = json.loads(r["stage"]) if r["stage"] else {}, unpack(r["j"])
+    pulls = [[x, to or d] for x, d in st.get("pull") or []] if not srcs else [[x, to or os.path.abspath("results/{name}/{id}")] for x in srcs]
+    if not pulls:
+        raise Fail("%s has nothing to pull: name the paths, or submit with --pull" % jid)
+    if not r["sent"]:
+        raise Fail("%s has not reached a host yet" % jid)
+    if st.get("cleaned"):
+        raise Fail("%s: its work dir was cleaned after the job ended%s" % (jid, " (results pulled to %s)" % ", ".join(st["pulled_to"]) if st.get("pulled_to") else ""))
+    h = db.execute("SELECT dest FROM hosts WHERE name=?", (r["host"],)).fetchone()
+    if not h:
+        raise Fail("host %s is no longer registered" % r["host"])
+    paths = json.loads(remote(h["dest"], ["rpc"], json.dumps(dict(paths=dict(id=jid, rels=[x for x, _ in pulls])))))["paths"]
+    done, errs, dirs = [], [], []
+    for src, d in pulls:
+        path, isdir, exists = paths[src]
+        dst = os.path.abspath(os.path.expanduser(d.format(name=b.get("name") or jid, id=jid, host=r["host"], state=r["state"])))
+        if not exists:
+            errs.append("%s: not found on %s" % (src, r["host"]))
+            continue
+        fresh = not os.path.exists(dst)
+        os.makedirs(dst, exist_ok=True)
+        if fresh:
+            self_ignore(dst)
+        try:
+            over_ssh(h["dest"], lambda pre: rsync_argv(pre + path + ("/" if isdir else ""), dst + "/"))
+        except Fail as e:
+            errs.append("%s: %s" % (src, e))
+            continue
+        with open(os.path.join(dst, "tinyshed-%s.json" % jid), "w") as f:
+            json.dump(dict(id=jid, name=b.get("name"), host=r["host"], state=r["state"], rc=b.get("rc"), cmd=b.get("cmd"),
+                           started=b.get("started"), ended=b.get("ended"), git=st.get("git"), source="%s:%s" % (r["host"], path),
+                           pulled=time.time()), f, indent=2)
+        done.append("%s → %s" % (src, dst))
+        dirs.append(dst)
+    if not srcs and not to:
+        set_stage(db, jid, pulled=None if errs else time.time(), pull_err="; ".join(errs) or None, pull_at=time.time(), pulled_to=dirs)
+    return done, errs
+
+
+def pulls_due(db):
+    """Finished jobs whose --pull has not happened yet (failed pulls are retried once a minute)."""
+    out = []
+    for r in db.execute("SELECT id, state, stage FROM jobs WHERE stage IS NOT NULL AND state IN (%s)" % ",".join("?" * len(TERMINAL)), TERMINAL):
+        st = json.loads(r["stage"])
+        if st.get("pull") and r["state"] in st.get("pull_on", ()) and not st.get("pulled") \
+                and (not st.get("pull_err") or time.time() - (st.get("pull_at") or 0) > 60):
+            out.append(r["id"])
+    return out
+
+
+def clean_due(db, ids=None):
+    """Ended jobs whose work dir can go: staged files (--git/--push), not --keep-work, not cleaned yet, and
+    the --pull for their end state done (or none wanted). Failed cleans are retried once a minute."""
+    out = []
+    for r in db.execute("SELECT id, state, stage FROM jobs WHERE stage IS NOT NULL AND state IN (%s)" % ",".join("?" * len(TERMINAL)), TERMINAL):
+        st = json.loads(r["stage"])
+        if (ids is None or r["id"] in ids) and (st.get("git") or st.get("push")) and (st.get("staged") or st.get("stale")) \
+                and not st.get("keep") and not st.get("cleaned") and (st.get("pulled") or not (st.get("pull") and r["state"] in st.get("pull_on", ()))) \
+                and (not st.get("clean_err") or time.time() - (st.get("clean_at") or 0) > 60):
+            out.append(r["id"])
+    return out
+
+
+def clean_job(db, jid):
+    """Delete a job's work dir on every host that holds a copy (the one it ran on, and any it was moved off)."""
+    r = db.execute("SELECT stage FROM jobs WHERE id=?", (jid,)).fetchone()
+    st = json.loads(r["stage"])
+    hosts = sorted({st.get("staged")} | set(st.get("stale") or []) - {None})
+    errs = []
+    for host in hosts:
+        h = db.execute("SELECT dest FROM hosts WHERE name=?", (host,)).fetchone()
+        if not h:
+            continue  # host gone: nothing left to clean
+        try:
+            got = json.loads(remote(h["dest"], ["rpc"], json.dumps(dict(clean=[jid]))))
+            if "cleaned" not in got:
+                raise Fail("host runs an older tinyshed")
+            if got["cleaned"].get(jid) not in ("cleaned", "absent"):
+                raise Fail("still %s there" % got["cleaned"].get(jid))
+        except Exception as e:
+            errs.append("%s: %s" % (host, e))
+    set_stage(db, jid, cleaned=None if errs else time.time(), clean_err="; ".join(errs) or None, clean_at=time.time())
+    return errs
+
+
+def pull_due_bg():
+    """Run due pulls in a background thread (serve, the dashboard); one batch at a time."""
+    if not _pulling.acquire(blocking=False):
+        return
+
+    def go():
+        try:
+            with contextlib.closing(sdb()) as db:
+                for jid in pulls_due(db):
+                    try:
+                        pull_job(db, jid)
+                    except Exception as e:
+                        set_stage(db, jid, pull_err=str(e), pull_at=time.time())
+                for jid in clean_due(db):  # after the pulls: a work dir goes only once its results are safe
+                    clean_job(db, jid)
+        finally:
+            _pulling.release()
+    threading.Thread(target=go, daemon=True).start()
+
+
 # ───────────────────────────────────────────────────────────────── server: operations
 
 NAME_MAX = 16
@@ -1162,34 +1839,101 @@ def submit_parser(**kw):
     p.add_argument("-p", "--prio", type=int, default=0, help="higher runs first")
     p.add_argument("-c", "--cpus", type=int, default=1, help="cores to pin with taskset")
     p.add_argument("-m", "--mem", type=size, default=0, help="RSS limit for the whole process tree, e.g. 8G")
-    p.add_argument("-t", "--timeout", type=dur, default=0, help="runtime limit per attempt, e.g. 90s 30m 12h 2d")
+    p.add_argument("-t", "--timeout", type=dur, default=0, help="runtime limit per attempt, e.g. 90s 30m 12h 2d (default: twice --expect)")
+    p.add_argument("-x", "--expect", type=dur, default=0, help="expected runtime: sets the timeout to twice this, gives an ETA "
+                   "and, without --stall, a stall limit of twice the expected time per reported step")
+    p.add_argument("--stall", type=dur, help="kill the job (state stalled) after this long without a checkpoint "
+                   "(tshed progress / $TINYSHED_PROGRESS), counted from its start; 0 = never")
+    p.add_argument("--stall-on-log", action="store_true", help="log output also counts as a checkpoint (needs --stall)")
+    p.add_argument("--trace-lines", action="store_true", help="record each bash process's current line and command, for "
+                   "`tshed where` (bash >= 4; costs ~0.1 ms per bash command)")
     p.add_argument("-r", "--retries", type=int, default=0)
-    p.add_argument("--retry-on", default=SPEC["retry_on"], help="comma list of error,timeout,oom,lost (default %(default)s)")
+    p.add_argument("--retry-on", default=SPEC["retry_on"], help="comma list of error,timeout,oom,stalled,lost (default %(default)s)")
     p.add_argument("--retry-delay", type=dur, default=SPEC["retry_delay"], help="first backoff, doubles per attempt")
-    p.add_argument("-C", "--cwd", help="working directory on the host (default ~)")
+    p.add_argument("-C", "--cwd", help="working directory on the host (default ~; with --git/--push: relative to the job's work dir)")
+    p.add_argument("--git", nargs="?", const=".", metavar="PATH", help="run in a snapshot of the git repo at PATH (default .): "
+                   "committed, uncommitted and untracked-but-not-ignored files, checked out per job on the host; cwd = your subdirectory")
+    p.add_argument("--push", action="append", default=[], metavar="SRC[:DEST]", help="copy a local file or folder into the job's "
+                   "working directory before it starts (DEST default: its name; repeatable)")
+    p.add_argument("--pull", action="append", default=[], metavar="SRC[:DEST]", help="when the job ends, copy SRC (relative to its "
+                   "working directory) into the local folder DEST (default results/{name}/{id}; {name} {id} {host} {state}; repeatable)")
+    p.add_argument("--pull-on", default="done,error,timeout,oom,stalled,lost", help="end states that trigger --pull (default %(default)s)")
+    p.add_argument("--keep-work", action="store_true", help="keep the job's work dir on the host after it ends (default: deleted "
+                   "once its results are pulled; the code stays recoverable with tshed checkout)")
     p.add_argument("-e", "--env", action="append", default=[], metavar="K=V")
     p.add_argument("cmd", nargs=argparse.REMAINDER, help="command (run with bash -c)")
     return p
 
 
-def add_job(db, spec, host=None):
+def add_job(db, spec, host=None, jid=None, staged=None):
+    """Queue a job on the server. spec["stage"] (--git/--push/--pull) travels in its own column: the host never
+    sees it, and a rerun copies it without the previous run's staging/pull state."""
     if host and not db.execute("SELECT 1 FROM hosts WHERE name=?", (host,)).fetchone():
         raise Fail("unknown host %r (see: tshed hosts)" % host)
     j = {k: spec.get(k, d) for k, d in SPEC.items()}
-    j.update(id=uuid.uuid4().hex[:8], created=time.time())
-    db.execute("INSERT INTO jobs(id,host,prio,state,created,j) VALUES(?,?,?,'pending',?,?)", (j["id"], host, j["prio"], j["created"], pack(j)))
+    j.update(id=jid or uuid.uuid4().hex[:8], created=time.time())
+    st = {k: v for k, v in (spec.get("stage") or {}).items() if k not in STAGE_RUNTIME}
+    if st and staged:
+        st["staged"] = staged
+    db.execute("INSERT INTO jobs(id,host,prio,state,created,j,stage) VALUES(?,?,?,'pending',?,?,?)",
+               (j["id"], host, j["prio"], j["created"], pack(j), json.dumps(st) if st else None))
     return j["id"]
 
 
-def submit(db, argv):
+def stage_spec(a, jid):
+    """--git/--push/--pull -> the job's stage record and its working directory (relative to the work dir)."""
+    st, cwd = {}, a.cwd
+    if (a.git or a.push) and cwd and os.path.isabs(os.path.expanduser(cwd)):
+        raise Fail("-C must be relative with --git/--push (the job runs inside its own work dir)")
+    if a.git:
+        st["git"] = g = git_snapshot(a.git, jid)
+        cwd = cwd or (g["sub"] if g["sub"] != "." else None)
+    for item in a.push:
+        src, _, d = item.partition(":")
+        src = os.path.abspath(os.path.expanduser(src))
+        if not os.path.exists(src):
+            raise Fail("--push %s: no such file or folder" % src)
+        d = os.path.normpath(d or os.path.basename(src.rstrip("/")))
+        if os.path.isabs(d) or d.startswith(".."):
+            raise Fail("--push %s: DEST must stay inside the job's working directory" % item)
+        st.setdefault("push", []).append([src, d, os.path.isdir(src)])
+    for item in a.pull:
+        src, _, d = item.partition(":")
+        st.setdefault("pull", []).append([src, os.path.abspath(os.path.expanduser(d or "results/{name}/{id}"))])
+    if a.pull:
+        st["pull_on"] = [x.strip() for x in a.pull_on.split(",") if x.strip()]
+    if a.keep_work and st:
+        st["keep"] = True
+    return st, cwd
+
+
+def submit(db, argv, stage_now=False):
+    """Queue a job. stage_now (the cli, with -H): copy its files before it is queued, so a failure is reported
+    here and nothing is left behind; otherwise the server stages it before delivery."""
     a = submit_parser(prog="submit").parse_args(argv) if isinstance(argv, list) else argv
     cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
     if not cmd:
         raise Fail("no command given")
-    spec = dict(name=a.name, cmd=cmd[0] if len(cmd) == 1 else shlex.join(cmd), cwd=a.cwd, env=dict(e.split("=", 1) for e in a.env),
-                prio=a.prio, cpus=a.cpus, mem_mb=a.mem, timeout=a.timeout, retries=a.retries, retry_on=a.retry_on,
-                retry_delay=a.retry_delay)
-    return add_job(db, spec, a.host)
+    if a.stall_on_log and not a.stall:
+        raise Fail("--stall-on-log needs --stall DURATION")
+    jid = uuid.uuid4().hex[:8]
+    st, cwd = stage_spec(a, jid)
+    spec = dict(name=a.name, cmd=cmd[0] if len(cmd) == 1 else shlex.join(cmd), cwd=cwd, env=dict(e.split("=", 1) for e in a.env),
+                prio=a.prio, cpus=a.cpus, mem_mb=a.mem, timeout=a.timeout or 2 * a.expect, retries=a.retries, retry_on=a.retry_on,
+                retry_delay=a.retry_delay, expect=a.expect, stall=a.stall, stall_on_log=int(a.stall_on_log),
+                trace_lines=int(a.trace_lines), work=int(bool(st.get("git") or st.get("push"))), stage=st)
+    staged = None
+    if stage_now and a.host and needs_stage(st, a.host):
+        h = db.execute("SELECT dest FROM hosts WHERE name=?", (a.host,)).fetchone()
+        if not h:
+            raise Fail("unknown host %r (see: tshed hosts)" % a.host)
+        print("staging files on %s…" % a.host, file=sys.stderr, flush=True)
+        try:
+            stage_job(h["dest"], jid, st, cwd)
+        except Exception as e:
+            raise Fail("staging on %s failed, job not queued: %s" % (a.host, e))
+        staged = a.host
+    return add_job(db, spec, a.host, jid, staged)
 
 
 def cancel(db, jid):
@@ -1274,6 +2018,47 @@ def edit_job(db, jid, prio=None, host=False, force=False):
     return done
 
 
+def pause_jobs(db, ids, resume=False):
+    """Pause (SIGSTOP, cores released) or resume running jobs, one rpc per host. Returns {id: state or error}."""
+    op, out, by_host = "resume" if resume else "pause", {}, {}
+    for jid in ids:
+        r = db.execute("SELECT host, state, sent FROM jobs WHERE id=?", (jid,)).fetchone()
+        if r["state"] not in ("running", "paused") or not r["sent"]:
+            out[jid] = "%s: only running or paused jobs can be %sd" % (r["state"], op)
+        else:
+            by_host.setdefault(r["host"], []).append(jid)
+
+    def one(host):
+        try:
+            got = host_answer(sync_host(host, {op: by_host[host]}), op + "d", host)
+            out.update({jid: got.get(jid) or "unknown on %s" % host for jid in by_host[host]})
+        except Fail as e:
+            out.update({jid: str(e) for jid in by_host[host]})
+    par(one, list(by_host))
+    return out
+
+
+def job_stats(db, names=None, since=0):
+    """Per job name, from the server's mirror: runs, outcomes, and the runtime spread of successful runs."""
+    groups = {}
+    for r in db.execute("SELECT id, state, created, j FROM jobs WHERE created>=?", (since,)):
+        b = _blob(r)
+        if not names or b.get("name") in names:
+            groups.setdefault(b.get("name") or "-", []).append(dict(b, state=r["state"], created=r["created"]))
+    out: list[dict] = []
+    for name, js in groups.items():
+        times = sorted(j["ended"] - j["started"] - (j.get("paused_s") or 0) for j in js if j["state"] == "done" and j.get("ended") and j.get("started"))
+        pick = lambda q: times[min(len(times) - 1, int(q * len(times)))] if times else None
+        fails = sum(j["state"] in FAILURES for j in js)
+        out.append(dict(name=name, runs=len(js), done=len(times), failed=fails, cancelled=sum(j["state"] == "cancelled" for j in js),
+                        active=sum(j["state"] not in TERMINAL for j in js), fail_pct=round(100 * fails / max(1, fails + len(times))),
+                        median=pick(0.5), p90=pick(0.9), max=times[-1] if times else None,
+                        expect=next((j.get("expect") for j in sorted(js, key=lambda j: -j["created"]) if j.get("expect")), None),
+                        peak_mb=max((j.get("peak_mb") or 0 for j in js), default=0) or None, last=max(j["created"] for j in js),
+                        states=sorted({j["state"] for j in js if j["state"] in FAILURES})))
+    return sorted(out, key=lambda g: -g["last"])
+
+
 def resolve(db, prefix):
     """A job id, from a unique id prefix or else a job name (the unfinished job of that name wins)."""
     rows = db.execute("SELECT id FROM jobs WHERE id LIKE ?", (prefix + "%",)).fetchall()
@@ -1353,6 +2138,10 @@ def install_notes(r):
         notes.append("agent starts at login, not boot (loginctl enable-linger was refused)")
     if not r["mosh"]:
         notes.append("no mosh-server: attach/shell use ssh")
+    if not r.get("git", True):
+        notes.append("no git: --git unavailable")
+    if not r.get("rsync", True):
+        notes.append("no rsync: --push/--pull unavailable")
     return "; ".join(notes)
 
 
@@ -1720,7 +2509,7 @@ def apply_theme(name=None, paint_bg=False):
                 pal["HILITE"] = "\x1b[%s;1m" % sgr_color(hexc, bg=True)
     globals().update(pal)
     STATE_STYLE = dict(running=(GREEN, "▶"), queued=(YELLOW, "◌"), pending=(CYAN, "◌"), done=(GREEN, "✓"),
-                       cancelled=(MAGENTA, "■"), moved=(CYAN, "→"))  # every failure: (BOLD_RED, "●")
+                       cancelled=(MAGENTA, "■"), moved=(CYAN, "→"), paused=(YELLOW, "‖"))  # every failure: (BOLD_RED, "●")
 
 
 def theme_cmd(name, contrast=None):
@@ -1887,7 +2676,7 @@ HEAD_BAR = SEL_FLAT = False
 STATE_STYLE: dict = {}
 apply_theme("default")
 HOST_HEAD = "%-12s  %-7s %5s %5s  %7s  %10s  %9s  %-8s %4s %4s  %6s  %6s  %s" % ("Host", "State", "Load", "CPU%", "Cores", "Mem free", "Used/Res", "GPU", "Run", "Que", "Seen", "Freq", "Notes")
-JOB_HEAD = "%-11s %3s %4s  %-12s  %-8s  %8s  %5s  %4s  %11s  %-16s  %s" % ("State", "CPU", "Prio", "Host", "ID", "Time", "Try", "CPU%", "Mem", "Name", "Command")
+JOB_HEAD = "%-11s %3s %4s  %-12s  %-8s  %9s  %9s  %5s  %4s  %11s  %-16s  %s" % ("State", "CPU", "Prio", "Host", "ID", "Time", "Progress", "Try", "CPU%", "Mem", "Name", "Command")
 
 
 def styled(segments, width, base=""):
@@ -1918,8 +2707,8 @@ def out(segments):
     print(styled(segments, 10 ** 6) if colors() else "".join(t for _, t in segments).rstrip())
 
 
-def fmt_dur(s):
-    s = int(max(0, s or 0)) // 5 * 5  # quantize to 5s so displays advance every 5s
+def fmt_dur(s, q=5):
+    s = int(max(0, s or 0)) // q * q  # quantize to 5s so displays advance every 5s; limits pass q=1
     if s < 60:
         return "%ds" % s
     if s < 3600:
@@ -1927,6 +2716,27 @@ def fmt_dur(s):
     if s < 86400:
         return "%dh %02dm" % (s // 3600, s % 3600 // 60)
     return "%dd %02dh" % (s // 86400, s % 86400 // 3600)
+
+
+def fmt_short(s):
+    """A compact duration for narrow columns: 45s 14m 3h05 2d04."""
+    s = int(max(0, s))
+    return "%ds" % s if s < 60 else "%dm" % (s // 60) if s < 3600 else "%dh%02d" % (s // 3600, s % 3600 // 60) if s < 86400 \
+        else "%dd%02d" % (s // 86400, s % 86400 // 3600)
+
+
+def job_progress(j):
+    """(fraction done, seconds left) from the job's last checkpoint; either may be None.
+    The ETA extrapolates the rate up to that checkpoint (host clock throughout)."""
+    done, total, _ = parse_progress(j.get("progress"))
+    if done is None:
+        return None, None
+    f, left = min(1.0, done / total), None
+    started, beat = j.get("started"), j.get("beat")
+    active = (beat or 0) - (started or 0) - (j.get("paused_s") or 0)  # running time up to the checkpoint (pauses before it, roughly)
+    if j["state"] == "running" and 0 < f and started and beat and active > 0:
+        left = max(0.0, active * (1 - f) / f - (j["now"] - beat))
+    return f, left
 
 
 def clean(s):
@@ -1953,20 +2763,27 @@ def load_jobs(db, hosts):
     out = []
     for r in db.execute("SELECT * FROM jobs"):
         j = dict(_blob(r))
-        j.update(id=r["id"], host=r["host"], state=r["state"], prio=r["prio"], sent=r["sent"], cancel=r["cancel"])
-        if j["state"] == "running":
-            j["t"] = time.time() + skew.get(r["host"], 0) - (j.get("started") or 0)
+        j.update(id=r["id"], host=r["host"], state=r["state"], prio=r["prio"], sent=r["sent"], cancel=r["cancel"],
+                 stage=json.loads(r["stage"]) if r["stage"] else None)
+        # durations: a run counts from this attempt's start, minus time spent paused; a waiting job shows how
+        # long it has been waiting (since submit, or since its previous attempt ended), rendered in brackets
+        j["now"] = now = time.time() + skew.get(r["host"], 0)  # the host's clock, like started/ended/beat
+        started, paused_s = j.get("started"), j.get("paused_s") or 0
+        if j["state"] in ("running", "paused"):
+            j["t"] = (j.get("paused_at") or now if j["state"] == "paused" else now) - (started or now) - paused_s
             j["cpu_pct"], j["rss_mb"] = live.get(r["host"], {}).get(r["id"]) or (None, None)
-        elif j["state"] in TERMINAL:
-            j["t"] = (j.get("ended") or 0) - (j.get("started") or j.get("ended") or 0)
+        elif j["state"] in TERMINAL and started:
+            j["t"] = (j.get("ended") or started) - started - paused_s
+        elif j["state"] in TERMINAL:  # ended before it ever ran (cancelled while waiting)
+            j["t"], j["waiting"] = (j.get("ended") or j["created"]) - j["created"], True
         else:
-            j["t"] = time.time() - j["created"]
+            j["t"], j["waiting"] = (now - j["ended"] if j.get("attempt") and j.get("ended") else time.time() - j["created"]), True
         out.append(j)
 
     def rank(j):  # running, then waiting by priority, then finished most-recent-first
         if j["state"] in TERMINAL:
             return (2, -(j.get("ended") or j["created"]), 0)
-        return (0 if j["state"] == "running" else 1, -j["prio"], j["created"])
+        return (0 if j["state"] in ("running", "paused") else 1, -j["prio"], j["created"])
     return sorted(out, key=rank)
 
 
@@ -2017,11 +2834,11 @@ def fmt_mem(used, limit):
 def job_segs(j):
     """Running jobs show live CPU% (of their assigned cores) and RSS; finished ones their peak RSS."""
     pct = j.get("cpu_pct")
-    used = j.get("rss_mb") if j["state"] == "running" else j.get("peak_mb") or None if j["state"] in TERMINAL else None
+    used = j.get("rss_mb") if j["state"] in ("running", "paused") else j.get("peak_mb") or None if j["state"] in TERMINAL else None
     over = used is not None and j.get("mem_mb") and used > 0.9 * j["mem_mb"]
     segs = [state_seg(j), (NUM, " %3d" % (j.get("cpus") or 1)),
             (NUM, " %4d" % j["prio"]), ("", "  "), (HOST, "%-12s" % (j["host"] or "(any)")[:12]),
-            ("", "  %-8s  %8s  " % (j["id"], fmt_dur(j["t"]))), (DIM, "%5s" % ("%d/%d" % (j.get("attempt") or 0, (j.get("retries") or 0) + 1))),
+            ("", "  %-8s  %9s  " % (j["id"], "(%s)" % fmt_dur(j["t"]) if j.get("waiting") else fmt_dur(j["t"]))), progress_seg(j), ("", "  "), (DIM, "%5s" % ("%d/%d" % (j.get("attempt") or 0, (j.get("retries") or 0) + 1))),
             (BOLD_RED if pct is not None and pct > 105 else "", "  %4s" % ("-" if pct is None else "%d%%" % round(pct))),
             (BOLD_RED if over else "", "  %11s" % fmt_mem(used, j.get("mem_mb"))),
             ("", "  "), ("", "%-16s" % clean(j.get("name") or "-")[:NAME_MAX]), ("", "  " + clean(j["cmd"]))]
@@ -2030,6 +2847,57 @@ def job_segs(j):
     elif j["state"] == "done":
         segs = [(DIM, t) for _, t in segs]
     return segs
+
+
+def progress_seg(j):
+    """The Progress column: percent done and, while running, the ETA; amber when the ETA overruns the timeout."""
+    f, left = job_progress(j)
+    if f is None:
+        return DIM, "%9s" % "-"
+    late = left is not None and j.get("timeout") and j["t"] + left > j["timeout"]
+    return YELLOW if late else "", "%9s" % ("%d%%" % (100 * f) + (" " + fmt_short(left) if left is not None else ""))
+
+
+def stage_segs(j):
+    """Code / files / results of a job that uses --git, --push or --pull; [] otherwise."""
+    st = j.get("stage")
+    if not st:
+        return []
+    segs, g = [], st.get("git")
+    if g:
+        segs += [("", "Code: "), (BOLD, "%s@%s" % (os.path.basename(g["repo"]), g["sha"][:8])),
+                 (YELLOW if g["dirty"] else DIM, " +uncommitted" if g["dirty"] else " clean"),
+                 (DIM, "%s%s   " % (" on " + g["branch"] if g.get("branch") else "", " (base %s)" % g["base"][:8] if g["dirty"] and g.get("base") else ""))]
+    if st.get("push"):
+        segs += [("", "Push: "), ("", ", ".join(os.path.basename(x) + ("/" if isdir else "") + (" → " + d if d != os.path.basename(x) else "")
+                                              for x, d, isdir in st["push"])), ("", "   ")]
+    if g or st.get("push"):
+        segs.append((BOLD_RED, "staging failed: %s   " % st["err"]) if st.get("err") else
+                    (DIM, "work dir cleaned   ") if st.get("cleaned") else
+                    (BOLD_RED, "clean failed: %s   " % st["clean_err"]) if st.get("clean_err") else
+                    (GREEN, "staged on %s%s   " % (st["staged"], " (kept)" if st.get("keep") else "")) if st.get("staged") else (DIM, "not staged yet   "))
+    if st.get("pull"):
+        segs += [("", "Pull: "), ("", ", ".join("%s → %s" % (x, d.replace(os.path.expanduser("~"), "~")) for x, d in st["pull"]))]
+        segs.append((BOLD_RED, "   pull failed: %s" % st["pull_err"]) if st.get("pull_err") else
+                    (GREEN, "   pulled %s ago" % fmt_dur(time.time() - st["pulled"], 1)) if st.get("pulled") else
+                    (DIM, "   when it ends (%s)" % ",".join(st.get("pull_on", ()))))
+    return segs
+
+
+def progress_segs(j):
+    """The checkpoint line of `show` and the detail view; empty for jobs that use none of it."""
+    if not (j.get("progress") or j.get("expect") or j.get("stall")):
+        return []
+    f, left = job_progress(j)
+    stall = j.get("stall")
+    stall = ("%s%s" % (fmt_dur(stall, 1), " (or output)" if j.get("stall_on_log") else "")) if stall \
+        else "2x expect/step" if stall is None and j.get("expect") else "-"
+    ago = j["now"] - j["beat"] if j["state"] in ("running", "paused") and j.get("beat") else None
+    return [("", "Progress: "), (BOLD, clean(j.get("progress") or "-")),
+            *([("", "   Done: "), (NUM, "%d%%" % (100 * f))] if f is not None else []),
+            *([("", "   ETA: "), (progress_seg(j)[0], fmt_dur(left))] if left is not None else []),
+            *([(DIM, "   (updated %s ago)" % fmt_dur(ago))] if ago is not None else []),
+            ("", "   Expect: %s   Stall after: %s" % (fmt_dur(j["expect"], 1) if j.get("expect") else "-", stall))]
 
 
 def meta_segs(j):
@@ -2041,15 +2909,21 @@ def meta_segs(j):
             ("", "   Mem peak: %s%s" % (lim("peak_mb", lambda v: "%dM" % v), " of %dM" % j["mem_mb"] if j.get("mem_mb") else "")),
             *([("", "   CPU%%: %s   Mem: %s" % ("-" if j.get("cpu_pct") is None else "%d%%" % round(j["cpu_pct"]),
                                               fmt_mem(j.get("rss_mb"), j.get("mem_mb"))))] if j["state"] == "running" else []),
-            ("", "   Timeout: %s" % lim("timeout", fmt_dur)), ("", "   rc: "),
+            ("", "   Timeout: %s" % lim("timeout", lambda v: fmt_dur(v, 1))), ("", "   rc: "),
             (GREEN if j.get("rc") == 0 else BOLD_RED if j.get("rc") else DIM, "-" if j.get("rc") is None else str(j["rc"])),
-            ("", "   %s: %s" % ("Waiting" if j["state"] in ("pending", "queued") else "Ran", fmt_dur(j["t"])))]
+            ("", "   %s: %s" % ("Waiting" if j.get("waiting") else "Ran", "(%s)" % fmt_dur(j["t"]) if j.get("waiting") else fmt_dur(j["t"]))),
+            *([(YELLOW, "   Paused: %s%s" % (fmt_dur((j.get("paused_s") or 0) + (j["now"] - j["paused_at"] if j["state"] == "paused" and j.get("paused_at") else 0), 1),
+                                           " (now)" if j["state"] == "paused" else " in total"))] if j.get("paused_s") or j["state"] == "paused" else [])]
 
 
 def show(j, log):
     t = lambda k: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(j[k])) if j.get(k) else "-"
     out([("", "Job: "), (BOLD_CYAN, j["id"]), ("", "   Name: "), (BOLD, clean(j.get("name") or "-")), ("", "   Host: "), (BOLD_CYAN, j["host"] or "(any)")])
     out(meta_segs(j))
+    if progress_segs(j):
+        out(progress_segs(j))
+    if stage_segs(j):
+        out(stage_segs(j))
     out([("", "Cmd: "), (BOLD, j["cmd"])])
     out([(DIM, "cwd %s   env %s   retry on %s   created %s   started %s   ended %s" % (
         j.get("cwd") or "~", j.get("env") if j.get("env") not in (None, "", "{}", {}) else "-", j.get("retry_on"), t("created"), t("started"), t("ended")))])
@@ -2058,12 +2932,63 @@ def show(j, log):
         sys.stdout.write(log if log.endswith("\n") else log + "\n")
 
 
+def where_lines(w):
+    """`tshed where` / the dashboard's W view: one segment list per line."""
+    if w["state"] != "running":
+        return [[(DIM, "not running (%s): no processes to show" % w["state"])]]
+    L = [[(BOLD, "%-8s %-5s %11s  %s" % ("PID", "STAT", "ELAPSED", "COMMAND"))]]
+    pad = " " * 28
+    for r in w["procs"]:
+        L.append([(NUM, "%-8d" % r["pid"]), ("", " %-5s %11s  " % (r["stat"][:5], r["etime"])),
+                  ("", "  " * r["depth"] + ("└ " if r["depth"] else "")), (BOLD if not r["depth"] else "", clean(r["cmd"].replace("\\012", " ")))])
+        ind = pad + "  " * r["depth"] + ("  " if r["depth"] else "")
+        if r.get("line"):
+            L.append([("", ind), (DIM, "at "), (HOST, "%s:%d" % (os.path.basename(r["script"]), r["line"])), ("", "  "),
+                      (BOLD, clean(r["text"])[:120])])
+        t = r.get("trace")
+        if t:
+            L.append([("", ind), (DIM, "traced "), (HOST, clean(os.path.basename(t["at"].split(":")[0]) + ":" + t["at"].rpartition(":")[2])),
+                      *([(DIM, " in "), ("", " ← ".join(t["funcs"]))] if t["funcs"] else []), ("", "  "), (BOLD, clean(t["cmd"])[:160]),
+                      (DIM, "   (%s ago)" % fmt_dur(t["age"], 1))])
+    if not w["procs"]:
+        L.append([(DIM, "(no processes found: the job may be exiting)")])
+    for pid, dump in sorted(w["pyspy"].items(), key=lambda kv: int(kv[0])):
+        L.append([(BOLD, "py-spy dump of %s:" % pid)])
+        L += [[("", "  " + clean(l))] for l in dump.splitlines()]
+    if w.get("pyspy_skipped"):
+        L.append([(DIM, "(%d more python processes not dumped)" % w["pyspy_skipped"])])
+    if w.get("pyspy_missing"):
+        L.append([(DIM, "python stacks: install py-spy on the host (pip install py-spy); Linux may need sudo or kernel.yama.ptrace_scope=0")])
+    if any(r.get("line") for r in w["procs"]):
+        L.append([(DIM, "at = the line where the running command ends: exact for top-level commands, the block's last line "
+                        "inside a loop or function" + ("" if w["trace_lines"] else "; exact lines: submit with --trace-lines"))])
+    return L
+
+
 ALT_ON = "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h"   # alternate screen, hide cursor, SGR mouse
 ALT_OFF = "\x1b[0m\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l"
 KEYS_UP, KEYS_DOWN = ("\x1b[A", "\x1bOA", "\x10"), ("\x1b[B", "\x1bOB", "\x0e")
 KEYS_PGUP, KEYS_PGDN = ("\x1b[5~", "\x1b[1;5A", "\x1b[1;2A"), ("\x1b[6~", "\x1b[1;5B", "\x1b[1;2B")
 KEYS_LEFT, KEYS_RIGHT = ("\x1b[D", "\x1bOD"), ("\x1b[C", "\x1bOC")
 PAGE = 10
+
+
+def clipboard(text):
+    """Put text on the clipboard: the local tool when this is a local session, else OSC 52, which the
+    terminal itself handles (works over ssh; tmux needs set-clipboard on). Returns what was used."""
+    if not os.environ.get("SSH_TTY"):
+        for argv, need in ((["pbcopy"], None), (["wl-copy"], "WAYLAND_DISPLAY"), (["xclip", "-selection", "clipboard"], "DISPLAY"),
+                           (["xsel", "-bi"], "DISPLAY")):
+            if shutil.which(argv[0]) and (not need or os.environ.get(need)):
+                try:
+                    subprocess.run(argv, input=text.encode(), timeout=5, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    return argv[0]
+                except (OSError, subprocess.SubprocessError):
+                    pass
+    import base64
+    OUT.write("\x1b]52;c;%s\x07" % base64.b64encode(text.encode()).decode())
+    OUT.flush()
+    return "the terminal (OSC 52)"
 
 
 def tui(interval):
@@ -2076,7 +3001,7 @@ def tui(interval):
     apply_theme(paint_bg=True)
     themes = theme_names()
     st: dict = dict(sel=0, top=0, query="", hide=False, detail=None, scroll=None, msg=("", ""), prompt=None, log=(None, ""),
-                    fetching=False, fetched=0, synced=0, row0=0, rows=0, syncing=False)
+                    fetching=False, fetched=0, synced=0, row0=0, rows=0, syncing=False, where=None, marks=set())
     wake, stop = threading.Event(), threading.Event()
 
     def say(text, style=""):
@@ -2087,6 +3012,7 @@ def tui(interval):
             st["syncing"] = True
             try:
                 sync_all()
+                pull_due_bg()
                 st["synced"] = time.time()
                 if st["msg"][1].startswith("sync: "):
                     say("")
@@ -2128,6 +3054,14 @@ def tui(interval):
             text = (j.get("tail") or "") + "\n[live log unavailable: %s]" % e
         st.update(log=(j["id"], text), fetching=False, fetched=time.time())
 
+    def fetch_where(j, dest):  # on demand only: a py-spy dump briefly pauses python processes
+        try:
+            w = json.loads(remote(dest, ["rpc"], json.dumps(dict(where=j["id"])), timeout=40))["where"]
+            st["where"] = (j["id"], where_lines(w), time.time())
+        except Exception as e:
+            st["where"] = (j["id"], [[(BOLD_RED, "where: %s" % e)]], time.time())
+        wake.set()
+
     def run_fg(argv):  # hand the terminal to mosh/ssh/tail, then take it back
         screen(False)
         try:
@@ -2149,7 +3083,7 @@ def tui(interval):
         label, text, _ = st["prompt"]
         hint = "[Enter: confirm, Esc: cancel, Ctrl-U: clear]"
         if label.startswith("New job"):
-            hint = "[-n name (required)  -H host  -p prio  -c cpus  -m mem  -t timeout  -r retries, then the command]"
+            hint = "[-n name (required)  -H host  -p prio  -c cpus  -m mem  -t timeout  -x expect  --stall D  -r retries, then the command]"
         text = text[-max(10, W - len(label) - 8):]
         return styled([(BOLD_YELLOW, label + " "), (BOLD_CYAN, text + "█"), ("", "   "), (DIM, hint)], W)
 
@@ -2191,27 +3125,32 @@ def tui(interval):
             L.append(DIM + "  (+%d more hosts)" % (len(hosts) - len(shown)) + RESET)
         L.append("")
         # 3. jobs
-        L.extend(table_head(JOB_HEAD, W))
+        L.extend(table_head("  " + JOB_HEAD, W))
         room = max(1, H - len(L) - 3)
         st["top"] = max(0, min(st["top"], st["sel"], len(jobs) - room))
         if st["sel"] >= st["top"] + room:
             st["top"] = st["sel"] - room + 1
         st.update(row0=len(L) + 1, rows=min(room, len(jobs) - st["top"]))
         for i, j in enumerate(jobs[st["top"]:st["top"] + room], st["top"]):
+            gutter = (KEY, "◆ ") if j["id"] in st["marks"] else ("", "  ")  # X / ctrl-click marks
             if i == st["sel"]:  # SEL_FLAT (ratatui's reversed row): the bar's own text color, no per-cell colors
-                L.append(styled([("", t) for _, t in job_segs(j)] if SEL_FLAT else job_segs(j), W, HILITE))
+                L.append(styled([("", t) for _, t in [gutter] + job_segs(j)] if SEL_FLAT else [gutter] + job_segs(j), W, HILITE))
             else:
-                L.append(styled(job_segs(j), W, ALT if i % 2 else ""))
+                L.append(styled([gutter] + job_segs(j), W, ALT if i % 2 else ""))
         if not jobs:
             L.append(DIM + ("  (no matching jobs)" if st["query"] or st["hide"] else "  (no jobs yet: press N to submit one)") + RESET)
         L.extend([""] * (H - 3 - len(L)))
         # 4. status message, 5. help line, 6. footer
         L.append(styled([st["msg"]], W))
-        L.append(help_line([("Enter/→", "detail"), ("N", "new"), ("K", "cancel"), ("E", "rerun"), ("P", "prio"), ("F", "force"), ("M", "move"),
+        n = len(st["marks"])
+        L.append(help_line(([("E", "rerun %d marked" % n), ("K", "cancel"), ("P", "prio"), ("Z", "pause/resume"), ("Y", "copy %d commands" % n),
+                             ("X", "mark"), ("^A", "mark shown"), ("U", "unmark all")]
+                            if n else [("X", "mark"), ("Y", "copy cmd"), ("Z", "pause/resume")]) + [("Enter/→", "detail"), ("W", "where"), ("N", "new"), ("K", "cancel"), ("E", "rerun"), ("P", "prio"), ("F", "force"), ("M", "move"),
                             ("A", "attach"), ("O", "shell"), ("H", "show done" if st["hide"] else "hide done"), ("C", "config"),
                             ("T", "theme"), ("B/D", "contrast"), ("R", "refresh"), ("Esc", "exit")], W))
         age = "syncing…" if st["syncing"] and not st["synced"] else "synced %s ago" % fmt_dur(time.time() - st["synced"]) if st["synced"] else "not synced yet"
-        L.append(styled([(DIM, "Server: %s   (%d/%d jobs shown)   %s" % (HOME.replace(os.path.expanduser("~"), "~"), len(jobs), total, age))], W))
+        L.append(styled([(DIM, "Server: %s   (%d/%d jobs shown)   " % (HOME.replace(os.path.expanduser("~"), "~"), len(jobs), total)),
+                         *([(KEY, "%d marked" % n), (DIM, "   ")] if n else []), (DIM, age)], W))
         return L, H
 
     def draw_detail(j):
@@ -2219,9 +3158,19 @@ def tui(interval):
         W -= 1
         L = [prompt_bar(W) if st["prompt"] else styled([("", "Job: "), (BOLD_CYAN, j["id"]), ("", "   Name: "), (BOLD, clean(j.get("name") or "-")), ("", "   Host: "), (BOLD_CYAN, j["host"] or "(any)"), ("", "   "),
                                                          (DIM, "(%s on the host)" % ("~/.tinyshed/logs/%s.log" % j["id"]))], W),
-             styled(meta_segs(j), W), styled([("", "Cmd: "), (BOLD, clean(j["cmd"]))], W), "─" * W]
+             styled(meta_segs(j), W), *([styled(progress_segs(j), W)] if progress_segs(j) else []),
+             *([styled(stage_segs(j), W)] if stage_segs(j) else []),
+             styled([("", "Cmd: "), (BOLD, clean(j["cmd"]))], W), "─" * W]
         text = st["log"][1] if st["log"][0] == j["id"] else (j.get("tail") or "")
         lines = [clean(l.rsplit("\r", 1)[-1]) for l in text.rstrip("\n").split("\n")] if text else []
+        wh = st["where"] if st["where"] and st["where"][0] == j["id"] else None
+        if wh:  # the W view replaces the log until W is pressed again
+            L.append(styled([(BOLD, "Where"), (DIM, " (as of %s ago)   [W] back to the log   [R] refresh" % fmt_dur(time.time() - wh[2], 1))], W))
+            L += [styled(segs, W) for segs in wh[1][:max(1, H - len(L) - 2)]]
+            L.extend([""] * (H - 2 - len(L)))
+            L.append(styled([st["msg"]], W))
+            L.append(help_line([("Esc/←", "back"), ("W", "log"), ("R", "refresh"), ("K", "cancel"), ("A", "attach"), ("O", "shell")], W))
+            return L, H
         room = max(1, H - len(L) - 2)
         last = max(0, len(lines) - room)
         if st["scroll"] is not None and st["scroll"] >= last:
@@ -2234,7 +3183,7 @@ def tui(interval):
         L.append(styled([st["msg"]], W) if st["msg"][1] else styled([(DIM, "Scroll: %d-%d/%d%s" % (
             top + 1, min(len(lines), top + room), len(lines), "   (following)" if st["scroll"] is None and j["state"] == "running" else "")
             if lines else "No output yet" if j["sent"] else "Not on a host yet")], W))
-        L.append(help_line([("Esc/←", "back"), ("↑/↓", "scroll"), ("K", "cancel"), ("E", "rerun"), ("P", "prio"), ("F", "force"), ("M", "move"), ("A", "attach"), ("O", "shell"), ("C", "config"), ("R", "refresh")], W))
+        L.append(help_line([("Esc/←", "back"), ("↑/↓", "scroll"), ("W", "where"), ("Z", "pause/resume"), ("K", "cancel"), ("E", "rerun"), ("P", "prio"), ("F", "force"), ("M", "move"), ("A", "attach"), ("O", "shell"), ("C", "config"), ("R", "refresh")], W))
         return L, H
 
     threading.Thread(target=syncer, daemon=True).start()
@@ -2281,14 +3230,17 @@ def tui(interval):
                     st["prompt"] = (label, text + key, fn)
                 continue
             say("")
-            step, click = 0, None
+            step, click, mark = 0, None, None
             m = re.match(r"\x1b\[<(\d+);(\d+);(\d+)([Mm])", key)
             if m:  # SGR mouse: wheel moves, click selects, click on the selection opens it
                 button, row = int(m.group(1)), int(m.group(3))
                 if button in (64, 65):
                     step = -1 if button == 64 else 1
-                elif button == 0 and m.group(4) == "M" and not st["detail"] and st["row0"] <= row < st["row0"] + st["rows"]:
-                    click = st["top"] + row - st["row0"]
+                elif button in (0, 8, 16) and m.group(4) == "M" and not st["detail"] and st["row0"] <= row < st["row0"] + st["rows"]:
+                    if button:  # alt- or ctrl-click: toggle the mark, as in a file manager
+                        mark = st["top"] + row - st["row0"]
+                    else:
+                        click = st["top"] + row - st["row0"]
             elif key in KEYS_UP + KEYS_DOWN:
                 step = -1 if key in KEYS_UP else 1
             elif key in KEYS_PGUP + KEYS_PGDN:
@@ -2297,19 +3249,25 @@ def tui(interval):
                 st["scroll"] = max(0, (st["rows"] if st["scroll"] is None else st["scroll"]) + step)
             elif step:
                 st["sel"] += step
+            elif mark is not None:
+                st["marks"] ^= {jobs[mark]["id"]}
+                st["sel"] = mark
             elif click is not None:
                 if click == st["sel"]:
                     st.update(detail=jobs[click]["id"], fetched=0, scroll=None)
                 st["sel"] = click
             elif m:
                 pass
-            elif key in ("Q", "\x03") or (key == "\x1b" and not st["detail"] and not st["query"]):
+            elif key in ("Q", "\x03") or (key == "\x1b" and not st["detail"] and not st["query"] and not st["marks"]):
                 break
             elif key == "\x1b" or (key in KEYS_LEFT and st["detail"]):
                 if st["detail"]:
-                    st["detail"] = None
-                else:
+                    st.update(detail=None, where=None)
+                elif st["query"]:
                     st["query"] = ""
+                else:  # Esc clears marks before it exits
+                    st["marks"] = set()
+                    say("Marks cleared", DIM)
             elif key in ("\r", "\n") + KEYS_RIGHT and cur and not st["detail"]:
                 st.update(detail=cur["id"], fetched=0, scroll=None)
             elif key == "\x15":
@@ -2317,7 +3275,15 @@ def tui(interval):
             elif key == "R":
                 st["fetched"] = 0
                 say("Refreshing…", DIM)
+                if st["detail"] and st["where"] and st["where"][0] == st["detail"] and cur and cur["host"] in dests:
+                    threading.Thread(target=fetch_where, args=(cur, dests[cur["host"]]), daemon=True).start()
                 wake.set()
+            elif key == "W" and cur and st["detail"] and st["where"] and st["where"][0] == cur["id"]:
+                st["where"] = None
+            elif key == "W" and cur and cur["state"] == "running" and cur["host"] in dests:
+                st.update(detail=cur["id"], fetched=0, scroll=None)
+                st["where"] = (cur["id"], [[(DIM, "asking %s…" % cur["host"])]], time.time())
+                threading.Thread(target=fetch_where, args=(cur, dests[cur["host"]]), daemon=True).start()
             elif key == "H":
                 st["hide"] = not st["hide"]
             elif key == "T":  # next theme, saved; TINYSHED_THEME (if set) only picks the starting point
@@ -2345,6 +3311,52 @@ def tui(interval):
                         say("Submit failed: %s" % (e if str(e) not in ("", "2") else "bad arguments"), BOLD_RED)
                     wake.set()
                 st["prompt"] = ("New job:", "", new)
+            elif key == "K" and st["marks"]:
+                live = [j["id"] for j in everything if j["id"] in st["marks"] and j["state"] not in TERMINAL]
+
+                def kill_marked(text, live=live):
+                    if text.lower() in ("y", "yes"):
+                        for jid in live:
+                            cancel(db, jid)
+                        st["marks"] = set()
+                        say("Cancelling %d jobs…" % len(live), YELLOW)
+                        wake.set()
+                skipped = len(st["marks"]) - len(live)
+                st["prompt"] = ("Cancel %d marked jobs%s? [y/N]:" % (len(live), " (%d already finished, skipped)" % skipped if skipped else ""), "", kill_marked)
+            elif key == "P" and st["marks"]:
+                waiting = [j["id"] for j in everything if j["id"] in st["marks"] and j["state"] in ("pending", "queued")]
+
+                def prio_marked(text, waiting=waiting):
+                    try:
+                        n = int(text)
+                    except ValueError:
+                        return say("Priority must be an integer", BOLD_RED)
+
+                    def go(tdb):
+                        bad = []
+                        for jid in waiting:
+                            try:
+                                set_prio(tdb, jid, n)
+                            except Fail as e:
+                                bad.append("%s: %s" % (jid, e))
+                        say("Priority %d for %d jobs%s" % (n, len(waiting) - len(bad), "; failed: " + "; ".join(bad) if bad else ""),
+                            BOLD_RED if bad else GREEN)
+                    background(go)
+                skipped = len(st["marks"]) - len(waiting)
+                st["prompt"] = ("Priority for %d marked waiting jobs%s:" % (len(waiting), " (%d not waiting, skipped)" % skipped if skipped else ""), "", prio_marked)
+            elif key == "Z" and (st["marks"] or cur):
+                picked = [j for j in everything if j["id"] in st["marks"]] if st["marks"] else [cur]
+                stop_ids = [j["id"] for j in picked if j["state"] == "running"]
+                go_ids = [j["id"] for j in picked if j["state"] == "paused"]
+                if not stop_ids and not go_ids:
+                    say("Z pauses running jobs and resumes paused ones; nothing to do here", DIM)
+                else:
+                    def toggle(tdb, stop_ids=stop_ids, go_ids=go_ids):
+                        res = {**(pause_jobs(tdb, stop_ids) if stop_ids else {}), **(pause_jobs(tdb, go_ids, resume=True) if go_ids else {})}
+                        bad = ["%s: %s" % (k, v) for k, v in res.items() if v not in ("running", "paused")]
+                        say("%s%s" % (", ".join(x for x in ("pausing %d" % len(stop_ids) if stop_ids else "", "resuming %d" % len(go_ids) if go_ids else "") if x),
+                                      "; failed: " + "; ".join(bad) if bad else ""), BOLD_RED if bad else YELLOW)
+                    background(toggle)
             elif key == "K" and cur and cur["state"] not in TERMINAL:
                 def kill(text, jid=cur["id"]):
                     if text.lower() in ("y", "yes"):
@@ -2352,6 +3364,35 @@ def tui(interval):
                         say("Cancelling %s…" % jid, YELLOW)
                         wake.set()
                 st["prompt"] = ("Cancel %s (%s)? [y/N]:" % (cur["id"], clean(cur["cmd"])[:40]), "", kill)
+            elif key == "X" and cur and not st["detail"]:
+                st["marks"] ^= {cur["id"]}
+                st["sel"] += 1
+            elif key == "\x01" and jobs and not st["detail"]:
+                shown = {j["id"] for j in jobs}
+                st["marks"] = st["marks"] - shown if shown <= st["marks"] else st["marks"] | shown
+                say("%d marked" % len(st["marks"]), KEY)
+            elif key == "U":
+                st["marks"] = set()
+                say("Marks cleared", DIM)
+            elif key == "Y" and (st["marks"] or cur):
+                picked = [j for j in everything if j["id"] in st["marks"]] if st["marks"] else [cur]
+                try:
+                    how = clipboard("\n".join(j["cmd"] for j in picked) + "\n")
+                    say("Copied %d command%s to %s" % (len(picked), "s" * (len(picked) != 1), how), GREEN)
+                except Exception as e:
+                    say("Copy failed: %s" % e, BOLD_RED)
+            elif key == "E" and st["marks"]:
+                picked = [j for j in everything if j["id"] in st["marks"]]
+
+                def rerun(text, picked=picked):
+                    text = text.strip()
+                    if text and text != "any" and text not in dests:
+                        return say("Unknown host %r: Enter keeps each job's host; or any, %s" % (text, ", ".join(dests)), BOLD_RED)
+                    ids = [add_job(db, j, (None if text == "any" else text) if text else j["host"] if j["host"] in dests else None) for j in picked]
+                    st["marks"] = set()
+                    say("Resubmitted %d jobs%s: %s" % (len(ids), " on " + text if text else "", " ".join(ids)), GREEN)
+                    wake.set()
+                st["prompt"] = ("Rerun %d marked jobs on host [Enter: each job's own | any | %s]:" % (len(picked), " | ".join(dests)), "", rerun)
             elif key == "E" and cur:
                 say("Resubmitted %s as %s" % (cur["id"], add_job(db, cur, cur["host"] if cur["host"] in dests else None)), GREEN)
                 wake.set()
@@ -2400,7 +3441,7 @@ EXAMPLES = """examples (tshed = this file, symlinked into PATH):
   tshed install gpu1=gpu1.local,gpu1 gpu2=me@gpu2    install or upgrade hosts (no hosts given: upgrade all)
   tshed hosts                                         ping hosts: load, idle cores, memory, GPUs
   tshed submit -n train -H gpu1 -p 5 -c 8 -m 32G -t 12h -r 2 -- python train.py
-  tshed ls -a;  tshed show ID;  tshed logs ID;  tshed wait ID;  tshed cancel ID
+  tshed ls -a;  tshed show ID;  tshed logs ID;  tshed where ID;  tshed wait ID;  tshed cancel ID
   tshed edit ID -p 9 -H gpu2 --force                  re-prioritise, move, or start a waiting job now
   tshed theme dracula                                 pick a color theme (tshed theme: list them)
   tshed overview                                      hosts + active jobs, one screen
@@ -2477,6 +3518,55 @@ def build_parser():
     s.add_argument("id")
     s.add_argument("-n", "--bytes", type=int, default=20000, help="tail size in bytes")
     s.add_argument("-f", "--follow", action="store_true", help="follow live on the host (mosh)")
+    s = sub.add_parser("where", help="where a running job is: process tree, script line, python stacks",
+                       description="Ask the job's host what the job is doing now: its process tree; for each bash script, "
+                                   "the line it has reached (exact for top-level commands; inside a loop or function, the "
+                                   "line where that block ends); with --trace-lines at submit, the exact line, function "
+                                   "stack and command of every bash process; and with py-spy on the host, the stack of "
+                                   "every python process.")
+    s.add_argument("id")
+    s.add_argument("--json", action="store_true", help="the raw answer as JSON")
+    s = sub.add_parser("pause", help="pause running jobs (SIGSTOP); their cores go back to the queue",
+                       description="Stop every process of each job (SIGSTOP) and release its cores, so queued jobs can use them. "
+                                   "Memory stays held. Paused time does not count against the timeout, the stall limit or the run time.")
+    s.add_argument("ids", nargs="+", metavar="ID")
+    s = sub.add_parser("resume", help="resume paused jobs as soon as their cores are free",
+                       description="A resumed job waits for free cores in priority order, like a queued job, then continues "
+                                   "(re-pinned to the cores it gets, on Linux).")
+    s.add_argument("ids", nargs="+", metavar="ID")
+    s = sub.add_parser("grep", help="search job logs on every host",
+                       description="Search the captured output of jobs (running or finished, compressed or not) for a Python "
+                                   "regular expression, on all hosts in parallel. Without IDs: every job that matches the filters.")
+    s.add_argument("pattern")
+    s.add_argument("ids", nargs="*", metavar="ID", help="limit to these jobs (ids or names)")
+    s.add_argument("-i", "--ignore-case", action="store_true")
+    s.add_argument("--name", action="append", metavar="NAME", help="only jobs with this name (repeatable)")
+    s.add_argument("--state", action="append", metavar="STATE", help="only jobs in this state, e.g. error (repeatable)")
+    s.add_argument("--since", type=dur, help="only jobs submitted within this long, e.g. 2d")
+    s.add_argument("-m", "--max", type=int, default=20, help="matches shown per job (default 20)")
+    s.add_argument("-l", "--files", action="store_true", help="only list the jobs that match")
+    s = sub.add_parser("stats", help="runs, failures and runtimes per job name",
+                       description="From the server's records (no host contact): per job name, how many runs, how many "
+                                   "succeeded or failed, and the median / 90th percentile / max runtime of successful runs, "
+                                   "next to the latest --expect. Use it to pick -x for a new run.")
+    s.add_argument("names", nargs="*", metavar="NAME")
+    s.add_argument("--since", type=dur, help="only jobs submitted within this long, e.g. 30d")
+    s.add_argument("--json", action="store_true", help="one JSON object per name")
+    s = sub.add_parser("checkout", help="a --git job's code from its snapshot: into a folder, or its changes as a diff",
+                       description="Rebuild the exact code a --git job ran from tinyshed's snapshot store (no host contact, also "
+                                   "after its work dir was cleaned): the files into DIR (default ./NAME-ID, must not exist "
+                                   "or be empty), or with --diff the changes the snapshot carried on top of its base commit.")
+    s.add_argument("id")
+    s.add_argument("dir", nargs="?")
+    s.add_argument("--diff", action="store_true", help="print the uncommitted changes the job ran with (git diff base..snapshot)")
+    s.add_argument("--stat", action="store_true", help="with --diff: only the list of changed files")
+    s = sub.add_parser("fetch", help="copy a job's results from its host now",
+                       description="Copy files from a job's host into local folders now, whatever its state (a running job "
+                                   "gives a snapshot). Without SRC: the job's --pull list. A folder's contents land in the "
+                                   "destination folder; a file lands inside it. Each destination gets tinyshed-ID.json.")
+    s.add_argument("id")
+    s.add_argument("srcs", nargs="*", metavar="SRC", help="paths relative to the job's working directory on the host")
+    s.add_argument("--to", metavar="DIR", help="local folder for everything (default: each --pull DEST, or results/{name}/{id})")
     s = sub.add_parser("wait", help="block until jobs finish (exit 0 all done, 1 any failed, 2 timeout)")
     s.add_argument("ids", nargs="+", metavar="ID")
     s.add_argument("-t", "--timeout", type=dur, default=0, help="give up after e.g. 30m")
@@ -2516,6 +3606,12 @@ def build_parser():
     s.add_argument("pairs", nargs="*", metavar="PRESET | ROLE=COLOR",
                    help="presets: " + " ".join(SCHEMES) + "; roles: " + " ".join(SCHEME_ROLES))
     s.add_argument("--clear", action="store_true", help="remove every override")
+    s = sub.add_parser("progress", help="report a checkpoint from inside a job (does nothing outside one)",
+                       description="Write a checkpoint for the running job to $TINYSHED_PROGRESS. Every call resets the "
+                                   "--stall clock; a leading DONE/TOTAL or PCT% gives the dashboard a percentage and an ETA. "
+                                   "Outside a tinyshed job it does nothing, so scripts run unchanged elsewhere. "
+                                   "Without python: printf '%s\\n' \"3/10 msg\" > \"$TINYSHED_PROGRESS\".")
+    s.add_argument("words", nargs="*", metavar="[DONE/TOTAL|PCT%] MESSAGE")
     s = sub.add_parser("completion", help="print a shell completion script")
     s.add_argument("shell", choices=("fish", "zsh", "bash"))
     public = [c.dest for c in sub._choices_actions]
@@ -2606,10 +3702,26 @@ def complete(db, kind):
             print("%s\t%s %s %s: %s" % (r["id"], b.get("name") or "-", r["state"], r["host"] or "(any)", clean(b.get("cmd"))[:40]))
 
 
+def progress_cmd(words):
+    """`tshed progress`: one atomic write of the checkpoint file the job's watchdog polls."""
+    path = os.environ.get("TINYSHED_PROGRESS")
+    if not path:
+        return 0
+    tmp = "%s.%d" % (path, os.getpid())
+    try:
+        with open(tmp, "w") as f:
+            f.write(" ".join(words) + "\n")
+        os.replace(tmp, path)
+    except OSError as e:
+        raise Fail("progress: %s" % e)
+    return 0
+
+
 def main():
-    global ECHO
+    global ECHO, STAGE_MODE
     p, sub, public = build_parser()
     a = p.parse_args()
+    STAGE_MODE = "bg" if a.op in (None, "tui", "serve") else "sync" if a.op in ("submit", "wait", "edit", "fetch") else None
 
     if a.op == "setup":
         return setup(a)
@@ -2625,6 +3737,8 @@ def main():
         return print(json.dumps(rpc(json.load(sys.stdin))))
     if a.op == "_run":
         return run_job(a.id)
+    if a.op == "progress":
+        return progress_cmd(a.words)
     if a.op == "completion":
         return print(completion(a.shell, sub, public))
 
@@ -2652,6 +3766,7 @@ def main():
         print("tshed %s serving %d hosts every %gs" % (VERSION, len(known), a.interval), flush=True)
         while True:
             sync_all()
+            pull_due_bg()
             time.sleep(a.interval)
     if a.op == "install":
         pairs = []
@@ -2720,21 +3835,22 @@ def main():
     elif a.op == "submit":
         if not known:
             raise Fail("no hosts yet: tshed install NAME=DEST ...")
-        jid = submit(db, a)
+        jid = submit(db, a, stage_now=True)
         sync_all()
         r = db.execute("SELECT host, state FROM jobs WHERE id=?", (jid,)).fetchone()
         print(jid, r["state"], r["host"] or "(any)")
         if r["state"] == "pending":
             print("note: " + ("host %s is unreachable; the job is delivered on reconnect" % r["host"] if r["host"] else
-                              "waiting for a host with enough idle cores; `tshed serve` or the dashboard must be running to place it"), file=sys.stderr)
+                              "waiting for a host with enough idle cores; the next sync places it (tshed wait/ls, serve or the dashboard)"), file=sys.stderr)
     elif a.op == "ls":
         sync_all()
         jobs = [j for j in load_jobs(db, load_hosts(db)) if a.all or j["state"] not in TERMINAL]
         if a.json:
             keys = ("id", "name", "host", "state", "prio", "attempt", "rc", "cmd", "created", "started", "ended", "peak_mb",
-                    "cpus", "mem_mb", "cpu_pct", "rss_mb")
+                    "cpus", "mem_mb", "cpu_pct", "rss_mb", "timeout", "expect", "stall", "progress", "beat", "paused_s", "stage")
             for j in jobs:
-                print(json.dumps({k: j.get(k) for k in keys}))
+                f, left = job_progress(j)
+                print(json.dumps(dict({k: j.get(k) for k in keys}, done=f, eta=left, **{"wait" if j.get("waiting") else "ran": round(j["t"], 1)})))
         elif not jobs:
             print("no jobs" if a.all else "no active jobs (ls -a shows finished ones)", file=sys.stderr)
         else:
@@ -2752,6 +3868,110 @@ def main():
                 log = json.loads(remote(known[j["host"]], ["rpc"], json.dumps(dict(logs=dict(id=jid, bytes=a.bytes)))))["logs"]
         log = log[-a.bytes:] if a.bytes else ""
         show(j, log.split("\n", 1)[-1] if len(log) >= a.bytes else log)  # drop the partial first line
+    elif a.op == "checkout":
+        jid = resolve(db, a.id)
+        r = db.execute("SELECT j, stage FROM jobs WHERE id=?", (jid,)).fetchone()
+        g = (json.loads(r["stage"]) if r["stage"] else {}).get("git")
+        if not g:
+            raise Fail("%s was not submitted with --git: there is no snapshot" % jid)
+        gd = ["--git-dir", g["store"]] if g.get("store") else ["-C", g["repo"]]
+        if subprocess.run(["git", *gd, "cat-file", "-e", g["sha"] + "^{commit}"], capture_output=True).returncode:
+            raise Fail("snapshot %s of %s is gone from %s" % (g["sha"][:8], jid, g.get("store") or g["repo"]))
+        if a.diff:
+            if not g["dirty"]:
+                print("%s ran on %s itself: no uncommitted changes" % (jid, g["sha"][:8]))
+                return 0
+            base = g.get("base") or "4b825dc642cb6eb9a060e54bf8d69288fbee4904"  # the empty tree: a repo without commits
+            return subprocess.call(["git", *gd, "diff", *(["--stat"] if a.stat else []), base, g["sha"]])
+        dst = os.path.abspath(os.path.expanduser(a.dir or "%s-%s" % (unpack(r["j"]).get("name") or "job", jid)))
+        if os.path.exists(dst) and os.listdir(dst):
+            raise Fail("%s exists and is not empty" % dst)
+        os.makedirs(dst, exist_ok=True)
+        arc = subprocess.Popen(["git", *gd, "archive", g["sha"]], stdout=subprocess.PIPE)
+        tar = subprocess.run(["tar", "-x", "-C", dst], stdin=arc.stdout)
+        if arc.wait() or tar.returncode:
+            raise Fail("could not extract the snapshot into %s" % dst)
+        print("%s code at %s%s → %s" % (jid, g["sha"][:8], " (+uncommitted changes on %s)" % (g.get("base") or "")[:8] if g["dirty"] else "", dst))
+    elif a.op == "fetch":
+        jid = resolve(db, a.id)
+        host = db.execute("SELECT host FROM jobs WHERE id=?", (jid,)).fetchone()["host"]
+        if host in known:
+            sync_host(host)  # the latest state, for the manifest
+        done, errs = pull_job(db, jid, os.path.abspath(os.path.expanduser(a.to)) if a.to else None, a.srcs or None)
+        for x in done:
+            print(jid, "pulled", x)
+        for e in errs:
+            print("tinyshed: %s %s" % (jid, e), file=sys.stderr)
+        return 1 if errs else 0
+    elif a.op in ("pause", "resume"):
+        ids = [resolve(db, i) for i in a.ids]
+        rc = 0
+        for jid, state in pause_jobs(db, ids, resume=a.op == "resume").items():
+            ok = state in ("running", "paused")
+            rc |= not ok
+            print(jid, ({"pause": {"running": "pausing", "paused": "paused"}, "resume": {"paused": "resuming (waits for free cores)",
+                                                                                      "running": "running"}}[a.op].get(state, state)))
+        return rc
+    elif a.op == "grep":
+        try:
+            re.compile(a.pattern)
+        except re.error as e:
+            raise Fail("bad pattern: %s" % e)
+        want = {resolve(db, i) for i in a.ids}
+        since = time.time() - a.since if a.since else 0
+        jobs = [j for j in load_jobs(db, load_hosts(db)) if j["sent"] and j["host"] in known and (not want or j["id"] in want)
+                and (not a.name or j.get("name") in a.name) and (not a.state or j["state"] in a.state) and j["created"] >= since]
+        by_host, found, errs = {}, {}, []
+        for j in jobs:
+            by_host.setdefault(j["host"], []).append(j["id"])
+
+        def one(host):
+            try:
+                req = dict(grep=dict(pattern=a.pattern, ignore_case=a.ignore_case, ids=by_host[host], per_job=1 if a.files else a.max, max=10 ** 6))
+                found.update(json.loads(remote(known[host], ["rpc"], json.dumps(req), timeout=300))["grep"])
+            except Exception as e:
+                errs.append("%s: %s" % (host, e))
+        par(one, list(by_host))
+        for j in sorted((j for j in jobs if j["id"] in found), key=lambda j: j["created"]):
+            hits = found[j["id"]]
+            out([(BOLD_CYAN, j["id"]), ("", "  "), (BOLD, clean(j.get("name") or "-")), ("", "  "), (HOST, j["host"]), ("", "  "), state_seg(j)])
+            for n, text in [] if a.files else hits:
+                out([(DIM, "%7d: " % n), ("", clean(text))])
+        for e in errs:
+            print("tinyshed: grep on %s" % e, file=sys.stderr)
+        return 0 if found else 1
+    elif a.op == "stats":
+        rows = job_stats(db, set(a.names) or None, time.time() - a.since if a.since else 0)
+        if a.json:
+            for g in rows:
+                print(json.dumps(g))
+            return
+        if not rows:
+            raise Fail("no jobs%s" % (" named " + ", ".join(a.names) if a.names else ""))
+        d = lambda v: fmt_dur(v, 1) if v is not None else "-"
+        print(paint("%-16s %5s %5s %6s %5s  %9s %9s %9s  %9s  %8s  %s" % ("Name", "Runs", "Done", "Failed", "Fail%", "Median", "P90", "Max",
+                                                                        "Expect", "Peak mem", "Last run"), BOLD))
+        for g in rows:
+            ratio = g["median"] / g["expect"] if g["median"] and g["expect"] else None
+            out([("", "%-16s" % clean(g["name"])[:NAME_MAX]), (NUM, " %5d %5d" % (g["runs"], g["done"])),
+                 (BOLD_RED if g["failed"] else DIM, " %6d" % g["failed"]), (BOLD_RED if g["fail_pct"] >= 50 else "", " %4d%%" % g["fail_pct"]),
+                 ("", "  %9s %9s %9s  " % (d(g["median"]), d(g["p90"]), d(g["max"]))),
+                 (YELLOW if ratio and not 0.5 <= ratio <= 1.5 else "", "%9s" % d(g["expect"])),
+                 ("", "  %8s  " % fmt_mem(g["peak_mb"], None)), (DIM, "%s ago%s" % (fmt_dur(time.time() - g["last"]),
+                                                                                  "; failed as " + ",".join(g["states"]) if g["states"] else "")),
+                 *([(GREEN, "  %d active" % g["active"])] if g["active"] else [])])
+    elif a.op == "where":
+        r = db.execute("SELECT * FROM jobs WHERE id=?", (resolve(db, a.id),)).fetchone()
+        if not r["sent"] or r["host"] not in known:
+            raise Fail("job %s is %s and not on a host" % (r["id"], r["state"]))
+        w = json.loads(remote(known[r["host"]], ["rpc"], json.dumps(dict(where=r["id"]))))["where"]
+        if a.json:
+            return print(json.dumps(w))
+        b = unpack(r["j"])
+        out([("", "Job: "), (BOLD_CYAN, r["id"]), ("", "   Name: "), (BOLD, clean(b.get("name") or "-")), ("", "   Host: "), (BOLD_CYAN, r["host"]),
+             *([("", "   Progress: "), (BOLD, clean(b["progress"]))] if b.get("progress") else [])])
+        for line in where_lines(w):
+            out(line)
     elif a.op == "wait":
         ids = [resolve(db, i) for i in a.ids]
         deadline = time.time() + a.timeout if a.timeout else None
@@ -2761,8 +3981,19 @@ def main():
             if all(s in TERMINAL for s in states.values()) or (deadline and time.time() > deadline):
                 break
             time.sleep(a.interval)
+        pulled = {}
+        due = set(pulls_due(db))
+        for i in ids:
+            if i in due:
+                try:
+                    done, errs = pull_job(db, i)
+                    pulled[i] = "; ".join(["pulled " + x for x in done] + ["pull failed: " + e for e in errs])
+                except Fail as e:
+                    pulled[i] = "pull failed: %s" % e
+        for i in clean_due(db, set(ids)):
+            clean_job(db, i)
         for i, s in states.items():
-            print(i, s)
+            print(i, s, *([pulled[i]] if i in pulled else []))
         return 2 if any(s not in TERMINAL for s in states.values()) else 0 if all(s == "done" for s in states.values()) else 1
     elif a.op == "cancel":
         ids = [resolve(db, i) for i in a.ids]

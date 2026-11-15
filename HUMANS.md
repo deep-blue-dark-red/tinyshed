@@ -98,6 +98,8 @@ tshed submit -n train -H gpu1 -p 10 -c 8 -m 32G -t 12h -r 2 -C ~/proj -e CUDA_VI
 | `-c 8` | reserves 8 cores and pins the job to them with `taskset` |
 | `-m 32G` | kills the job if its whole process tree exceeds 32 GB RSS → `oom` |
 | `-t 12h` | kills it after 12 hours → `timeout` |
+| `-x 6h` | expected runtime: the timeout becomes 12h unless `-t` says otherwise, and you get an ETA |
+| `--stall 15m` | kills it after 15 minutes without a progress checkpoint → `stalled` |
 | `-r 2` | up to 2 retries with doubling backoff, by default only after `error` or `lost` |
 
 A host starts jobs strictly in priority order as cores free up. A big job at the head of the queue
@@ -113,8 +115,68 @@ tshed cancel train
 
 A move only happens if the job has not started on its current host; otherwise nothing changes.
 
+### Progress checkpoints
+
+A job that hangs without crashing would otherwise sit there until its timeout. Have the script
+report a checkpoint after each unit of work:
+
+```sh
+for f in data/*.csv; do
+  ./crunch "$f"
+  tshed progress "$((++i))/$(ls data/*.csv | wc -l)" "$f"
+done
+```
+
+`tshed progress` exists on every host inside a job, and does nothing when the script runs outside
+tinyshed. With `-x` and a `DONE/TOTAL` checkpoint, a step that takes more than twice its share of the
+expected time kills the job as `stalled`; `--stall DUR` sets a fixed limit instead. The dashboard's
+Progress column shows percent and ETA. For a command you cannot edit that prints as it works,
+`--stall 15m --stall-on-log` treats its output as the heartbeat. Details: README, Progress checkpoints.
+
+### Pause, search, history
+
+```sh
+tshed pause train        # SIGSTOP; its cores go to the next queued job (memory stays held)
+tshed resume train       # continues as soon as cores are free, in priority order
+tshed grep -i 'out of memory' --state error --since 2d   # search logs on every host
+tshed stats train        # runs, failures, median/p90/max runtime: pick -x from this
+```
+
+Paused time counts against nothing: not the timeout, not the stall limit, not the run time. In `ls`
+the Time column is the run time of the current attempt; waiting jobs show `(waiting time)` in brackets.
+
+### Where is it stuck?
+
+```sh
+tshed where train        # process tree, the line each bash script is on, python stacks (with py-spy)
+```
+
+For bash scripts the line is exact at the top level. Inside a loop or function it is the block's last
+line. Submit with `--trace-lines` to get the exact line, function and command of every bash process,
+at about 0.1 ms per bash command. In the dashboard, `W` shows the same view for the selected job.
+
 `lost` means the job's watchdog vanished — typically the host rebooted. With retries left the job
 simply starts again.
+
+### Shipping code and fetching results
+
+Instead of keeping a checkout on every host in sync by hand:
+
+```sh
+cd ~/proj/train                       # a git repo; uncommitted edits are fine
+tshed submit -n sweep -H gpu1 -x 3h --git --push ~/data/imgs:data --pull out:~/results/{name}/{id} -- python train.py
+tshed wait sweep                      # ... done pulled out → /home/me/results/sweep/1a2b3c4d
+```
+
+`--git` runs the job on an exact snapshot of your working tree (uncommitted changes and new files
+included, ignored files not), in its own checkout on the host, so you can keep editing while it runs.
+`--push` copies extra files or folders next to it; `--pull` copies results back when the job ends,
+into folders you name, with a `tinyshed-ID.json` that records what produced them. `tshed fetch ID`
+copies them at any time, also from a running job.
+
+After the pull the job's work dir on the host is deleted (`--keep-work` keeps it), so pull everything
+you want to keep. The code is never lost: `tshed checkout sweep --diff` shows the changes it ran with,
+`tshed checkout sweep` rebuilds the whole tree. Details: README, Files.
 
 ## 4. Let the server pick the host
 
@@ -152,7 +214,17 @@ Arrow keys or the mouse wheel move, a click selects (click again to open), typin
 | `A` | follow the log on the host (mosh) |
 | `O` | shell on the host (mosh) |
 | `H` / `R` | hide finished / refresh |
-| `Esc` / `Q` | quit |
+| `W` | where the selected running job is: processes, script lines (`W` again: back to the log) |
+| `X` | mark / unmark the selected job (and move down); ctrl- or alt-click also toggles |
+| `Ctrl-A` / `U` | mark every job shown / clear all marks |
+| `E` with marks | rerun every marked job: Enter keeps each one's host, or type `any` or a host name |
+| `K` / `P` with marks | cancel every marked job / set the priority of every marked waiting job |
+| `Z` | pause a running job / resume a paused one (with marks: all of them) |
+| `Y` | copy the marked jobs' commands (or the selected one's) to the clipboard, one per line |
+| `Esc` / `Q` | `Esc` clears the filter, then the marks, then quits; `Q` quits at once |
+
+To rerun every failure of last night on another host: type `error` to filter, `Ctrl-A`, `E`, `gpu2`,
+`Enter`.
 
 While it is open the TUI is also a server loop, like `tshed serve`.
 
@@ -190,8 +262,8 @@ def OnHostDown(ev):
     print("lost contact with", ev["host"], ev["data"]["err"])
 ```
 
-Available: `OnJobQueued OnJobStart OnJobCompletion OnJobError OnJobTimeout OnJobOOM OnJobLost
-OnJobCancel OnHostDown OnHostUp OnEvent`. Anything a hook prints, and any traceback, lands in
+Available: `OnJobQueued OnJobStart OnJobCompletion OnJobError OnJobTimeout OnJobOOM OnJobStalled OnJobLost
+OnJobCancel OnJobProgress OnJobPaused OnJobResumed OnHostDown OnHostUp OnEvent`. Anything a hook prints, and any traceback, lands in
 `~/.tinyshed/hooks.log`. The same file on a *host* runs there, at the moment the event happens, even
 when the server is unreachable. Server hooks run when the server learns of the event — so something
 must be listening: `tshed serve`, the TUI, or phone-home.

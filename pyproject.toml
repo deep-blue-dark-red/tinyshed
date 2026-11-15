@@ -1,17 +1,14 @@
 [project]
 name = "tinyshed"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.2"
+description = "A minimal priority-queue scheduler for long jobs: one server, N hosts, ssh in between. One file, stdlib only."
 readme = "README.md"
 authors = [
     { name = "deep-blue-dark-red", email = "2272178+deep-blue-dark-red@users.noreply.github.com" }
 ]
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 dependencies = []
 
-[project.scripts]
-tinyshed = "tinyshed:main"
-
-[build-system]
-requires = ["uv_build>=0.12.21,<0.13.0"]
-build-backend = "uv_build"
+[tool.uv]
+# not a package: tinyshed is the single file tinyshed.py, installed by copying it (see README)
+package = false

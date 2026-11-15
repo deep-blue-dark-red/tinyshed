@@ -1,8 +1,8 @@
 version = 1
 revision = 3
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 
 [[package]]
 name = "tinyshed"
-version = "0.1.0"
-source = { editable = "." }
+version = "0.2"
+source = { virtual = "." }

@@ -5,7 +5,7 @@ description: Run long jobs on the user's remote hosts with tinyshed / tshed - pr
 
 # tinyshed
 
-CLI: `tshed` (on PATH; source `tinyshed.py`). Run it from this machine (the
+CLI: `tshed` (on PATH: a symlink to `tinyshed.py` of the tinyshed repo). Run it from this machine (the
 server); it reaches hosts over ssh itself. Never run bare `tshed`, `tshed tui` or `tshed logs -f`:
 those are interactive.
 

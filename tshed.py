@@ -13,18 +13,19 @@ draining its own queue. Hosts can also phone home (`ssh server tinyshed.py inges
 
 Each job runs under a watchdog process (taskset pinning, runtime timeout, RSS limit, stdout/stderr
 capture, retry with backoff) that is detached from the agent, so agents can be upgraded mid-job.
+Jobs claim cores, RAM and GPUs (a share of one, or several); the agent fits running jobs' claims to their use.
 
 Progress checkpoints: a job writes `DONE/TOTAL message` to $TINYSHED_PROGRESS (or runs `tshed progress`);
 --stall kills a job that stops checkpointing, --expect sets the timeout to twice the expected runtime.
 
 Callbacks: put functions in ~/.tinyshed/hooks.py (server and/or host), each taking one event dict:
   OnJobQueued OnJobStart OnJobCompletion OnJobError OnJobTimeout OnJobOOM OnJobStalled OnJobLost OnJobCancel
-  OnJobProgress OnJobPaused OnJobResumed  OnCriticalDisk (~ or /tmp under 2G free)
+  OnJobProgress OnJobPaused OnJobResumed OnJobAdjusted  OnCriticalDisk (~ or /tmp under 2G free)
   OnHostDown OnHostUp (server only)   OnEvent (everything)
 """
-import argparse, bisect, contextlib, fcntl, glob, importlib, json, os, re, shlex, shutil, signal, sqlite3, subprocess, sys, tempfile, threading, time, traceback, uuid
+import argparse, bisect, contextlib, fcntl, glob, importlib, json, math, os, re, shlex, shutil, signal, sqlite3, subprocess, sys, tempfile, threading, time, traceback, uuid
 
-VERSION = "0.2"
+VERSION = "0.4"
 HOME = os.path.abspath(os.path.expanduser(os.environ.get("TINYSHED_HOME") or "~/.tinyshed"))
 SELF = os.path.abspath(__file__)
 OUT = sys.stdout
@@ -33,12 +34,14 @@ TERMINAL = ("done", "cancelled") + FAILURES
 HOOKS = {"queued": "OnJobQueued", "start": "OnJobStart", "done": "OnJobCompletion", "error": "OnJobError",
          "timeout": "OnJobTimeout", "oom": "OnJobOOM", "stalled": "OnJobStalled", "lost": "OnJobLost", "cancelled": "OnJobCancel",
          "progress": "OnJobProgress", "paused": "OnJobPaused", "resumed": "OnJobResumed", "host_down": "OnHostDown",
-         "host_up": "OnHostUp", "critical_disk": "OnCriticalDisk"}
+         "host_up": "OnHostUp", "critical_disk": "OnCriticalDisk", "adjust": "OnJobAdjusted"}
 # job fields that travel server -> host, with defaults
 # stall: None = derived from expect once the job reports a total, 0 = off
+# gpus: GPUs claimed (a share of one below 1, else a whole count); vram_mb: per GPU, 0 = the claimed share of its memory
+# adjust: 0 = keep the claims as submitted (no fitting to measured usage)
 SPEC = dict(name=None, cmd=None, cwd=None, env=None, prio=0, cpus=1, mem_mb=0, timeout=0, retries=0,
             retry_on="error,lost", retry_delay=30, created=None, expect=0, stall=None, stall_on_log=0, trace_lines=0, work=0,
-            owner=None, origin=None)  # owner: who submitted (owner_origin); origin: JSON of where from
+            owner=None, origin=None, gpus=0, vram_mb=0, adjust=1)  # owner: who submitted (owner_origin); origin: JSON of where from
 PROGRESS_EVERY = 30  # seconds: a changed checkpoint becomes a `progress` event at most this often
 DISK_MIN_GB = 2  # free space on ~ or /tmp below this is critical (OnCriticalDisk)
 DISK_REWARN_S = 3600  # while a path stays critical, re-emit the event at most this often
@@ -158,7 +161,10 @@ def compress_log(jid):
         pass  # no log, or compression failed: the plain log stays
 
 
-def log_tail(jid, n=2000):
+TAIL_BYTES = 2000  # the end of the log a job's final event carries
+
+
+def log_tail(jid, n=TAIL_BYTES):
     """Last n bytes of a job's log, live (plain) or finished (zstd)."""
     path, buf = P("logs", jid + ".log"), b""
     try:
@@ -212,7 +218,8 @@ CREATE TABLE IF NOT EXISTS jobs(
   state TEXT, attempt INT DEFAULT 0, not_before REAL DEFAULT 0, cores TEXT, pid INT, rc INT,
   started REAL, ended REAL, peak_mb INT, cancel INT DEFAULT 0, force INT DEFAULT 0,
   expect REAL DEFAULT 0, stall REAL, stall_on_log INT DEFAULT 0, progress TEXT, beat REAL, trace_lines INT DEFAULT 0,
-  pause INT DEFAULT 0, paused_at REAL, paused_s REAL DEFAULT 0, work INT DEFAULT 0, owner TEXT, origin TEXT);
+  pause INT DEFAULT 0, paused_at REAL, paused_s REAL DEFAULT 0, work INT DEFAULT 0, owner TEXT, origin TEXT,
+  gpus REAL DEFAULT 0, vram_mb INT DEFAULT 0, adjust INT DEFAULT 1, gpu TEXT, mem_claim INT);
 CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(state, prio DESC, created);
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, job TEXT, kind TEXT, data TEXT);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
@@ -226,7 +233,8 @@ def hdb():
                       ("expect", "REAL DEFAULT 0"), ("stall", "REAL"), ("stall_on_log", "INT DEFAULT 0"),  # and these
                       ("progress", "TEXT"), ("beat", "REAL"), ("trace_lines", "INT DEFAULT 0"),
                       ("pause", "INT DEFAULT 0"), ("paused_at", "REAL"), ("paused_s", "REAL DEFAULT 0"), ("work", "INT DEFAULT 0"),
-                      ("owner", "TEXT"), ("origin", "TEXT")):
+                      ("owner", "TEXT"), ("origin", "TEXT"),
+                      ("gpus", "REAL DEFAULT 0"), ("vram_mb", "INT DEFAULT 0"), ("adjust", "INT DEFAULT 1"), ("gpu", "TEXT"), ("mem_claim", "INT")):
         if col not in have:
             try:
                 db.execute("ALTER TABLE jobs ADD COLUMN %s %s" % (col, decl))
@@ -275,14 +283,227 @@ def used_cores(db):
     return used
 
 
+GPU_STEP = 0.05  # GPU shares are fitted to usage in steps of 5% of one GPU
+MEM_STEP = 100  # MB: RAM and VRAM claims are fitted to usage in steps of this
+EPS = 1e-6  # float slack when comparing GPU shares (0.1 + 0.2 must fit in 0.3)
+_gpu_inv = [0.0, {}, {}]  # (when, {index: memory MB}, {index: its PCI-local CPUs}): nvidia-smi is too slow to ask every second
+
+
+def nvidia_smi(*args):
+    """nvidia-smi's output, or '' where there is none or it fails."""
+    if not shutil.which("nvidia-smi"):
+        return ""
+    try:
+        return subprocess.run(["nvidia-smi", *args], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def gpu_inventory(cfg):
+    """{index: memory MB} of the GPUs jobs may claim: every NVIDIA GPU, or only config `gpus` ("0-1", "" = none).
+    Asked of nvidia-smi at most once a minute."""
+    if time.time() - _gpu_inv[0] > 60:
+        inv, local = {}, {}
+        for line in nvidia_smi("--query-gpu=index,memory.total,pci.bus_id", "--format=csv,noheader,nounits").splitlines():
+            f = [x.strip() for x in line.split(",")]
+            if len(f) == 3 and f[0].isdigit() and f[1].isdigit():
+                inv[int(f[0])] = int(f[1])
+                dom, _, rest = f[2].lower().partition(":")  # nvidia-smi: 00000000:09:00.0, sysfs: 0000:09:00.0
+                with contextlib.suppress(OSError, ValueError):
+                    with open("/sys/bus/pci/devices/%s:%s/local_cpulist" % (dom[-4:], rest)) as fh:
+                        local[int(f[0])] = set(parse_cores(fh.read().strip()))
+        _gpu_inv[:] = [time.time(), inv, local]
+    inv = _gpu_inv[1]
+    if cfg.get("gpus") is not None:
+        allowed = set(parse_cores(cfg["gpus"])) if cfg["gpus"] else set()
+        inv = {i: m for i, m in inv.items() if i in allowed}
+    return inv
+
+
+def gpu_local_cpus(index):
+    """The CPUs on the same NUMA node / PCIe root as GPU index (all of them on single-socket desktops), or None."""
+    return _gpu_inv[2].get(index)
+
+
+_topo = [0.0, None, {}]  # (when, the CPU set it covers, topology)
+
+
+def cpu_topology(cfg):
+    """{cpu: (physical core, L3 group, speed rank)} for the CPUs jobs may use, from sysfs (Linux): the core is its
+    lowest SMT sibling, the L3 group the lowest CPU sharing its last-level cache (an AMD CCX/CCD), the rank
+    amd_pstate's preferred-core ranking, else cpu_capacity (big.LITTLE, Intel P/E cores), else the top clock.
+    {} where sysfs says nothing (macOS, some VMs): every CPU is then its own core in one group, as before.
+    Re-read every 10 minutes."""
+    cores = tuple(host_cores(cfg))
+    if _topo[1] == cores and time.time() - _topo[0] < 600:
+        return _topo[2]
+    base, out = "/sys/devices/system/cpu/cpu%d/", {}
+    read = lambda path: open(path).read().strip()
+    for c in cores:
+        try:
+            core = min(parse_cores(read(base % c + "topology/thread_siblings_list")))
+        except (OSError, ValueError):
+            out = {}
+            break
+        l3 = None
+        for idx in sorted(glob.glob(base % c + "cache/index*")):
+            with contextlib.suppress(OSError, ValueError):
+                if read(idx + "/level") == "3" or l3 is None:
+                    l3 = min(parse_cores(read(idx + "/shared_cpu_list")))
+        rank = 0
+        for name in ("cpufreq/amd_pstate_prefcore_ranking", "cpu_capacity", "cpufreq/cpuinfo_max_freq"):
+            with contextlib.suppress(OSError, ValueError):
+                rank = int(read(base % c + name))
+                break
+        out[c] = (core, l3 if l3 is not None else 0, rank)
+    _topo[:] = [time.time(), cores, out]
+    return out
+
+
+def cpu_list(cpus):
+    """[0, 1, 2, 12, 13] -> '0-2,12-13'"""
+    out, run = [], []
+    for c in sorted(cpus):
+        if run and c == run[-1] + 1:
+            run.append(c)
+        else:
+            run and out.append(run)
+            run = [c]
+    run and out.append(run)
+    return ",".join("%d-%d" % (r[0], r[-1]) if len(r) > 1 else "%d" % r[0] for r in out)
+
+
+def pick_cores(need, free, topo, fast=True, pack=True, local=None):
+    """Which of the free CPUs a job of `need` CPUs gets, greedily (no solver), best first:
+    1. distinct physical cores that are wholly free (no other job on a sibling thread), from as few L3 groups as
+       possible: the group that fits the job most tightly (pack), or the fastest group that fits (not pack: GPU jobs,
+       whose feeder threads want fast cores and an L3 of their own); a job bigger than any group takes whole groups first;
+    2. then the other threads of the cores it took (it shares a core with itself);
+    3. last, threads on cores another job already uses.
+    fast: the faster cores first (a group's speed is its best core's rank), else the slower ones (CPU-only jobs on a GPU
+    host leave the fast cores to GPU jobs). local: the CPUs near the job's GPU, used if enough of them are free.
+    Without topology every CPU is a core of its own in one group: the free CPUs in order, as before."""
+    free = list(free)
+    idle = set(free)  # whether a core is wholly free is judged on every free CPU, not just the ones near the GPU
+    if local:
+        near = [c for c in free if c in local]
+        if len(near) >= need:
+            free = near
+    need = min(need, len(free))
+    info = lambda c: topo.get(c) or (("cpu", c), 0, 0)
+    fs, members = set(free), {}
+    for c in set(topo) | idle:
+        members.setdefault(info(c)[0], []).append(c)
+    sign = -1 if fast else 1
+    order = lambda c: (sign * info(c)[2], c)
+    whole = {k: min((x for x in m if x in fs), key=order) for k, m in members.items() if all(x in idle for x in m) and any(x in fs for x in m)}
+    groups = {}
+    for k, first in whole.items():
+        groups.setdefault(info(first)[1], []).append(first)
+    for g in groups.values():
+        g.sort(key=order)
+    speed = {g: sign * max(info(c)[2] for c in cs) for g, cs in groups.items()}
+    picked, left = [], need
+    while left and groups:
+        fits = [g for g in groups if len(groups[g]) >= left]
+        if fits:  # the rest fits in one group
+            g = min(fits, key=lambda g: (len(groups[g]), speed[g], g) if pack else (speed[g], len(groups[g]), g))
+            picked += groups.pop(g)[:left]
+            break
+        g = min(groups, key=lambda g: (-len(groups[g]), speed[g], g))  # too big for any group: whole groups, largest first
+        picked += groups[g]
+        left -= len(groups.pop(g))
+    used_groups = {info(c)[1] for c in picked}
+    own = sorted((c for c in fs if c not in picked and info(c)[0] in {info(p)[0] for p in picked}), key=order)
+    rest = sorted((c for c in fs if c not in picked and c not in own), key=lambda c: (info(c)[1] not in used_groups, order(c)))
+    return (picked + own + rest)[:need]
+
+
+def shrink_cores(mine, want, topo, busy):
+    """The `want` CPUs a job keeps of `mine` when its core claim is cut: one thread per physical core before both
+    threads of one, in the L3 groups it used most, its busiest cores first. busy: {cpu: busy ticks in the window}."""
+    info = lambda c: topo.get(c) or (("cpu", c), 0, 0)
+    group_use, by_core = {}, {}
+    for c in mine:
+        group_use[info(c)[1]] = group_use.get(info(c)[1], 0) + busy.get(c, 0)
+        by_core.setdefault(info(c)[0], []).append(c)
+    threads = [sorted(cs, key=lambda c: (-busy.get(c, 0), c)) for cs in by_core.values()]
+    threads.sort(key=lambda cs: (-group_use[info(cs[0])[1]], -sum(busy.get(c, 0) for c in cs), cs[0]))
+    keep = [cs[0] for cs in threads][:want]
+    keep += sorted((c for cs in threads for c in cs[1:]), key=lambda c: (-group_use[info(c)[1]], -busy.get(c, 0), c))[:want - len(keep)]
+    return sorted(keep)
+
+
+def host_mem_mb(cfg):
+    """RAM that -m claims may add up to: config `mem` ("120G"), else the machine's physical memory; None if unknown."""
+    if cfg.get("mem"):
+        return size(cfg["mem"])
+    try:
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") >> 20
+    except (OSError, ValueError):
+        return None
+
+
+def gpu_claims(db):
+    """{GPU index: [share, VRAM MB]} claimed by running and paused jobs (a paused job keeps its GPU memory)."""
+    out = {}
+    for r in db.execute("SELECT gpu FROM jobs WHERE state IN ('running','paused') AND gpu IS NOT NULL"):
+        for idx, share, vram in json.loads(r[0]):
+            c = out.setdefault(idx, [0.0, 0])
+            c[0] += share
+            c[1] += vram
+    return out
+
+
+def mem_claimed(db):
+    return db.execute("SELECT coalesce(sum(mem_claim),0) FROM jobs WHERE state IN ('running','paused')").fetchone()[0]
+
+
+def gpu_free(db, inv):
+    """{index: [free share, free VRAM MB, total VRAM MB]} of the claimable GPUs."""
+    claims = gpu_claims(db)
+    return {i: [1.0 - claims.get(i, [0, 0])[0], total - claims.get(i, [0, 0])[1], total] for i, total in inv.items()}
+
+
+def gpu_vram(want, vram_mb, total):
+    """VRAM a claim takes on one GPU of total MB: --vram, else the claimed share of the GPU's memory; never more than it has."""
+    return min(vram_mb or round(min(want, 1.0) * total), total)
+
+
+def fit_gpus(want, vram_mb, free, force=False):
+    """GPUs for a claim, picked greedily (no solver) from free = {index: [free share, free VRAM, total VRAM]}.
+    A share below 1 goes to the first GPU by index with that much share and VRAM left, so small claims pack together
+    and whole GPUs stay whole; N GPUs take the first N that no job claims any of. Returns [[index, share, VRAM MB]],
+    or None if it does not fit now. force: the least claimed GPUs, fit or not."""
+    if not free:
+        return None
+    n = 1 if want < 1 else min(int(round(want)), len(free))
+    share = min(want, 1.0)
+    if force:
+        picked = sorted(free, key=lambda i: (-free[i][0], i))[:n]
+    else:
+        picked = [i for i in sorted(free) if free[i][0] >= share - EPS and free[i][1] >= gpu_vram(want, vram_mb, free[i][2])][:n]
+        if len(picked) < n:
+            return None
+    return [[i, share, gpu_vram(want, vram_mb, free[i][2])] for i in picked]
+
+
+def take_gpus(free, gpu):
+    for i, share, vram in gpu or ():
+        free[i][0] -= share
+        free[i][1] -= vram
+
+
 def check_cfg(cfg):
     """Reject a config that would break the agent before it reaches disk."""
     if not isinstance(cfg, dict):
         raise Fail("config must be a JSON object")
-    try:
-        host_cores(cfg)
-    except (AttributeError, TypeError, ValueError) as e:
-        raise Fail("bad config cores: %s" % e)
+    for key, check in (("cores", host_cores), ("gpus", lambda c: c.get("gpus") and parse_cores(c["gpus"])),
+                       ("mem", lambda c: c.get("mem") and size(c["mem"])), ("slack", slack)):
+        try:
+            check(cfg)
+        except (AttributeError, TypeError, ValueError) as e:
+            raise Fail("bad config %s: %s" % (key, e))
     return cfg
 
 
@@ -303,7 +524,7 @@ def edit_cfg(cfg, label, put, run=subprocess.call):
     fd, path = tempfile.mkstemp(prefix="tshed-config-", suffix=".json")
     with os.fdopen(fd, "w") as f:
         f.write("// tshed config - edit and save; // lines are ignored\n"
-                "// keys: name, cores (e.g. \"0-15\"), home ({\"dest\",\"cmd\"} or null)\n")
+                "// keys: name, cores (e.g. \"0-15\"), home ({\"dest\",\"cmd\"} or null), gpus (\"0-1\"), mem (\"120G\"), slack (0.2)\n")
         json.dump(cfg, f, indent=2, sort_keys=True)
         f.write("\n")
     with open(path) as f:
@@ -358,7 +579,7 @@ def finish(db, jid, kind, rc=None, peak_mb=None, **extra):
     if j["cancel"] and kind != "done":
         kind = "cancelled"
     now = time.time()
-    cols = dict(state=kind, rc=rc, ended=now, pid=None, cores=None, peak_mb=peak_mb)
+    cols = dict(state=kind, rc=rc, ended=now, pid=None, cores=None, gpu=None, mem_claim=None, peak_mb=peak_mb)
     final = not (kind in FAILURES and kind in j["retry_on"].split(",") and j["attempt"] <= j["retries"])
     if not final:
         cols.update(state="queued", not_before=now + j["retry_delay"] * 2 ** (j["attempt"] - 1))
@@ -374,12 +595,13 @@ def events_after(db, after, limit=500):
 
 # ───────────────────────────────────────────────────────────────── host: watchdog (one per running job)
 
-def session_usage(sids):
+def session_usage(sids, swap=False):
     """{sid: [RSS MB, CPU seconds]} summed over every process whose session id is in sids (shared
     pages counted per process). Linux CPU includes reaped children (cutime/cstime); macOS sees only
-    live processes and groups by process group (== session leader pid for our jobs)."""
+    live processes and groups by process group (== session leader pid for our jobs).
+    swap: also [..., swapped-out MB] (Linux VmSwap; 0 elsewhere): memory the job holds that RSS misses."""
     sids = {str(s) for s in sids}
-    out = {s: [0, 0.0] for s in sids}
+    out = {s: [0, 0.0, 0] for s in sids}
     if not sids:
         return out
     if os.path.isdir("/proc/self"):
@@ -394,9 +616,12 @@ def session_usage(sids):
                         u = out[fields[3]]
                         u[0] += int(fields[21]) * page
                         u[1] += sum(int(x) for x in fields[11:15]) / hz
+                        if swap:
+                            with open("/proc/%s/status" % pid) as f:
+                                u[2] += next((int(l.split()[1]) for l in f if l.startswith("VmSwap:")), 0) << 10
                 except (OSError, IndexError, ValueError):
                     pass
-        return {k: [int(v[0]) >> 20, v[1]] for k, v in out.items()}
+        return {k: [int(v[0]) >> 20, v[1]] + ([int(v[2]) >> 20] if swap else []) for k, v in out.items()}
     try:  # macOS / BSD: fall back to the process group
         ps = subprocess.run(["ps", "-axo", "pgid=,rss=,time="], capture_output=True, text=True, timeout=10).stdout
         for line in ps.splitlines():
@@ -411,7 +636,7 @@ def session_usage(sids):
                 u[1] += secs + int(d or 0) * 86400
     except (OSError, ValueError, IndexError, subprocess.SubprocessError):
         pass
-    return {k: [int(v[0]) >> 10, v[1]] for k, v in out.items()}
+    return {k: [int(v[0]) >> 10, v[1]] + ([0] if swap else []) for k, v in out.items()}
 
 
 def session_rss_mb(sids):
@@ -425,9 +650,10 @@ def tree_rss_mb(sid):
 
 def job_usage(db):
     """Live usage of running jobs: ({id: [CPU% of its assigned cores or None, RSS MB]}, summed RSS MB,
-    sum of their -m limits MB or None if any running job set no -m). CPU% = CPU-seconds delta since
+    sum of their RAM claims MB (-m, or what it was fitted to) or None if any set no -m). CPU% = CPU-seconds delta since
     the previous status() call / (elapsed * cores assigned); the baseline lives in host.db meta."""
-    rows = db.execute("SELECT id, pid, cores, cpus, mem_mb FROM jobs WHERE state IN ('running','paused')").fetchall()  # paused: RAM still held
+    rows = db.execute("SELECT id, pid, cores, cpus, coalesce(mem_claim, mem_mb) AS mem_mb FROM jobs "
+                      "WHERE state IN ('running','paused')").fetchall()  # paused: RAM still held
     reserved = None if any(not r["mem_mb"] for r in rows) else sum(r["mem_mb"] for r in rows)
     use = session_usage({r["pid"] for r in rows if r["pid"]})
     now = time.time()
@@ -541,7 +767,10 @@ def run_job(jid):
     signal.signal(signal.SIGTERM, lambda *a: stop.append(1))
     logp, prog, trace = P("logs", jid + ".log"), P("run", jid + ".progress"), P("run", jid + ".where")
     log = open(logp, "ab")
-    log.write(("=== tshed %s attempt %d cores=%s %s ===\n" % (jid, j["attempt"], j["cores"], time.strftime("%F %T"))).encode())
+    gpu = json.loads(j["gpu"]) if j["gpu"] else []
+    gpu_ids = ",".join(str(g) for g, _, _ in gpu)
+    log.write(("=== tshed %s attempt %d cores=%s%s %s ===\n" % (jid, j["attempt"], j["cores"], " gpus=" + gpu_ids if gpu else "",
+                                                             time.strftime("%F %T"))).encode())
     log.flush()
     with contextlib.suppress(OSError):  # a new attempt starts without checkpoints or traces
         os.remove(prog)
@@ -551,6 +780,8 @@ def run_job(jid):
         cmd = ["taskset", "-c", j["cores"]] + cmd
     env = dict(os.environ, **json.loads(j["env"] or "{}"))
     env.update(TINYSHED_JOB=jid, TINYSHED_ATTEMPT=str(j["attempt"]), TINYSHED_CORES=j["cores"] or "", TINYSHED_PROGRESS=prog)
+    if gpu:  # its GPUs, numbered as nvidia-smi numbers them (PCI bus order, not CUDA's default fastest-first)
+        env.update(CUDA_DEVICE_ORDER="PCI_BUS_ID", CUDA_VISIBLE_DEVICES=gpu_ids, TINYSHED_GPUS=gpu_ids)
     if j["owner"]:  # a job that submits jobs submits them as its own owner
         env["TINYSHED_OWNER"] = j["owner"]
     with contextlib.suppress(OSError):
@@ -701,39 +932,319 @@ def reconcile(db):
 
 
 def schedule(db, cfg, kids):
-    """Strict priority order: highest prio first, FIFO within a priority; no backfilling past a job that does not fit.
-    Forced jobs (`tshed edit --force`) go first and start at once: idle cores first, then they share busy ones."""
+    """Strict priority order over cores, RAM (-m) and GPUs (-g, --vram): highest prio first, FIFO within a priority.
+    A job that does not fit is never overtaken on what it waits for: it holds back the free cores and RAM it needs and,
+    while its GPUs are not free, no job behind it gets a GPU. Jobs behind it may use what is left over.
+    Forced jobs (`tshed edit --force`) go first and start at once: idle cores first, then they share busy ones;
+    RAM and GPUs are overcommitted if need be."""
     cores = host_cores(cfg)
     used = used_cores(db)
     free = [c for c in cores if c not in used]
-    for j in db.execute("SELECT id, cpus, force, state FROM jobs WHERE cancel=0 AND ((state='queued' AND (force=1 OR not_before<=?)) "
-                        "OR (state='paused' AND pause=0)) ORDER BY force DESC, prio DESC, created, id", (time.time(),)).fetchall():
+    ram = host_mem_mb(cfg)
+    ram_free = ram - mem_claimed(db) if ram else None
+    inv = gpu_inventory(cfg)
+    gfree, gpu_blocked, topo = gpu_free(db, inv), False, cpu_topology(cfg)
+
+    def pick(n, gpu_job, gpu=None):  # GPU jobs: the fastest cores near their GPU; CPU jobs: packed, slow end first on GPU hosts
+        local = set.union(*[gpu_local_cpus(g) or set(cores) for g, _, _ in gpu]) if gpu else None
+        return pick_cores(n, free, topo, fast=gpu_job or not inv, pack=not gpu_job, local=local)
+    for j in db.execute("SELECT id, cpus, mem_mb, gpus, vram_mb, force, state FROM jobs WHERE cancel=0 AND ((state='queued' AND "
+                        "(force=1 OR not_before<=?)) OR (state='paused' AND pause=0)) ORDER BY force DESC, prio DESC, created, id",
+                        (time.time(),)).fetchall():
         need = min(max(1, j["cpus"]), len(cores))
-        if need > len(free) and not j["force"]:
-            break
-        if j["state"] == "paused":  # resume: its watchdog is alive (holds the lock); it re-pins and continues the job
-            mine = free[:need]
-            free = free[need:]
+        if j["state"] == "paused":  # resume: it kept its RAM and GPUs; its watchdog (holding the lock) re-pins and continues it
+            held = db.execute("SELECT gpu FROM jobs WHERE id=?", (j["id"],)).fetchone()[0]
+            mine = pick(need, bool(j["gpus"]), json.loads(held) if held else None)
+            free = [c for c in free if c not in mine]
+            if len(mine) < need:  # not enough: the cores it got are held back for it
+                continue
             with tx(db):
                 n = db.execute("UPDATE jobs SET state='running', cores=?, paused_s=coalesce(paused_s,0)+?-paused_at, paused_at=NULL "
                                "WHERE id=? AND state='paused' AND pause=0 AND cancel=0",
-                               (",".join(map(str, mine)), time.time(), j["id"])).rowcount
+                               (",".join(map(str, sorted(mine))), time.time(), j["id"])).rowcount
                 ev = emit(db, j["id"], "resumed") if n else None
             if ev:
                 fire(ev)
+            continue
+        mem = min(j["mem_mb"] or 0, ram) if ram else 0
+        gpu = None
+        if j["gpus"]:
+            if not inv:  # never runs here (no GPUs, or none allowed): it waits without holding anything back
+                continue
+            if j["force"] or not gpu_blocked:
+                gpu = fit_gpus(j["gpus"], j["vram_mb"], gfree, force=bool(j["force"]))
+        fits = need <= len(free) and (ram_free is None or mem <= ram_free) and (not j["gpus"] or gpu is not None)
+        if not fits and not j["force"]:  # hold back what it needs; it starts once all of it is there
+            held = pick(need, bool(j["gpus"]), gpu)
+            free = [c for c in free if c not in held]
+            if ram_free is not None:
+                ram_free = max(0, ram_free - mem)
+            if gpu:
+                take_gpus(gfree, gpu)
+            elif j["gpus"]:
+                gpu_blocked = True
             continue
         f = try_lock(P("run", j["id"] + ".lock"))
         if not f:  # previous attempt's watchdog is still exiting
             continue
         with f:
-            mine = (free + [c for c in cores if c not in free])[:need]
+            mine = pick(need, bool(j["gpus"]), gpu)
+            mine += [c for c in cores if c not in free][:need - len(mine)]  # forced: busy cores make up the rest
             free = [c for c in free if c not in mine]
             with tx(db):
-                n = db.execute("UPDATE jobs SET state='running', attempt=attempt+1, cores=?, started=?, ended=NULL, rc=NULL, pid=NULL, "
-                               "force=0, pause=0, paused_at=NULL, paused_s=0 WHERE id=? AND state='queued' AND cancel=0",
-                               (",".join(map(str, mine)), time.time(), j["id"])).rowcount
+                n = db.execute("UPDATE jobs SET state='running', attempt=attempt+1, cores=?, gpu=?, mem_claim=?, started=?, ended=NULL, "
+                               "rc=NULL, pid=NULL, force=0, pause=0, paused_at=NULL, paused_s=0 WHERE id=? AND state='queued' AND cancel=0",
+                               (",".join(map(str, sorted(mine))), json.dumps(gpu) if gpu else None, mem or None, time.time(), j["id"])).rowcount
             if n:  # the watchdog inherits the held lock
+                if ram_free is not None:
+                    ram_free -= mem
+                take_gpus(gfree, gpu)
                 kids.append(detach(["_run", j["id"]], pass_fds=[f.fileno()]))
+
+
+ADJUST_EVERY = 2  # s between usage samples of running jobs
+ADJUST_WINDOW = 120  # s of samples after which a job's claims are fitted to its peak usage
+ADJUST_SETTLE = 10  # s after an adjustment before sampling resumes (migrated threads, refilled caches)
+ADJUST_MIN_SAMPLES = 10  # a window with fewer samples (a busy or restarted agent) decides nothing
+SLACK = 0.2  # default headroom (config `slack`): a claim is fitted to peak / (1 - slack)
+GPU_SEEN_MB = 256  # a job counts as using its GPU once it holds this much VRAM there (a CUDA context) or any utilization
+
+
+def slack(cfg):
+    v = cfg.get("slack")
+    v = SLACK if v is None else float(v)
+    if not 0 <= v < 1:
+        raise ValueError("slack must be at least 0 and below 1")
+    return v
+
+
+def ceil_step(x, step):
+    return math.ceil(x / step - 1e-9) * step
+
+
+def pid_sids(pids):
+    """{pid: its session id as a string} (Linux; elsewhere its process group, as session_usage)."""
+    out = {}
+    if os.path.isdir("/proc/self"):
+        for pid in pids:
+            with contextlib.suppress(OSError, IndexError):
+                with open("/proc/%d/stat" % pid) as f:
+                    out[pid] = f.read().rsplit(")", 1)[1].split()[3]
+        return out
+    with contextlib.suppress(OSError, ValueError, subprocess.SubprocessError):
+        ps = subprocess.run(["ps", "-axo", "pid=,pgid="], capture_output=True, text=True, timeout=10).stdout
+        for line in ps.splitlines():
+            p = line.split()
+            if len(p) == 2 and int(p[0]) in pids:
+                out[int(p[0])] = p[1]
+    return out
+
+
+def gpu_procs():
+    """What nvidia-smi says about each GPU and each process on one: ({index: [util %, memory used MB]},
+    [[pid, session id, GPU index, VRAM MB, SM % or None]]). Per-process SM % comes from `nvidia-smi pmon`
+    (about a second; None where the GPU or driver does not report it)."""
+    num = lambda x: int(x) if x.isdigit() else None
+    gpus, by_uuid, mem, sm = {}, {}, {}, {}
+    for line in nvidia_smi("--query-gpu=index,uuid,utilization.gpu,memory.used", "--format=csv,noheader,nounits").splitlines():
+        f = [x.strip() for x in line.split(",")]
+        if len(f) == 4 and f[0].isdigit():
+            gpus[int(f[0])], by_uuid[f[1]] = [num(f[2]), num(f[3])], int(f[0])
+    if not gpus:
+        return {}, []
+    for line in nvidia_smi("--query-compute-apps=pid,gpu_uuid,used_memory", "--format=csv,noheader,nounits").splitlines():
+        f = [x.strip() for x in line.split(",")]
+        if len(f) == 3 and f[0].isdigit() and f[1] in by_uuid:
+            key = (int(f[0]), by_uuid[f[1]])
+            mem[key] = mem.get(key, 0) + (num(f[2]) or 0)
+    for line in nvidia_smi("pmon", "-c", "1", "-s", "u").splitlines():  # gpu pid type sm mem enc dec … command
+        f = line.split()
+        if len(f) >= 4 and not line.startswith("#") and f[0].isdigit() and f[1].isdigit():
+            sm[(int(f[1]), int(f[0]))] = num(f[3])
+    sids = pid_sids({pid for pid, _ in set(mem) | set(sm)})
+    return gpus, [[pid, sids.get(pid), g, mem.get((pid, g), 0), sm.get((pid, g))] for pid, g in sorted(set(mem) | set(sm))]
+
+
+def job_gpu_usage(jobs, gpus, procs, holders=None):
+    """{job id: {GPU index: [util % or None, VRAM MB]}} from a gpu_procs() sample; jobs = {id: (session id, its GPU
+    assignment)}, holders = {GPU index: how many jobs claim it} (default: counted from jobs). A job's use is what its
+    processes do; a process pmon shows '-' for is idle, if pmon reports SM % for any process on that GPU. Where the
+    GPU's own readings can only be the job's (it alone claims the GPU and no other process loads it), they stand in
+    for what nvidia-smi cannot say per process: inside a container it sees no pids, some GPUs report no SM %.
+    Otherwise the job's utilization there stays None and its GPU share is not fitted."""
+    by_sid = {str(sid): jid for jid, (sid, _) in jobs.items()}
+    out, seen, measured, load = {}, set(), set(), {}  # load: GPU -> jobs (None = not tshed's) whose processes use it
+    for pid, sid, g, mb, pct in procs:
+        seen.add(g)
+        jid = by_sid.get(str(sid))
+        if pct is not None:
+            measured.add(g)  # pmon reports SM % on this GPU: a process it shows '-' for did not run a kernel
+        if (pct or 0) > 0 or mb >= GPU_SEEN_MB:
+            load.setdefault(g, set()).add(jid)
+        if jid is None:
+            continue
+        u = out.setdefault(jid, {}).setdefault(g, [None, 0])
+        u[1] += mb
+        if pct is not None:
+            u[0] = (u[0] or 0) + pct
+    claimants = {}
+    for jid, (_, gpu) in jobs.items():
+        for g, _, _ in gpu:
+            claimants.setdefault(g, []).append(jid)
+    for g, js in claimants.items():
+        alone = len(js) == 1 and (holders or {}).get(g, 1) == 1 and g in gpus and load.get(g, set()) <= {js[0]}
+        u = out.get(js[0], {}).get(g) if len(js) == 1 else None
+        if u is None and g not in seen and alone:  # nothing visible on this GPU (a container): its readings are the job's
+            out.setdefault(js[0], {})[g] = list(gpus[g])
+        for jid in js:
+            u = out.get(jid, {}).get(g)
+            if u is not None and u[0] is None:
+                if g in measured:  # idle in pmon's sample
+                    u[0] = 0
+                elif alone:  # no per-process SM % here, and nothing else loads this GPU: the GPU's is the job's
+                    u[0] = gpus[g][0]
+    return out
+
+
+def sample_gpus_bg(st):
+    """Take a GPU sample in a thread (pmon blocks for a second); adjust() uses the latest one."""
+    if st.get("gpu_busy"):
+        return
+    st["gpu_busy"] = True
+
+    def go():
+        try:
+            st["gpu"] = (time.time(),) + gpu_procs()
+        except Exception:
+            traceback.print_exc()
+        finally:
+            st["gpu_busy"] = False
+    threading.Thread(target=go, daemon=True).start()
+
+
+def fitted(peak, step, floor):
+    return max(floor, ceil_step(peak, step))
+
+
+def adjust(db, cfg, st, ticks=None):
+    """Fit running jobs' claims to what they use. Every ADJUST_EVERY s each job's CPU (cores busy), RSS and, per GPU,
+    utilization and VRAM are sampled; after ADJUST_WINDOW s each claim larger than peak / (1 - slack) is cut to that:
+    cores (re-pinned, keeping the cores the job used most), RAM and VRAM (in MEM_STEP MB) and GPU share (in GPU_STEP).
+    Then the peaks restart, ADJUST_SETTLE s later. RAM and VRAM claims also grow back as soon as use passes them, up
+    to what was submitted; cores and GPU share only shrink. A job submitted with --no-adjust is left alone."""
+    now = time.time()
+    if now - st.get("at", 0) < ADJUST_EVERY:
+        return
+    st["at"] = now
+    win = st.setdefault("jobs", {})
+    rows = {r["id"]: r for r in db.execute("SELECT id, pid, cores, cpus, mem_mb, mem_claim, gpus, vram_mb, gpu, paused_s "
+                                            "FROM jobs WHERE state='running' AND pid IS NOT NULL AND adjust=1")}
+    for jid in [k for k in win if k not in rows]:
+        del win[jid]
+    if not rows:
+        return
+    if any(r["gpu"] for r in rows.values()):
+        sample_gpus_bg(st)
+    use = session_usage({r["pid"] for r in rows.values()}, swap=True)
+    gsample = st.get("gpu")
+    fresh = gsample and gsample[0] > st.get("gpu_used", 0) and now - gsample[0] < 30
+    if fresh:
+        st["gpu_used"] = gsample[0]
+        claims = {jid: (r["pid"], json.loads(r["gpu"])) for jid, r in rows.items() if r["gpu"]}
+        holders = {}  # every job holding a GPU counts, --no-adjust and paused ones too
+        for (gpu,) in db.execute("SELECT gpu FROM jobs WHERE state IN ('running','paused') AND gpu IS NOT NULL"):
+            for g in {x[0] for x in json.loads(gpu)}:
+                holders[g] = holders.get(g, 0) + 1
+        gpu_use = job_gpu_usage(claims, gsample[1], gsample[2], holders)
+    else:
+        gpu_use = {}
+    try:
+        k = slack(cfg)
+    except (TypeError, ValueError):  # a hand-edited config.json: keep fitting with the default
+        k = SLACK
+    inv = gpu_inventory(cfg) if any(r["gpu"] for r in rows.values()) else {}
+    for jid, r in rows.items():
+        rss, cpu_s, swapped = use.get(str(r["pid"]), [0, 0.0, 0])
+        rss += swapped  # what the job holds: with zram, swapped pages still take RAM, and they come back when touched
+        w = win.get(jid)
+        if not w or w["key"] != (r["pid"], r["paused_s"]):  # new, restarted or resumed since: a fresh window
+            win[jid] = dict(key=(r["pid"], r["paused_s"]), start=now, skip=0, prev=(now, cpu_s), cpu=0.0, rss=0, gpu={}, vram={},
+                            n=0, ticks=None)
+            continue
+        (t0, c0), w["prev"] = w["prev"], (now, cpu_s)
+        rate = max(0.0, (cpu_s - c0) / (now - t0)) if 0.5 <= now - t0 <= 300 else None  # cores busy since the last sample
+        gpu = json.loads(r["gpu"]) if r["gpu"] else []
+        g_use = gpu_use.get(jid, {})
+        grow = {}  # memory claims follow use upwards at once, up to what was submitted
+        if r["mem_claim"] and rss > r["mem_claim"]:
+            want = min(r["mem_mb"], fitted(rss / (1 - k), MEM_STEP, MEM_STEP))
+            if want > r["mem_claim"]:
+                grow["mem_claim"] = want
+        new = []
+        for g, share, vram in gpu:
+            used = g_use.get(g, [None, 0])[1]
+            if used > vram:
+                vram = max(vram, min(gpu_vram(r["gpus"], r["vram_mb"], inv.get(g, vram)), fitted(used / (1 - k), MEM_STEP, MEM_STEP)))
+            new.append([g, share, vram])
+        if new != gpu:
+            grow["gpu"] = json.dumps(new)
+        if grow:
+            set_claims(db, jid, r, "grow", grow, dict(rss_mb=rss, vram_mb={g: u[1] for g, u in g_use.items()}))
+            continue  # the row changed under this window: read it afresh next time
+        if now < w["skip"]:
+            continue
+        if w["ticks"] is None:  # per-core counters at the window's start: which of its cores the job used
+            w["ticks"] = ticks = ticks if ticks is not None else per_core_ticks()
+        if rate is not None:
+            w["cpu"] = max(w["cpu"], rate)
+        w["rss"] = max(w["rss"], rss)
+        for g, (pct, mb) in g_use.items():
+            if pct is not None:
+                w["gpu"][g] = max(w["gpu"].get(g, 0), pct)
+            w["vram"][g] = max(w["vram"].get(g, 0), mb)
+        w["n"] += 1
+        if now - w["start"] < ADJUST_WINDOW:
+            continue
+        if w["n"] >= ADJUST_MIN_SAMPLES:
+            upd = {}
+            mine = parse_cores(r["cores"]) if r["cores"] else []
+            want = max(1, math.ceil(w["cpu"] / (1 - k) - 1e-9))
+            if want < len(mine):
+                ticks = ticks if ticks is not None else per_core_ticks()
+                d = lambda c, i: ticks.get(c, [0, 0])[i] - w["ticks"].get(c, [0, 0])[i]
+                keep = shrink_cores(mine, want, cpu_topology(cfg), {c: d(c, 0) - d(c, 1) for c in mine})
+                upd["cores"] = ",".join(map(str, keep))
+            if r["mem_claim"]:
+                want = fitted(w["rss"] / (1 - k), MEM_STEP, MEM_STEP)
+                if want < r["mem_claim"]:
+                    upd["mem_claim"] = want
+            new = []
+            for g, share, vram in gpu:
+                if w["vram"].get(g, 0) >= GPU_SEEN_MB or w["gpu"].get(g, 0) > 0:  # only once the job is seen using its GPU
+                    if g in w["gpu"]:
+                        share = min(share, round(fitted(w["gpu"][g] / 100 / (1 - k), GPU_STEP, GPU_STEP), 4))
+                    vram = min(vram, fitted(w["vram"].get(g, 0) / (1 - k), MEM_STEP, MEM_STEP))
+                new.append([g, share, vram])
+            if new != gpu:
+                upd["gpu"] = json.dumps(new)
+            if upd and set_claims(db, jid, r, "fit", upd, dict(cpu=round(w["cpu"], 2), rss_mb=w["rss"], gpu_pct=w["gpu"], vram_mb=w["vram"])):
+                w["skip"] = now + ADJUST_SETTLE
+        w.update(start=max(now, w["skip"]), cpu=0.0, rss=0, gpu={}, vram={}, n=0, ticks=None)
+
+
+def set_claims(db, jid, r, why, upd, peak):
+    """Change a running job's claims (cores, mem_claim, gpu) if nothing else changed them first, log an `adjust`
+    event (before, after, the peaks it was fitted to) and re-pin the job to its new cores."""
+    before = {k: r[k] for k in upd}
+    with tx(db):
+        n = db.execute("UPDATE jobs SET %s WHERE id=? AND state='running' AND pid=? AND cores IS ? AND mem_claim IS ? AND gpu IS ?"
+                       % ",".join(k + "=?" for k in upd), list(upd.values()) + [jid, r["pid"], r["cores"], r["mem_claim"], r["gpu"]]).rowcount
+        ev = emit(db, jid, "adjust", dict(why=why, before=before, after=upd, peak=peak)) if n else None
+    if ev:
+        fire(ev)
+    if n and "cores" in upd:
+        repin(r["pid"], upd["cores"])
+    return bool(n)
 
 
 def phone_home(db, cfg, st):
@@ -774,13 +1285,14 @@ def agent():
     lock.truncate(0)
     lock.write(str(os.getpid()))
     lock.flush()
-    db, kids, st = hdb(), [], {}
+    db, kids, st, ast = hdb(), [], {}, {}
     print("agent %s started pid=%d %s" % (VERSION, os.getpid(), time.strftime("%F %T")), flush=True)
     while True:
         try:
             cfg = load_cfg()
             reconcile(db)
             schedule(db, cfg, kids)
+            adjust(db, cfg, ast)
             phone_home(db, cfg, st)
             check_disk(db)
         except Exception:
@@ -1037,6 +1549,11 @@ def status(db, cfg):
     if mem_reserved_mb is not None and mem_used_mb > mem_reserved_mb:  # watchdog should have killed it
         warn.append("RAM over reserved")
     dfree = disk_free()
+    claims = gpu_claims(db)
+    for g in gpus:  # what jobs claim of each GPU, next to what it reports
+        c = claims.get(g["index"], [0.0, 0])
+        g.update(claimed=round(c[0], 4), vram_claimed=c[1])
+    queued = db.execute("SELECT coalesce(sum(cpus),0), coalesce(sum(mem_mb),0), coalesce(sum(gpus),0) FROM jobs WHERE state='queued'").fetchone()
     return dict(now=time.time(), version=VERSION, ncpu=os.cpu_count(), cores=len(cores), free=len(cores) - len(used_cores(db)),
                 load=os.getloadavg()[0], cpu_pct=pct, cpu_ghz=round(ghz, 2) if ghz is not None else None,
                 mem_total_mb=mem_total, mem_avail_mb=mem_avail,
@@ -1044,7 +1561,20 @@ def status(db, cfg):
                 power_w=round(sum(power.values()), 1) if power else None, power_parts=power, warnings=warn,
                 disk_free_gb=round(shutil.disk_usage(HOME).free / 2 ** 30, 1), disk_free=dfree, gpus=gpus, agent=agent_alive(),
                 counts={r[0]: r[1] for r in db.execute("SELECT state, count(*) FROM jobs GROUP BY state")},
-                queued_cpus=db.execute("SELECT coalesce(sum(cpus),0) FROM jobs WHERE state='queued'").fetchone()[0])
+                queued_cpus=queued[0], queued_mem_mb=queued[1], queued_gpus=queued[2],
+                mem_cap_mb=host_mem_mb(cfg), mem_claimed_mb=mem_claimed(db), topology=topology_summary(cfg),
+                gpu_claimable=sorted(gpu_inventory(cfg)))
+
+
+def topology_summary(cfg):
+    """{'l3': ['0-2,12-14', …], 'smt': True}: the host's L3 groups (CPUs jobs may use) and whether cores have siblings."""
+    topo = cpu_topology(cfg)
+    if not topo:
+        return None
+    groups = {}
+    for c, (core, l3, _) in topo.items():
+        groups.setdefault(l3, []).append(c)
+    return dict(l3=[cpu_list(g) for _, g in sorted(groups.items())], smt=len({v[0] for v in topo.values()}) < len(topo))
 
 
 _disk_warned = [0.0]  # last alert time in memory too: on a full disk the meta row cannot be written
@@ -1511,7 +2041,7 @@ def teardown(a):
 
 SERVER_SCHEMA = """
 CREATE TABLE IF NOT EXISTS hosts(name TEXT PRIMARY KEY, dest TEXT, epoch TEXT, cursor INT DEFAULT 0,
-  seen REAL DEFAULT 0, err TEXT, status TEXT);
+  seen REAL DEFAULT 0, err TEXT, status TEXT, cpu_score REAL, gpu_score REAL, score_src TEXT);
 CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, host TEXT, prio INT, state TEXT, created REAL,
   sent INT DEFAULT 0, cancel INT DEFAULT 0, eid INT DEFAULT 0, j TEXT, stage TEXT, rev INT DEFAULT 0);
 CREATE TABLE IF NOT EXISTS events(host TEXT, eid INT, ts REAL, job TEXT, kind TEXT, data TEXT, PRIMARY KEY(host, eid));
@@ -1541,6 +2071,14 @@ def sdb():
         if col not in have:
             try:
                 db.execute("ALTER TABLE jobs ADD COLUMN %s %s" % (col, decl))
+            except sqlite3.OperationalError as e:
+                if "duplicate" not in str(e):
+                    raise
+    have = {r[1] for r in db.execute("PRAGMA table_info(hosts)")}
+    for col, decl in (("cpu_score", "REAL"), ("gpu_score", "REAL"), ("score_src", "TEXT")):  # servers before host scores
+        if col not in have:
+            try:
+                db.execute("ALTER TABLE hosts ADD COLUMN %s %s" % (col, decl))
             except sqlite3.OperationalError as e:
                 if "duplicate" not in str(e):
                     raise
@@ -1651,28 +2189,58 @@ def _sync_host(db, name, extra):
 
 
 def host_caps(db):
-    """Spare cores per live host (idle minus what is already queued or on its way), and total cores."""
-    cap, cores = {}, {}
-    for h in db.execute("SELECT name, status FROM hosts WHERE err IS NULL AND status IS NOT NULL AND seen>?", (time.time() - 120,)):
+    """Per live host, what is left for host-less jobs once its queue and the jobs on their way are counted: cores,
+    RAM (None: not known) and GPU share (summed over its claimable GPUs), plus its core count and claimable GPUs."""
+    caps = {}
+    for h in db.execute("SELECT name, status, cpu_score, gpu_score FROM hosts WHERE err IS NULL AND status IS NOT NULL AND seen>?",
+                        (time.time() - 120,)):
         s = json.loads(h["status"])
-        unsent = sum(unpack(r["j"]).get("cpus", 1) for r in db.execute("SELECT j FROM jobs WHERE host=? AND sent=0 AND state='pending'", (h["name"],)))
-        cap[h["name"]], cores[h["name"]] = s["free"] - s["queued_cpus"] - unsent, s["cores"]
-    return cap, cores
+        unsent = [unpack(r["j"]) for r in db.execute("SELECT j FROM jobs WHERE host=? AND sent=0 AND state='pending'", (h["name"],))]
+        claimable = set(s.get("gpu_claimable") or ())  # hosts before GPU claims report none
+        gfree = sum(max(0.0, 1 - (g.get("claimed") or 0)) for g in s.get("gpus") or () if g.get("index") in claimable)
+        cap = s.get("mem_cap_mb")
+        caps[h["name"]] = dict(
+            cpu=s["free"] - s["queued_cpus"] - sum(j.get("cpus", 1) for j in unsent), cores=s["cores"], ngpu=len(claimable), mem_cap=cap,
+            cpu_score=h["cpu_score"], gpu_score=h["gpu_score"],
+            mem=cap - s.get("mem_claimed_mb", 0) - s.get("queued_mem_mb", 0) - sum(min(j.get("mem_mb") or 0, cap) for j in unsent) if cap else None,
+            gpu=gfree - s.get("queued_gpus", 0) - sum(j.get("gpus") or 0 for j in unsent))
+    return caps
+
+
+def rank_key(c, gpu_job):
+    """How good a host is for a job, highest first: its score (`tshed score`: GPU score for GPU jobs, CPU score for the
+    rest; scored hosts before unscored ones), then the most free GPU share / idle cores."""
+    score = c["gpu_score"] if gpu_job else c["cpu_score"]
+    return (score is not None, score or 0) + ((c["gpu"], c["cpu"]) if gpu_job else (c["cpu"],))
 
 
 def dispatch(db):
-    """Late-bind host-less jobs, highest priority first, to the live host with the most idle cores."""
-    cap, cores = host_caps(db)
+    """Late-bind host-less jobs, highest priority first, greedily: each goes to the best live host (rank_key) with room
+    for its cores, RAM and GPUs now, else the next best, and so on. A job that fits nowhere yet holds back the ones
+    behind it; one that no live host could ever run (too few GPUs) is passed over."""
+    caps = host_caps(db)
     touched = set()
     for r in db.execute("SELECT id, j FROM jobs WHERE host IS NULL AND state='pending' AND cancel=0 ORDER BY prio DESC, created").fetchall():
-        if not cap:
+        if not caps:
             break
-        best = max(cap, key=cap.get)
-        need = min(max(1, unpack(r["j"]).get("cpus", 1)), cores[best])
-        if cap[best] < need:
+        j = unpack(r["j"])
+        g = j.get("gpus") or 0
+        need = lambda c: min(max(1, j.get("cpus", 1)), c["cores"])
+        mem = lambda c: min(j.get("mem_mb") or 0, c["mem_cap"] or 0)
+        able = [h for h, c in caps.items() if not g or c["ngpu"] >= math.ceil(g)]
+        if not able:
+            continue
+        ok = [h for h in able if caps[h]["cpu"] >= need(caps[h]) and (caps[h]["mem"] is None or caps[h]["mem"] >= mem(caps[h]))
+              and (not g or caps[h]["gpu"] >= g - EPS)]
+        if not ok:
             break
+        best = max(ok, key=lambda h: rank_key(caps[h], bool(g)))
         db.execute("UPDATE jobs SET host=? WHERE id=? AND host IS NULL", (best, r["id"]))
-        cap[best] -= need
+        c = caps[best]
+        c["cpu"] -= need(c)
+        c["gpu"] -= g
+        if c["mem"] is not None:
+            c["mem"] -= mem(c)
         touched.add(best)
     return touched
 
@@ -1965,13 +2533,125 @@ def job_name(s):
     return s
 
 
+def gpu_count(s):
+    """-g: a share of one GPU (0 < N < 1) or a whole number of GPUs."""
+    try:
+        v = float(s)
+    except ValueError:
+        v = -1
+    if not math.isfinite(v) or v < 0 or (v >= 1 and v != int(v)):
+        raise argparse.ArgumentTypeError("--gpus is a share of one GPU (0.25) or a whole number of GPUs (2), got %r" % s)
+    return int(v) if v >= 1 else v
+
+
+BENCH_CPU_TESTS = ("integer_compute", "string_scan", "crc32c", "utf8_validate")  # clpeak CPU tests that hold up across ISAs
+
+
+def bench_scores(path):
+    """{host: dict(cpu, gpu, src, note)} from a stdbench results folder (one folder per host of clpeak 3 JSON runs; the
+    newest complete run counts). CPU score: the geometric mean of clpeak's integer, string-scan, CRC32C and UTF-8 rates per
+    logical CPU, in G/s: the speed of one claimed CPU (its fp32 kernels miss Apple cores' SIMD, so they are left out).
+    GPU score: per GPU, the geometric mean of fp32 TFLOPS and memory bandwidth in 100 GB/s; the host's best GPU."""
+    out = {}
+    for d in sorted(glob.glob(os.path.join(os.path.expanduser(path), "*", ""))):
+        runs = sorted(f for f in glob.glob(d + "*.json") if not f.endswith(".partial.json"))
+        for f in reversed(runs):
+            try:
+                with open(f) as fh:
+                    run = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            if run.get("schema") == "clpeak/run":
+                break
+        else:
+            continue
+        best = lambda dev, test: max([m.get("value") or 0 for x in dev.get("tests", []) if x.get("id") == test
+                                      for m in x.get("metrics", [])] or [0])
+        n = (run.get("host") or {}).get("logical_cores") or 0
+        r = dict(src=f, ncpu=n, cpu=None, gpu=None)
+        cpu = next((x for x in run.get("devices", []) if x.get("type") == "cpu"), None)
+        rates = [best(cpu, t) / n / 1e9 for t in BENCH_CPU_TESTS] if cpu and n else []
+        rates = [v for v in rates if v > 0]
+        if len(rates) >= 2:
+            r["cpu"] = round(math.exp(sum(map(math.log, rates)) / len(rates)), 1)
+        gpus = [(best(x, "single_precision_compute") / 1e12, best(x, "global_memory_bandwidth") / 1e11)
+                for x in run.get("devices", []) if x.get("type") == "gpu"]
+        gpus = [math.sqrt(tf * bw) for tf, bw in gpus if tf > 0 and bw > 0]
+        if gpus:
+            r["gpu"] = round(max(gpus), 1)
+        out[os.path.basename(os.path.dirname(d))] = r
+    return out
+
+
+def score_cmd(db, a):
+    """Show the hosts' scores in the order dispatch tries them, set one by hand, or import them from stdbench."""
+    known = {r["name"]: r for r in db.execute("SELECT * FROM hosts")}
+    if a.host and a.host not in known:
+        raise Fail("unknown host %r (see: tshed hosts)" % a.host)
+    if a.bench:
+        found = bench_scores(a.bench)
+        if not found:
+            raise Fail("no clpeak runs under %s (expected HOST/*.json, as stdbench writes them)" % a.bench)
+        for name in sorted(set(found) & set(known) if not a.host else {a.host} & set(found)):
+            r, st = found[name], json.loads(known[name]["status"] or "{}")
+            if r["cpu"] is not None and st.get("cores") and r["ncpu"] != st["cores"]:  # e.g. run in a smaller container
+                print("%s: CPU score skipped: benchmarked with %d CPUs, the host now has %d (rerun the benchmark, or set it with "
+                      "tshed score %s --cpu N)" % (name, r["ncpu"], st["cores"], name), file=sys.stderr)
+                r["cpu"] = None
+            db.execute("UPDATE hosts SET cpu_score=coalesce(?, cpu_score), gpu_score=coalesce(?, gpu_score), score_src=? WHERE name=?",
+                       (r["cpu"], r["gpu"], os.path.basename(r["src"]), name))
+        missing = sorted(set(known) - set(found))
+        if missing:
+            print("no benchmark for: %s" % ", ".join(missing), file=sys.stderr)
+    elif a.host and (a.cpu is not None or a.gpu is not None or a.clear):
+        if a.clear:
+            db.execute("UPDATE hosts SET cpu_score=NULL, gpu_score=NULL, score_src=NULL WHERE name=?", (a.host,))
+        for col in ("cpu", "gpu"):
+            if getattr(a, col) is not None:
+                db.execute("UPDATE hosts SET %s_score=?, score_src='manual' WHERE name=?" % col, (getattr(a, col) or None, a.host))
+    rows = [dict(r, s=json.loads(r["status"] or "{}")) for r in db.execute("SELECT * FROM hosts ORDER BY name")]
+    order = lambda col: sorted(rows, key=lambda r: (r[col] is None, -(r[col] or 0), r["name"]))
+    if a.json:
+        for r in rows:
+            print(json.dumps(dict(name=r["name"], cpu_score=r["cpu_score"], gpu_score=r["gpu_score"], source=r["score_src"],
+                                  claimable_gpus=len(r["s"].get("gpu_claimable") or ()))))
+        return
+    print(paint("%-14s %9s %9s  %-6s %s" % ("Host", "CPU score", "GPU score", "GPUs", "Source"), BOLD))
+    for r in order("cpu_score"):
+        ng = len(r["s"].get("gpu_claimable") or ())
+        print("%-14s %9s %9s  %-6s %s" % (r["name"], "-" if r["cpu_score"] is None else "%g" % r["cpu_score"],
+                                          "-" if r["gpu_score"] is None else "%g" % r["gpu_score"], ng or "-", r["score_src"] or ""))
+    gpu_hosts = [r["name"] for r in order("gpu_score") if r["s"].get("gpu_claimable")]
+    print(paint("host-less CPU jobs try: %s" % " > ".join(r["name"] for r in order("cpu_score")), DIM))
+    print(paint("host-less GPU jobs try: %s" % (" > ".join(gpu_hosts) or "(no host has claimable GPUs)"), DIM))
+
+
+def check_gpus(db, host, want):
+    """Refuse a GPU claim that no host could ever meet, going by what the hosts last reported."""
+    rows = db.execute("SELECT name, status FROM hosts" + (" WHERE name=?" if host else ""), (host,) if host else ()).fetchall()
+    known = {r["name"]: json.loads(r["status"]) for r in rows if r["status"]}
+    if host and host not in known or not host and len(known) < len(rows):
+        return  # not seen yet: the host decides
+    able = [n for n, st in known.items() if len(st.get("gpu_claimable") or ()) >= math.ceil(want)]
+    if not able:
+        old = [n for n, st in known.items() if "gpu_claimable" not in st]
+        raise Fail("%s %d GPU%s to claim%s" % ("%s has fewer than" % host if host else "no host has", math.ceil(want), "s" * (want > 1),
+                                              " (%s: run tshed install)" % ", ".join(old) if old else ""))
+
+
 def submit_parser(**kw):
     p = argparse.ArgumentParser(**kw)
     p.add_argument("-n", "--name", type=job_name, required=True, help="job name, at most %d characters, no spaces" % NAME_MAX)
     p.add_argument("-H", "--host", help="pin to a host (default: first live host with enough idle cores)")
     p.add_argument("-p", "--prio", type=int, default=0, help="higher runs first")
     p.add_argument("-c", "--cpus", type=int, default=1, help="cores to pin with taskset")
-    p.add_argument("-m", "--mem", type=size, default=0, help="RSS limit for the whole process tree, e.g. 8G")
+    p.add_argument("-m", "--mem", type=size, default=0, help="RAM to claim, and the RSS limit of the whole process tree, e.g. 8G")
+    p.add_argument("-g", "--gpus", type=gpu_count, default=0, help="GPUs to claim: a share of one (0.25) or a whole number (2); "
+                   "the job sees them as CUDA_VISIBLE_DEVICES")
+    p.add_argument("--vram", type=size, default=0, help="GPU memory to claim on each of its GPUs, e.g. 6G (default: the claimed "
+                   "share of the GPU's memory)")
+    p.add_argument("--no-adjust", action="store_true", help="keep the claims as submitted (default: cores, RAM, GPU share and VRAM "
+                   "are fitted to the job's measured peak use every 2 minutes)")
     p.add_argument("-t", "--timeout", type=dur, default=0, help="runtime limit per attempt, e.g. 90s 30m 12h 2d (default: twice --expect)")
     p.add_argument("-x", "--expect", type=dur, default=0, help="expected runtime: sets the timeout to twice this, gives an ETA "
                    "and, without --stall, a stall limit of twice the expected time for each checkpoint's progress (at least 10s)")
@@ -2142,6 +2822,10 @@ def submit(db, argv, stage_now=False):
         raise Fail("no command given")
     if a.stall_on_log and not a.stall:
         raise Fail("--stall-on-log needs --stall DURATION")
+    if a.vram and not a.gpus:
+        raise Fail("--vram needs --gpus")
+    if a.gpus:
+        check_gpus(db, a.host, a.gpus)
     jid = uuid.uuid4().hex[:8]
     owner, origin = owner_origin(explicit=getattr(a, "owner", None))
     st, cwd = stage_spec(a, jid)
@@ -2149,7 +2833,7 @@ def submit(db, argv, stage_now=False):
                 prio=a.prio, cpus=a.cpus, mem_mb=a.mem, timeout=a.timeout or 2 * a.expect, retries=a.retries, retry_on=a.retry_on,
                 retry_delay=a.retry_delay, expect=a.expect, stall=a.stall, stall_on_log=int(a.stall_on_log),
                 trace_lines=int(a.trace_lines), work=int(bool(st.get("git") or st.get("push"))), stage=st,
-                owner=owner, origin=json.dumps(origin))
+                owner=owner, origin=json.dumps(origin), gpus=a.gpus, vram_mb=a.vram, adjust=int(not a.no_adjust))
     staged = None
     if stage_now and a.host and needs_stage(st, a.host):
         h = db.execute("SELECT dest FROM hosts WHERE name=?", (a.host,)).fetchone()
@@ -2958,7 +3642,7 @@ def host_head(gpu_w=3):
     return "%-12s  %-7s %5s %5s  %7s  %10s  %9s  %11s  %-*s %4s %4s  %6s  %6s  %s" % (
         "Host", "State", "Load", "CPU%", "Cores", "Mem free", "Used/Res", "Disk free", gpu_w, "GPU", "Run", "Que", "Seen", "Freq", "Notes")
 
-JOB_HEAD = "%-11s %3s %4s  %-12s  %-8s  %9s  %9s  %5s  %4s  %11s  %-16s  %s" % ("State", "CPU", "Prio", "Host", "ID", "Time", "Progress", "Try", "CPU%", "Mem", "Name", "Command")
+JOB_HEAD = "%-11s %3s %4s %4s  %-12s  %-8s  %9s  %9s  %5s  %4s  %11s  %-16s  %s" % ("State", "CPU", "GPU", "Prio", "Host", "ID", "Time", "Progress", "Try", "CPU%", "Mem", "Name", "Command")
 
 
 def styled(segments, width, base=""):
@@ -3247,16 +3931,44 @@ def fmt_mem(used, limit):
     return "%s/%sG" % (g(used), g(limit)) if limit else g(used) + "G"
 
 
+def fmt_share(v):
+    """A GPU claim, short: 2, 1, .25, 1.5 (a two-GPU job fitted below two whole GPUs)."""
+    return ("%.2f" % v).rstrip("0").rstrip(".").removeprefix("0") or "0"
+
+
+def job_claims(j):
+    """What a job claims now: (cores, GPU share summed over its GPUs or None, RAM MB or None). A running job's claims
+    may have been fitted to its use; otherwise they are what it asked for."""
+    live = j["state"] in ("running", "paused")
+    gpu = json.loads(j["gpu"]) if live and j.get("gpu") else None
+    cores = len(parse_cores(j["cores"])) if j["state"] == "running" and j.get("cores") else j.get("cpus") or 1
+    return (cores, sum(x[1] for x in gpu) if gpu else j.get("gpus") or None,
+            j.get("mem_claim") if live and j.get("mem_claim") else j.get("mem_mb") or None)
+
+
+def gpu_desc(j):
+    """'0 30% 2.1G, 1 100% 24G' for a job holding GPUs, '0.25 (6G each)' for one asking, '' for neither."""
+    if j["state"] in ("running", "paused") and j.get("gpu"):
+        return ", ".join("%d %d%% %s" % (g, round(100 * share), fmt_mem(vram, 0)) for g, share, vram in json.loads(j["gpu"]))
+    if j.get("gpus"):
+        return fmt_share(j["gpus"]) + (" (%s each)" % fmt_mem(j["vram_mb"], 0) if j.get("vram_mb") else "")
+    return ""
+
+
 def job_segs(j):
-    """Running jobs show live CPU% (of their assigned cores) and RSS; finished ones their peak RSS."""
+    """Running jobs show live CPU% (of their assigned cores) and RSS; finished ones their peak RSS.
+    CPU, GPU and Mem's limit are the claims: what it asked for, or what a running job was fitted to."""
     pct = j.get("cpu_pct")
     used = j.get("rss_mb") if j["state"] in ("running", "paused") else j.get("peak_mb") or None if j["state"] in TERMINAL else None
     over = used is not None and j.get("mem_mb") and used > 0.9 * j["mem_mb"]
-    segs = [state_seg(j), (NUM, " %3d" % (j.get("cpus") or 1)),
+    cores, gpus, mem = job_claims(j)
+    fit = lambda now, asked: YELLOW if now != asked else NUM  # fitted below what was asked
+    segs = [state_seg(j), (fit(cores, j.get("cpus") or 1), " %3d" % cores),
+            (fit(gpus, j.get("gpus") or None), " %4s" % (fmt_share(gpus) if gpus else "-")),
             (NUM, " %4d" % j["prio"]), ("", "  "), (HOST, "%-12s" % (j["host"] or "(any)")[:12]),
             ("", "  %-8s  %9s  " % (j["id"], "(%s)" % fmt_dur(j["t"]) if j.get("waiting") else fmt_dur(j["t"]))), progress_seg(j), ("", "  "), (DIM, "%5s" % ("%d/%d" % (j.get("attempt") or 0, (j.get("retries") or 0) + 1))),
             (BOLD_RED if pct is not None and pct > 105 else "", "  %4s" % ("-" if pct is None else "%d%%" % round(pct))),
-            (BOLD_RED if over else "", "  %11s" % fmt_mem(used, j.get("mem_mb"))),
+            (BOLD_RED if over else "", "  %11s" % fmt_mem(used, mem)),
             ("", "  "), ("", "%-16s" % clean(j.get("name") or "-")[:NAME_MAX]), ("", "  " + clean(j["cmd"]))]
     if j["state"] in TERMINAL and j["state"] != "done":
         segs = segs[:1] + [(DIM, t) for _, t in segs[1:]]
@@ -3319,9 +4031,14 @@ def progress_segs(j):
 def meta_segs(j):
     """The one-line summary of a job used by `show` and the detail view."""
     lim = lambda k, f: f(j[k]) if j.get(k) else "-"
+    cores, _, mem = job_claims(j)
+    live = j["state"] == "running"  # fitted claims: shown against what was asked
     return [("", "State: "), state_seg(j), ("", "  Prio: "), (NUM, str(j["prio"])),
             ("", "   Try: %d/%d" % (j.get("attempt") or 0, (j.get("retries") or 0) + 1)),
             ("", "   Cores: "), (NUM, "%s" % (j.get("cores") or j.get("cpus") or "-")),
+            *([(YELLOW, " (asked %d)" % j["cpus"])] if live and cores < (j.get("cpus") or 1) else []),
+            *([("", "   GPU: "), (NUM, gpu_desc(j))] if gpu_desc(j) else []),
+            *([("", "   RAM claim: "), (YELLOW, "%s (asked %s)" % (fmt_mem(mem, 0), fmt_mem(j["mem_mb"], 0)))] if live and mem != (j.get("mem_mb") or None) else []),
             ("", "   Mem peak: %s%s" % (lim("peak_mb", lambda v: "%dM" % v), " of %dM" % j["mem_mb"] if j.get("mem_mb") else "")),
             *([("", "   CPU%%: %s   Mem: %s" % ("-" if j.get("cpu_pct") is None else "%d%%" % round(j["cpu_pct"]),
                                               fmt_mem(j.get("rss_mb"), j.get("mem_mb"))))] if j["state"] == "running" else []),
@@ -3409,6 +4126,10 @@ def clipboard(text):
     return "the terminal (OSC 52)"
 
 
+LOG_CACHE = 64  # job logs the dashboard keeps after fetching them
+PREFETCH_AFTER = 0.25  # s the cursor rests on a job before its log is fetched, so → shows it at once
+
+
 def tui(interval):
     """The dashboard, after gitss: alternate screen, synchronized double-buffered frames, type-to-filter,
     capital command keys, SGR mouse. It is also a full server loop (delivery, ingest, callbacks)."""
@@ -3418,9 +4139,17 @@ def tui(interval):
     db = sdb()
     apply_theme(paint_bg=True)
     themes = theme_names()
-    st: dict = dict(sel=0, top=0, query="", hide=False, detail=None, scroll=None, msg=("", ""), prompt=None, log=(None, ""),
+    st: dict = dict(sel=0, top=0, query="", hide=False, detail=None, scroll=None, msg=("", ""), prompt=None, rest=(None, 0.0),
                     fetching=False, fetched=0, synced=0, row0=0, rows=0, syncing=False, where=None, marks=set())
     wake, stop = threading.Event(), threading.Event()
+    logs: dict = {}  # job id -> (its state when fetched, None = refetch; log text), most recent last
+    redraw_r, redraw_w = os.pipe()  # background results wake the screen loop, which otherwise waits on keys
+    os.set_blocking(redraw_r, False)
+    os.set_blocking(redraw_w, False)
+
+    def repaint():
+        with contextlib.suppress(OSError):  # full: a redraw is already due
+            os.write(redraw_w, b".")
 
     def say(text, style=""):
         st["msg"] = (style, clean(str(text)))
@@ -3432,6 +4161,7 @@ def tui(interval):
                 sync_all()
                 pull_due_bg()
                 st["synced"] = time.time()
+                repaint()
                 if st["msg"][1].startswith("sync: "):
                     say("")
             except Exception as e:
@@ -3447,7 +4177,11 @@ def tui(interval):
 
     def get_key(timeout, pending=[]):  # one key per call, even when several arrive in one read (paste, key repeat)
         if not pending:
-            if not select.select([fd], [], [], timeout)[0]:
+            ready = select.select([fd, redraw_r], [], [], timeout)[0]
+            if redraw_r in ready:
+                with contextlib.suppress(OSError):
+                    os.read(redraw_r, 4096)
+            if fd not in ready:
                 return ""
             s = os.read(fd, 1024).decode("utf-8", "ignore")
             while s == "\x1b" and select.select([fd], [], [], 0.02)[0]:
@@ -3463,14 +4197,21 @@ def tui(interval):
             except Exception as e:
                 say(e, BOLD_RED)
             wake.set()
+            repaint()
         threading.Thread(target=go, daemon=True).start()
 
     def fetch_log(j, dest):
         try:
             text = json.loads(remote(dest, ["rpc"], json.dumps(dict(logs=dict(id=j["id"], bytes=200000))), timeout=20))["logs"]
         except Exception as e:
-            text = (j.get("tail") or "") + "\n[live log unavailable: %s]" % e
-        st.update(log=(j["id"], text), fetching=False, fetched=time.time())
+            logs[j["id"]] = (None, (j.get("tail") or "") + "\n[live log unavailable: %s]" % e)  # None: try again
+        else:
+            logs.pop(j["id"], None)
+            logs[j["id"]] = (j["state"], text)
+            while len(logs) > LOG_CACHE:
+                logs.pop(next(iter(logs)))
+        st.update(fetching=False, fetched=time.time())
+        repaint()
 
     def fetch_where(j, dest):  # on demand only: a py-spy dump briefly pauses python processes
         try:
@@ -3478,7 +4219,7 @@ def tui(interval):
             st["where"] = (j["id"], where_lines(w), time.time())
         except Exception as e:
             st["where"] = (j["id"], [[(BOLD_RED, "where: %s" % e)]], time.time())
-        wake.set()
+        repaint()
 
     def run_fg(argv):  # hand the terminal to mosh/ssh/tail, then take it back
         screen(False)
@@ -3582,7 +4323,7 @@ def tui(interval):
              *([styled(stage_segs(j), W)] if stage_segs(j) else []),
              *([styled(owner_segs(j), W)] if owner_segs(j) else []),
              styled([("", "Cmd: "), (BOLD, clean(j["cmd"]))], W), "─" * W]
-        text = st["log"][1] if st["log"][0] == j["id"] else (j.get("tail") or "")
+        text = logs[j["id"]][1] if j["id"] in logs else (j.get("tail") or "")  # the event's tail until fetched
         lines = [clean(l.rsplit("\r", 1)[-1]) for l in text.rstrip("\n").split("\n")] if text else []
         wh = st["where"] if st["where"] and st["where"][0] == j["id"] else None
         if wh:  # the W view replaces the log until W is pressed again
@@ -3598,7 +4339,10 @@ def tui(interval):
             st["scroll"] = None  # back at the bottom: follow the log again
         top = last if st["scroll"] is None else max(0, st["scroll"])
         st["rows"] = last  # for scrolling keys
-        for l in lines[top:top + room]:
+        # until the log arrives, the event's tail of a longer log sits at the bottom, where the log will put it
+        pad = room - len(lines) if j["id"] not in logs and len(text.encode()) >= TAIL_BYTES - 8 and len(lines) < room else 0
+        L.extend([""] * pad)
+        for l in lines[top:top + room - pad]:
             L.append((DIM + l[:W] + RESET) if l.startswith(("=== tinyshed", "=== tshed")) else l[:W])
         L.extend([""] * (H - 2 - len(L)))
         L.append(styled([st["msg"]], W) if st["msg"][1] else styled([(DIM, "Scroll: %d-%d/%d%s" % (
@@ -3625,14 +4369,22 @@ def tui(interval):
             cur = job_times(jobs[st["sel"]], clocks) if jobs else None
             if st["detail"] and not (cur and cur["id"] == st["detail"]):
                 st["detail"] = None  # filtered away
-            if cur and st["detail"] and cur["sent"] and cur["host"] in dests and not st["fetching"] and time.time() - st["fetched"] > 2 \
-                    and (cur["state"] == "running" or st["log"][0] != cur["id"]):
-                st["fetching"] = True
-                threading.Thread(target=fetch_log, args=(cur, dests[cur["host"]]), daemon=True).start()
+            wait = 0.5
+            if cur and cur["sent"] and cur["host"] in dests:
+                if st["rest"][0] != cur["id"]:
+                    st["rest"] = (cur["id"], time.time())
+                have = logs.get(cur["id"])  # fetch when missing, older than the job's state, or live in the detail view
+                need = have is None or have[0] != cur["state"] or (st["detail"] and cur["state"] == "running")
+                rested = time.time() - st["rest"][1]  # the list prefetches the log the cursor stops on
+                if need and not st["detail"] and rested < PREFETCH_AFTER:
+                    wait = PREFETCH_AFTER - rested
+                elif need and not st["fetching"] and (have is None or time.time() - st["fetched"] > 2):
+                    st["fetching"] = True
+                    threading.Thread(target=fetch_log, args=(cur, dests[cur["host"]]), daemon=True).start()
             L, H = draw_detail(cur) if st["detail"] else draw_main(hosts, jobs, len(everything), cache.counts, cur, clocks)
             OUT.write("\x1b[?2026h\x1b[H" + RESET + "\x1b[K\n".join(L[:H]) + "\x1b[K\x1b[J\x1b[?2026l")  # one atomic frame
             OUT.flush()
-            key = get_key(0.5)
+            key = get_key(wait)
             if not key:
                 continue
             if st["prompt"]:
@@ -3694,6 +4446,8 @@ def tui(interval):
                 st["query"] = ""
             elif key == "R":
                 st["fetched"] = 0
+                if cur and cur["id"] in logs:  # stale but still shown: no flash back to the event's tail
+                    logs[cur["id"]] = (None, logs[cur["id"]][1])
                 say("Refreshing…", DIM)
                 if st["detail"] and st["where"] and st["where"][0] == st["detail"] and cur and cur["host"] in dests:
                     threading.Thread(target=fetch_where, args=(cur, dests[cur["host"]]), daemon=True).start()
@@ -3916,6 +4670,17 @@ def build_parser():
     s = sub.add_parser("hosts", help="show each host's last known state (no ssh; ls, serve and the dashboard refresh it)")
     s.add_argument("--json", action="store_true", help="one JSON object per line")
     s.add_argument("--rm", metavar="NAME", help="forget a host without contacting it")
+    s = sub.add_parser("score", help="hosts' CPU and GPU scores: the order host-less jobs try them in",
+                       description="Each host has a CPU score (speed of one CPU) and a GPU score (speed of its best GPU). A job "
+                                   "without -H goes to the best-scoring live host with room for it, else the next. Import them from "
+                                   "stdbench's clpeak runs (--from DIR), or set them by hand.")
+    s.add_argument("host", nargs="?", help="the host to set or import")
+    s.add_argument("--cpu", type=float, help="set its CPU score (0 = none)")
+    s.add_argument("--gpu", type=float, help="set its GPU score (0 = none)")
+    s.add_argument("--from", dest="bench", metavar="DIR", help="import from a stdbench results folder (HOST/*.json clpeak runs), "
+                   "e.g. ~/git/stdbench/bench-results")
+    s.add_argument("--clear", action="store_true", help="drop the host's scores")
+    s.add_argument("--json", action="store_true", help="one JSON object per host")
     s = sub.add_parser("config", help="show or edit config.json in $EDITOR",
                        description="Show, or with --edit open in $VISUAL/$EDITOR, this machine's config.json. "
                                    "With --host, read/write that registered host's config over ssh. Edits are "
@@ -4251,7 +5016,8 @@ def main():
         hosts = load_hosts(db)  # last known state, instant: the Seen column says how old it is
         if a.json:
             for h in hosts:
-                print(json.dumps(dict(h["s"], name=h["name"], dest=h["dest"], up=bool(h["seen"] and not h["err"]), err=h["err"], seen=h["seen"])))
+                print(json.dumps(dict(h["s"], name=h["name"], dest=h["dest"], up=bool(h["seen"] and not h["err"]), err=h["err"], seen=h["seen"],
+                                      cpu_score=h["cpu_score"], gpu_score=h["gpu_score"])))
         elif not hosts:
             print("no hosts yet: tshed install NAME=DEST ...", file=sys.stderr)
         else:
@@ -4259,6 +5025,8 @@ def main():
             print(paint(host_head(gw), BOLD))
             for h in hosts:
                 out(host_segs(h, gw))
+    elif a.op == "score":
+        score_cmd(db, a)
     elif a.op == "owner":
         owner_cmd(db, a.id, a.json)
     elif a.op == "overview":
@@ -4280,7 +5048,7 @@ def main():
                 and (not a.owner or a.owner in (j.get("owner") or "")) and (not mine or j.get("owner") == mine)]
         if a.json:
             keys = ("id", "name", "host", "state", "prio", "attempt", "rc", "cmd", "created", "started", "ended", "peak_mb",
-                    "cpus", "mem_mb", "cpu_pct", "rss_mb", "timeout", "expect", "stall", "progress", "beat", "paused_s", "stage", "owner")
+                    "cpus", "mem_mb", "gpus", "vram_mb", "adjust", "cores", "gpu", "mem_claim", "cpu_pct", "rss_mb", "timeout", "expect", "stall", "progress", "beat", "paused_s", "stage", "owner")
             for j in jobs:
                 f, left = job_progress(j)
                 print(json.dumps(dict({k: j.get(k) for k in keys}, done=f, eta=left, **{"wait" if j.get("waiting") else "ran": round(j["t"], 1)})))

@@ -1,5 +1,5 @@
 # tailwind-indigo: ratatui's tailwind palette (slate-950 buffer, slate-200 text, indigo accent).
-# Companion of tinyshed's `tshed theme tailwind-indigo`. Install: cp to ~/.config/btop/themes/
+# Companion of tshed's `tshed theme tailwind-indigo`. Install: cp to ~/.config/btop/themes/
 
 theme[main_bg]="#020617"
 theme[main_fg]="#e2e8f0"

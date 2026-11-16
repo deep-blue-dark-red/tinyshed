@@ -5,7 +5,7 @@ analysis attached that picking one up does not mean starting over.
 
 ---
 
-## 1. Ship tinyshed as a self-contained binary per platform
+## 1. Ship tshed as a self-contained binary per platform
 
 **Origin.** User, 2026-11-14: "can this be packaged into a binary (arch/debian-x86 amd +/- arm64
 macos?)", then "reserve for later". Same message fixed the assumption that every machine has
@@ -16,12 +16,12 @@ Python > 3.11.
 Every machine already has an interpreter, so a binary does not remove a Python dependency that
 hurts today. What it would remove is the **zstd** dependency: stdlib `compression.zstd` exists only
 from 3.14, so 3.12/3.13 hosts currently need the `zstd` binary or `pyzstd`/`zstandard`
-(`zmod()` in `tinyshed.py` exits otherwise). A binary built on 3.14 carries its own.
+(`zmod()` in `tshed.py` exits otherwise). A binary built on 3.14 carries its own.
 
 ### 1.2 Why "just freeze it" is not the whole change
 
 The file re-executes itself as a script in several places, all of which assume
-`python3 …/tinyshed.py`:
+`python3 …/tshed.py`:
 
 - `detach()` — spawns the agent and every watchdog as `[sys.executable, SELF]`
 - `setup()` — the `@reboot` crontab line

@@ -3,6 +3,6 @@ revision = 3
 requires-python = ">=3.12"
 
 [[package]]
-name = "tinyshed"
+name = "tshed"
 version = "0.2"
 source = { virtual = "." }

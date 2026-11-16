@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Unit tests for tinyshed.py: stdlib unittest, no ssh, no daemons, never the live ~/.tinyshed.
+"""Unit tests for tshed.py: stdlib unittest, no ssh, no daemons, never the live ~/.tinyshed.
 
-    python3 -m unittest -v test_tinyshed      (or ./test_tinyshed.py)
+    python3 -m unittest -v test_tshed      (or ./test_tshed.py)
 
 Every test runs in its own temporary TINYSHED_HOME; process launches (`detach`) are stubbed out.
 End-to-end behaviour (agents, watchdogs, ssh) is still exercised with fake hosts, see AGENTS.md.
 """
-import contextlib, importlib.util, io, json, os, re, sqlite3, sys, tempfile, time, unittest
+import contextlib, importlib.util, io, json, os, re, shutil, sqlite3, subprocess, sys, tempfile, time, unittest
+from unittest import mock
+from typing import Any, cast
 
 os.environ["TINYSHED_HOME"] = tempfile.mkdtemp(prefix="tshed-test-")  # before import: HOME is read at import time
 os.environ["NO_COLOR"] = "1"
-_spec = importlib.util.spec_from_file_location("tinyshed", os.path.join(os.path.dirname(os.path.abspath(__file__)), "tinyshed.py"))
-t = importlib.util.module_from_spec(_spec)
+_spec = importlib.util.spec_from_file_location("tshed", os.path.join(os.path.dirname(os.path.abspath(__file__)), "tshed.py"))
+assert _spec is not None and _spec.loader is not None  # narrow ModuleSpec|None for the checker
+t = cast(Any, importlib.util.module_from_spec(_spec))  # Any: stubs patch tshed attrs onto it
 _spec.loader.exec_module(t)
 
 
@@ -156,7 +159,7 @@ class TestHostDb(Base):
         db.close()
         db = t.hdb()
         cols = {r[1] for r in db.execute("PRAGMA table_info(jobs)")}
-        self.assertTrue({"force", "name", "expect", "stall", "progress", "pause", "work"} <= cols)
+        self.assertTrue({"force", "name", "expect", "stall", "progress", "pause", "work", "owner", "origin"} <= cols)
         self.assertEqual(db.execute("SELECT state FROM jobs WHERE id='old1'").fetchone()[0], "queued")
 
 
@@ -412,6 +415,23 @@ class TestServerJobs(ServerBase):
         with self.assertRaises(t.Fail):
             self.add("x", host="ghost")
 
+    def test_migrates_old_server_db(self):
+        """A server.db from before the indexes keeps its rows and gains them on connect."""
+        self.db.close()
+        for suffix in ("", "-wal", "-shm"):
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(os.path.join(self.home, "server.db" + suffix))
+        db = sqlite3.connect(os.path.join(self.home, "server.db"))
+        db.executescript("CREATE TABLE jobs(id TEXT PRIMARY KEY, host TEXT, prio INT, state TEXT, created REAL,"
+                         " sent INT DEFAULT 0, cancel INT DEFAULT 0, eid INT DEFAULT 0, j TEXT, stage TEXT);"
+                         "INSERT INTO jobs(id, host, state) VALUES('old1', 'h1', 'done');")
+        db.close()
+        db = t.sdb()
+        idx = {r[1] for r in db.execute("PRAGMA index_list(jobs)")}
+        self.assertTrue({"jobs_out", "jobs_queue"} <= idx)
+        self.assertEqual(db.execute("SELECT state FROM jobs WHERE id='old1'").fetchone()[0], "done")
+        db.close()
+
     def test_resolve(self):
         a = t.add_job(self.db, dict(name="train", cmd="true"), jid="abc12345")
         b = t.add_job(self.db, dict(name="train", cmd="true"), jid="abd99999")
@@ -631,6 +651,108 @@ class TestHostRow(unittest.TestCase):
         self.assertNotIn("disk", row(status(disk_free={"~": 0.1})))
 
 
+SID = "cf93301b-ae23-4aed-8cf3-f5ee3fa033ed"
+NO_AGENT = {k: "" for k in ("CLAUDE_CODE_SESSION_ID", "MAKI_SESSION_ID", "TINYSHED_OWNER", "TINYSHED_JOB")}
+
+
+@unittest.skipUnless(shutil.which("git"), "needs git")
+class TestOwner(Base):
+    def setUp(self):
+        super().setUp()
+        self.repo = os.path.join(self.home, "my-proj")
+        git = lambda *a, cwd=self.repo: subprocess.run(["git", *a], cwd=cwd, check=True, capture_output=True)
+        os.makedirs(self.repo)
+        git("init", "-q", "-b", "main")
+        git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init")
+        self.wt = os.path.join(self.home, "my-proj-feature")
+        git("worktree", "add", "-q", "-b", "feature", self.wt)
+        os.makedirs(os.path.join(self.repo, "sub"))
+
+    def origin(self, cwd=None, **env):
+        with mock.patch.dict(os.environ, dict(NO_AGENT, **env)):
+            return t.owner_origin(cwd or self.repo)
+
+    def test_claude_session(self):
+        oid, o = self.origin(os.path.join(self.repo, "sub"), CLAUDE_CODE_SESSION_ID=SID)
+        self.assertEqual(oid, "clau-my-proj-" + SID)
+        self.assertEqual((o["agent"], o["session"], o["root"], o["branch"]), ("clau", SID, "my-proj", "main"))
+        self.assertEqual(os.path.realpath(o["repo"]), os.path.realpath(self.repo))
+        self.assertNotIn("worktree", o)
+        self.assertEqual(len(o["commit"]), 40)
+
+    def test_worktree_shares_the_project_root(self):
+        oid, o = self.origin(self.wt, MAKI_SESSION_ID=SID)
+        self.assertEqual(oid, "maki-my-proj-" + SID)  # the main repository's folder, not the worktree's
+        self.assertEqual(o["branch"], "feature")
+        self.assertEqual(os.path.realpath(o["worktree"]), os.path.realpath(self.wt))
+
+    def test_person_outside_git(self):
+        plain = os.path.join(self.home, "scratch dir")
+        os.makedirs(plain)
+        oid, o = self.origin(plain, USER="ana")
+        self.assertEqual(oid, "user-scratch_dir")
+        self.assertEqual((o["agent"], o["session"], o["user"]), ("user", None, "ana"))
+        self.assertNotIn("repo", o)
+
+    def test_inherited_inside_a_job(self):
+        oid, o = self.origin(TINYSHED_OWNER="clau-my-proj-" + SID, TINYSHED_JOB="abcd1234")
+        self.assertEqual(oid, "clau-my-proj-" + SID)
+        self.assertEqual((o["parent"], o["agent"], o["session"]), ("abcd1234", "clau", SID))
+
+    def test_explicit_owner(self):
+        with mock.patch.dict(os.environ, dict(NO_AGENT, CLAUDE_CODE_SESSION_ID=SID)):
+            oid, o = t.owner_origin(self.repo, explicit="nightly-ci")
+        self.assertEqual(oid, "nightly-ci")
+        self.assertNotIn("parent", o)
+        for bad in ("", "has space", "x" * 129):
+            with self.subTest(owner=bad), self.assertRaises(Exception):
+                t.owner_id(bad)
+
+    def test_parse_owner(self):
+        self.assertEqual(t.parse_owner("clau-my-proj-" + SID), dict(agent="clau", root="my-proj", session=SID))
+        self.assertEqual(t.parse_owner("maki-my-proj-2RDrm2Mmo11eosunnUWMWy"),  # maki's base58 session ids
+                         dict(agent="maki", root="my-proj", session="2RDrm2Mmo11eosunnUWMWy"))
+        for other in ("user-my-proj", "nightly-ci", "clau-x-not0a0uuid", "maki-x-has0zero", None):
+            with self.subTest(owner=other):
+                self.assertIsNone(t.parse_owner(other))
+
+    def test_session_file(self):
+        fake = os.path.join(self.home, "userhome")
+        claude = os.path.join(fake, ".claude", "projects", "-Users-x-my-proj")
+        os.makedirs(claude)
+        open(os.path.join(claude, SID + ".jsonl"), "w").close()
+        os.makedirs(os.path.join(fake, ".maki", "sessions"))
+        open(os.path.join(fake, ".maki", "sessions", SID + ".jsonl"), "w").close()
+        with mock.patch.dict(os.environ, HOME=fake):
+            self.assertEqual(t.session_file(dict(agent="clau", session=SID)), os.path.join(claude, SID + ".jsonl"))
+            self.assertTrue(t.session_file(dict(agent="maki", session=SID)).endswith(".maki/sessions/%s.jsonl" % SID))
+            self.assertIsNone(t.session_file(dict(agent="clau", session="0" * 8 + SID[8:])))
+            self.assertIsNone(t.session_file(dict(agent="user")))
+            self.assertIsNone(t.session_file(dict(agent="maki", session="../../etc/passwd")))
+
+    def test_owner_travels_to_the_host_and_back(self):
+        origin = json.dumps(dict(agent="clau", session=SID, repo=self.repo))
+        t.rpc(dict(submit=[job("j1", owner="clau-my-proj-" + SID, origin=origin)]))
+        r = t.hdb().execute("SELECT owner, origin FROM jobs WHERE id='j1'").fetchone()
+        self.assertEqual((r[0], r[1]), ("clau-my-proj-" + SID, origin))
+        self.assertEqual(self.fired[-1]["data"]["owner"], "clau-my-proj-" + SID)  # events carry it to the server mirror
+
+    def test_submit_records_owner_and_lookup_prefers_direct_origin(self):
+        db = t.sdb()
+        with mock.patch.dict(os.environ, dict(NO_AGENT, CLAUDE_CODE_SESSION_ID=SID)), contextlib.chdir(self.wt):
+            jid = t.submit(db, ["-n", "train", "--", "true"])
+        with mock.patch.dict(os.environ, dict(NO_AGENT, TINYSHED_OWNER="clau-my-proj-" + SID, TINYSHED_JOB=jid)), \
+                contextlib.chdir(self.home):
+            t.submit(db, ["-n", "child", "--", "true"])
+        b = t.unpack(db.execute("SELECT j FROM jobs WHERE id=?", (jid,)).fetchone()[0])
+        self.assertEqual(b["owner"], "clau-my-proj-" + SID)
+        (g,) = t.owners(db, "my-proj")
+        self.assertEqual((g["jobs"], g["states"]), (2, {"pending": 2}))
+        self.assertEqual(g["origin"]["branch"], "feature")  # the session's own submit, not its job's
+        self.assertEqual(g["origin"]["session"], SID)
+        self.assertEqual(t.owners(db, "nobody"), [])
+
+
 class TestCli(Base):
     def run_cli(self, *argv):
         saved = sys.argv
@@ -663,6 +785,24 @@ class TestCli(Base):
         self.assertEqual(t.sdb().execute("SELECT count(*) FROM hosts").fetchone()[0], 0)
         with self.assertRaises(t.Fail):
             self.run_cli("hosts", "--rm", "gpu1")
+
+    def test_ls_owner_filters_and_owner_command(self):
+        t.sync_all = lambda: None
+        db = t.sdb()
+        for name, owner in (("a", "clau-proj-" + SID), ("b", "maki-other-" + SID), ("c", None)):
+            t.add_job(db, dict(name=name, cmd="true", owner=owner))
+        names = lambda *argv: sorted(json.loads(l)["name"] for l in self.run_cli("ls", "--json", *argv).splitlines())
+        self.assertEqual(names(), ["a", "b", "c"])
+        self.assertEqual(names("--owner", "proj"), ["a"])
+        self.assertEqual(names("--owner", SID[:8]), ["a", "b"])
+        with mock.patch.dict(os.environ, dict(NO_AGENT, TINYSHED_OWNER="maki-other-" + SID)):
+            self.assertEqual(names("--mine"), ["b"])
+            self.assertEqual(self.run_cli("owner").splitlines()[0], "maki-other-" + SID)
+        out = self.run_cli("owner", "proj")
+        self.assertIn("clau-proj-" + SID, out)
+        self.assertIn("1 pending", out)
+        with self.assertRaises(t.Fail):
+            self.run_cli("owner", "nobody")
 
     def test_completion_covers_public_commands(self):
         p, sub, public = t.build_parser()

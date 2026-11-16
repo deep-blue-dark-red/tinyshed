@@ -1,11 +1,11 @@
-# tinyshed
+# tshed
 
 A minimal priority-queue scheduler for long jobs: one server commanding a handful of machines over ssh.
 
-You have a laptop and a few boxes with cores and GPUs. tinyshed queues jobs on them by priority,
+You have a laptop and a few boxes with cores and GPUs. tshed queues jobs on them by priority,
 pins each job to its own cores, enforces runtime and memory limits, notices when a job stops making
 progress, retries what failed, keeps every log, and moves your code there and your results back.
-It is one file, `tinyshed.py` (the command is `tshed`), stdlib-only Python, with no daemon on the
+It is one file, `tshed.py` (the command is `tshed`), stdlib-only Python, with no daemon on the
 server and nothing to install on the hosts except that same file.
 
 - **Hosts are authoritative.** Each host keeps its own queue and event log in sqlite and keeps
@@ -37,7 +37,7 @@ tshed / tshed serve   ── ssh: rpc ──▶   agent ──▶ watchdog ─�
 ## Quick start
 
 ```sh
-ln -s "$PWD/tinyshed.py" ~/bin/tshed                    # anywhere on PATH; the command is `tshed`
+ln -s "$PWD/tshed.py" ~/bin/tshed                    # anywhere on PATH; the command is `tshed`
 tshed install gpu1=gpu1.local,gpu1 gpu2=me@gpu2         # copy itself to each host, start its agent (~1 s per host)
 tshed hosts                                             # load, CPU%, idle cores, memory, GPUs
 tshed submit -n hello -H gpu1 -x 60 -- 'echo hi from $(hostname); sleep 30'
@@ -45,7 +45,7 @@ tshed ls                                                # or just `tshed` for th
 tshed completion fish > ~/.config/fish/completions/tshed.fish   # or zsh / bash
 ```
 
-`HUMANS.md` is a step-by-step tutorial. `skills/tinyshed/SKILL.md` teaches coding agents to use it.
+`HUMANS.md` is a step-by-step tutorial. `skills/tshed/SKILL.md` teaches coding agents to use it.
 
 ## A job, end to end
 
@@ -61,7 +61,7 @@ tshed wait -t 4h train                  # → 1a2b3c4d done pulled out → /User
 The job runs on gpu1 in its own checkout of your working tree, in the same subdirectory, with
 `data/` copied next to it. It gets 8 pinned cores and a 32 GB RSS limit, and a 6 h timeout (2 × `-x`).
 If it exits with an error (or its host reboots), it is retried once. When it ends, `out/` is copied to the local folder, along with
-`tinyshed-ID.json` recording what produced it. The checkout on gpu1 is then deleted. The code stays
+`tshed-ID.json` recording what produced it. The checkout on gpu1 is then deleted. The code stays
 recoverable with `tshed checkout ID`.
 
 Inside the script, report progress after each unit of work:
@@ -69,7 +69,7 @@ Inside the script, report progress after each unit of work:
 ```python
 import os
 
-def progress(line):                     # no-op outside tinyshed
+def progress(line):                     # no-op outside tshed
     if p := os.environ.get("TINYSHED_PROGRESS"):
         with open(p, "w") as f:
             f.write(line + "\n")
@@ -93,7 +93,8 @@ letting it hang until the timeout. The dashboard shows percent done and an ETA.
 | `config [--edit] [--host HOST…]` | show or edit (in `$VISUAL`/`$EDITOR`) this machine's `config.json`, or a host's over ssh; validated before saving, applied within a second |
 | **jobs** | |
 | `submit -n NAME [flags] -- CMD` | queue a job; prints `ID STATE HOST`. See [Submitting](#submitting) |
-| `ls [-a] [--json]` | active jobs (`-a`: finished too) |
+| `ls [-a] [--json] [--owner TEXT] [--mine]` | active jobs (`-a`: finished too); only one owner's, or your own. See [Owners](#owners) |
+| `owner [ID] [--json]` | your owner id, or an owner's jobs, where it submitted from and its agent session file |
 | `overview [-n N] [-a]` | hosts and active jobs in one non-interactive screen |
 | `show ID` | one job: state, limits, rc, times, progress, code and file status, end of its log |
 | `logs ID [-n BYTES] [-f]` | its captured stdout+stderr; `-f` follows it live on the host (mosh/ssh, interactive) |
@@ -139,11 +140,32 @@ tshed submit -n NAME [-H HOST] [-p PRIO] [-c CPUS] [-m MEM] [-x EXPECT] [-t TIME
 | `--trace-lines` | record every bash process's exact line for `where` (~0.1 ms per bash command) |
 | `-C DIR` | working directory on the host (default `~`; with `--git`/`--push` relative to the job's own work dir) |
 | `-e K=V` | environment variable, repeatable |
+| `--owner ID` | who submits (default: detected, see [Owners](#owners)) |
 
 `CMD` runs on the host through `bash -c`, in a non-login environment: paths are the host's, and
 conda/modules need `bash -lc '…'`. Quote it as one argument if it has shell syntax:
 `-- 'make 2>&1 | tail'`. Jobs see `TINYSHED_JOB`, `TINYSHED_ATTEMPT`, `TINYSHED_CORES` and
-`TINYSHED_PROGRESS`, and `~/.tinyshed/bin` first on `PATH` (so `tshed progress` works on every host).
+`TINYSHED_PROGRESS` (and `TINYSHED_OWNER`), and `~/.tinyshed/bin` first on `PATH` (so `tshed progress` works on every host).
+
+### Owners
+
+Every job records who submitted it, as an id that leads back to the agent session:
+`AGENT-ROOT-SESSION`, e.g. `clau-tinyshed-cf93301b-ae23-4aed-8cf3-f5ee3fa033ed`.
+
+- `AGENT` comes from the session variable the submitting process sees: `CLAUDE_CODE_SESSION_ID` →
+  `clau`, `MAKI_SESSION_ID` → `maki`. With neither it is `user` and there is no `SESSION`
+  (`user-tinyshed`).
+- `ROOT` is the project folder: the main repository's, so every worktree of a project shares it;
+  outside git, the current folder.
+- `--owner ID` sets it by hand; jobs submitted from inside a job inherit the job's owner
+  (`TINYSHED_OWNER`).
+
+The job also keeps its origin: agent, session, cwd, repository, branch, worktree (when it is not the
+main one) and commit. `show` and the dashboard print it, and the dashboard's search matches owners.
+`tshed owner` prints the id you would submit as; `tshed owner TEXT` finds owners by any part of the id
+(a project, a session prefix) and lists their jobs, where they submitted from and the session's
+transcript (`~/.claude/projects/*/SESSION.jsonl`, `~/.maki/sessions/SESSION.jsonl`) when it is on this
+machine. `tshed ls --mine` / `--owner TEXT` filter the job list. Jobs from before owners show none.
 
 **States.** `pending` (on the server: not placed yet, or its files are being staged) → `queued` →
 `running` (⇄ `paused`) → `done` | `error` | `timeout` | `oom` | `stalled` | `lost` | `cancelled`.
@@ -197,8 +219,8 @@ The server does all copying, over the same ssh connection as everything else.
 - **`--pull SRC[:DEST]`** (repeatable) rsyncs SRC, relative to the job's working directory, into the
   local folder DEST when the job ends in one of `--pull-on`. The default is every end state except
   `cancelled`. A folder's contents land in DEST; a file lands inside it. DEST may use `{name}` `{id}`
-  `{host}` `{state}` and defaults to `results/{name}/{id}`. Each DEST gets `tinyshed-ID.json`: job,
-  host, state, rc, command, times, snapshot and source. A DEST that tinyshed creates inside a git work
+  `{host}` `{state}` and defaults to `results/{name}/{id}`. Each DEST gets `tshed-ID.json`: job,
+  host, state, rc, command, times, snapshot and source. A DEST that tshed creates inside a git work
   tree gets a `.gitignore` of `*`, so results never end up in the next snapshot.
 
 **When.** With `-H`, `submit` stages the files before queueing; if that fails, nothing is queued.
@@ -243,7 +265,7 @@ median is off by more than 50%) and peak memory.
   `at script.sh:N` with the line's text. This is exact for top-level commands. Inside a loop, function
   or `if`, it shows the block's last line, because bash parses the whole block first.
 - **Exact line, function stack and command** (`submit --trace-lines`): every bash of the job reads
-  `$BASH_ENV`. tinyshed points it at a DEBUG trap that records `file:line`, `FUNCNAME` and the command
+  `$BASH_ENV`. tshed points it at a DEBUG trap that records `file:line`, `FUNCNAME` and the command
   about to run, one record per bash process, so nested scripts read like a stack:
   `outer.sh:4 in stage` → `inner.sh:3 python3 …`. The job's own `BASH_ENV` is sourced first; `$?`
   and `$_` are preserved.
@@ -368,7 +390,7 @@ hooks need something listening: `serve`, the dashboard, or phone-home.
 `Host State Load CPU% Cores Mem free Used/Res Disk free GPU Run Que Seen Freq Notes`
 
 - **`Load`** is the 1-minute load average.
-- **`CPU%`** is the measured busy share of the cores tinyshed owns (`--cores`, or the CPU affinity),
+- **`CPU%`** is the measured busy share of the cores tshed owns (`--cores`, or the CPU affinity),
   from per-core OS counters between polls. Above 100% is impossible while jobs are pinned, so it is
   flagged.
 - **`Cores`** is idle / total.
@@ -381,7 +403,7 @@ hooks need something listening: `serve`, the dashboard, or phone-home.
 - **`GPU`** is NVIDIA utilization and memory used / total per GPU, on one line, in index order. One GPU
   also shows its index (`88% 9.1/12G :0`); several are separated by `|` (`88% 9.1/12G | 0% 0.3/24G`),
   and the column widens to fit the host with the most. Models and power per GPU are in `hosts --json`.
-- **`Freq`** is the mean clock of tinyshed's cores (`-` on Apple Silicon).
+- **`Freq`** is the mean clock of tshed's cores (`-` on Apple Silicon).
 - **`Notes`** carries the host's power draw (see Power below), version mismatches (run `tshed install`)
   and warnings.
 - `hosts --json` has all of it.
@@ -393,7 +415,7 @@ agent sees no CPU power and `tshed install` says so. To let it read them, on eac
 
 ```sh
 echo 'ACTION=="add", SUBSYSTEM=="powercap", RUN+="/bin/chmod o+r /sys%p/energy_uj"' \
-  | sudo tee /etc/udev/rules.d/99-tinyshed-rapl.rules
+  | sudo tee /etc/udev/rules.d/99-tshed-rapl.rules
 sudo chmod o+r /sys/class/powercap/intel-rapl:*/energy_uj     # now; the rule covers reboots
 ```
 
@@ -463,9 +485,9 @@ Never point a test at your real `~/.tinyshed`:
 
 ```sh
 export TINYSHED_HOME=/tmp/ts/server
-./tinyshed.py install a=local:/tmp/ts/a b=local:/tmp/ts/b --cores 0-1 --home local
-./tinyshed.py submit -n t -H a -x 10s -- sleep 5 ; ./tinyshed.py wait -i 1 t ; ./tinyshed.py ls -a
-./tinyshed.py uninstall a b --purge ; rm -rf /tmp/ts     # agents are daemons: always clean up
+./tshed.py install a=local:/tmp/ts/a b=local:/tmp/ts/b --cores 0-1 --home local
+./tshed.py submit -n t -H a -x 10s -- sleep 5 ; ./tshed.py wait -i 1 t ; ./tshed.py ls -a
+./tshed.py uninstall a b --purge ; rm -rf /tmp/ts     # agents are daemons: always clean up
 ```
 
 `local:DIR` hosts skip ssh, and `--home local` exercises phone-home. Linux-only paths (`taskset`,

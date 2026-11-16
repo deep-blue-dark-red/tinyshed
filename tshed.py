@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tinyshed - a minimal priority-queue scheduler for long jobs: one server, N hosts, ssh in between.
+"""tshed - a minimal priority-queue scheduler for long jobs: one server, N hosts, ssh in between.
 
 One file, stdlib only (python >= 3.12 plus zstd: stdlib from 3.14, else pyzstd/zstandard or the zstd binary):
 
@@ -22,7 +22,7 @@ Callbacks: put functions in ~/.tinyshed/hooks.py (server and/or host), each taki
   OnJobProgress OnJobPaused OnJobResumed  OnCriticalDisk (~ or /tmp under 2G free)
   OnHostDown OnHostUp (server only)   OnEvent (everything)
 """
-import argparse, contextlib, fcntl, importlib, json, os, re, shlex, shutil, signal, sqlite3, subprocess, sys, tempfile, threading, time, traceback, uuid
+import argparse, contextlib, fcntl, glob, importlib, json, os, re, shlex, shutil, signal, sqlite3, subprocess, sys, tempfile, threading, time, traceback, uuid
 
 VERSION = "0.2"
 HOME = os.path.abspath(os.path.expanduser(os.environ.get("TINYSHED_HOME") or "~/.tinyshed"))
@@ -37,7 +37,8 @@ HOOKS = {"queued": "OnJobQueued", "start": "OnJobStart", "done": "OnJobCompletio
 # job fields that travel server -> host, with defaults
 # stall: None = derived from expect once the job reports a total, 0 = off
 SPEC = dict(name=None, cmd=None, cwd=None, env=None, prio=0, cpus=1, mem_mb=0, timeout=0, retries=0,
-            retry_on="error,lost", retry_delay=30, created=None, expect=0, stall=None, stall_on_log=0, trace_lines=0, work=0)
+            retry_on="error,lost", retry_delay=30, created=None, expect=0, stall=None, stall_on_log=0, trace_lines=0, work=0,
+            owner=None, origin=None)  # owner: who submitted (owner_origin); origin: JSON of where from
 PROGRESS_EVERY = 30  # seconds: a changed checkpoint becomes a `progress` event at most this often
 DISK_MIN_GB = 2  # free space on ~ or /tmp below this is critical (OnCriticalDisk)
 DISK_REWARN_S = 3600  # while a path stays critical, re-emit the event at most this often
@@ -115,7 +116,7 @@ def zmod():
                 pass
         else:
             if not shutil.which("zstd"):
-                sys.exit("tinyshed: zstd is required: python >= 3.14, or `pip install pyzstd` / `zstandard`, or the zstd binary on PATH")
+                sys.exit("tshed: zstd is required: python >= 3.14, or `pip install pyzstd` / `zstandard`, or the zstd binary on PATH")
             _zmod = None
     return _zmod
 
@@ -211,7 +212,7 @@ CREATE TABLE IF NOT EXISTS jobs(
   state TEXT, attempt INT DEFAULT 0, not_before REAL DEFAULT 0, cores TEXT, pid INT, rc INT,
   started REAL, ended REAL, peak_mb INT, cancel INT DEFAULT 0, force INT DEFAULT 0,
   expect REAL DEFAULT 0, stall REAL, stall_on_log INT DEFAULT 0, progress TEXT, beat REAL, trace_lines INT DEFAULT 0,
-  pause INT DEFAULT 0, paused_at REAL, paused_s REAL DEFAULT 0, work INT DEFAULT 0);
+  pause INT DEFAULT 0, paused_at REAL, paused_s REAL DEFAULT 0, work INT DEFAULT 0, owner TEXT, origin TEXT);
 CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(state, prio DESC, created);
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, job TEXT, kind TEXT, data TEXT);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
@@ -224,7 +225,8 @@ def hdb():
     for col, decl in (("force", "INT DEFAULT 0"), ("name", "TEXT"),  # v0.2 queues predate these
                       ("expect", "REAL DEFAULT 0"), ("stall", "REAL"), ("stall_on_log", "INT DEFAULT 0"),  # and these
                       ("progress", "TEXT"), ("beat", "REAL"), ("trace_lines", "INT DEFAULT 0"),
-                      ("pause", "INT DEFAULT 0"), ("paused_at", "REAL"), ("paused_s", "REAL DEFAULT 0"), ("work", "INT DEFAULT 0")):
+                      ("pause", "INT DEFAULT 0"), ("paused_at", "REAL"), ("paused_s", "REAL DEFAULT 0"), ("work", "INT DEFAULT 0"),
+                      ("owner", "TEXT"), ("origin", "TEXT")):
         if col not in have:
             try:
                 db.execute("ALTER TABLE jobs ADD COLUMN %s %s" % (col, decl))
@@ -469,7 +471,7 @@ def kill_group(p, grace=10):
 # --trace-lines: every bash process of the job (BASH_ENV is read by each non-interactive bash) records the
 # command it is about to run in run/ID.where/PID. Subshells skip it (BASHPID != $$); $? survives a DEBUG trap
 # by itself, $_ is restored by hand; a failed write (or set -e) never affects the script.
-TRACE_BASH = r"""# tinyshed --trace-lines (see tshed where); sources the job's own BASH_ENV first
+TRACE_BASH = r"""# tshed --trace-lines (see tshed where); sources the job's own BASH_ENV first
 [ -n "$TINYSHED_BASH_ENV" ] && . "$TINYSHED_BASH_ENV"
 set -T
 trap '_tshed_u=$_; [ "$BASHPID" = "$$" ] && { printf "%s:%s\t%s\t%.300s\n" "${BASH_SOURCE[0]:-bash -c}" "$LINENO" "${FUNCNAME[*]}" "$BASH_COMMAND" > "$TINYSHED_WHERE/$$"; } 2>/dev/null || :; : "$_tshed_u"' DEBUG
@@ -539,7 +541,7 @@ def run_job(jid):
     signal.signal(signal.SIGTERM, lambda *a: stop.append(1))
     logp, prog, trace = P("logs", jid + ".log"), P("run", jid + ".progress"), P("run", jid + ".where")
     log = open(logp, "ab")
-    log.write(("=== tinyshed %s attempt %d cores=%s %s ===\n" % (jid, j["attempt"], j["cores"], time.strftime("%F %T"))).encode())
+    log.write(("=== tshed %s attempt %d cores=%s %s ===\n" % (jid, j["attempt"], j["cores"], time.strftime("%F %T"))).encode())
     log.flush()
     with contextlib.suppress(OSError):  # a new attempt starts without checkpoints or traces
         os.remove(prog)
@@ -549,6 +551,8 @@ def run_job(jid):
         cmd = ["taskset", "-c", j["cores"]] + cmd
     env = dict(os.environ, **json.loads(j["env"] or "{}"))
     env.update(TINYSHED_JOB=jid, TINYSHED_ATTEMPT=str(j["attempt"]), TINYSHED_CORES=j["cores"] or "", TINYSHED_PROGRESS=prog)
+    if j["owner"]:  # a job that submits jobs submits them as its own owner
+        env["TINYSHED_OWNER"] = j["owner"]
     with contextlib.suppress(OSError):
         env["PATH"] = host_bin() + os.pathsep + env.get("PATH", os.defpath)
         if j["trace_lines"]:
@@ -558,7 +562,7 @@ def run_job(jid):
         p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, env=env,
                              cwd=job_cwd(j), start_new_session=True)
     except OSError as e:
-        log.write(("tinyshed: cannot start: %s\n" % e).encode())
+        log.write(("tshed: cannot start: %s\n" % e).encode())
         log.flush()
         return finish(db, jid, "error", rc=127, tail=str(e))
     transition(db, jid, "start", pid=p.pid, progress=None, beat=None)
@@ -614,7 +618,7 @@ def run_job(jid):
                         os.killpg(p.pid, signal.SIGCONT)
                     d = time.monotonic() - paused_at
                     deadline, beat, paused_at = deadline and deadline + d, beat + d, None
-                    log.write(("=== tinyshed: resumed after %.0fs, cores=%s %s ===\n" % (d, r["cores"], time.strftime("%F %T"))).encode())
+                    log.write(("=== tshed: resumed after %.0fs, cores=%s %s ===\n" % (d, r["cores"], time.strftime("%F %T"))).encode())
                     log.flush()
         elif deadline and time.monotonic() > deadline:
             kind, why = "timeout", ": ran %.0fs" % j["timeout"]
@@ -633,10 +637,10 @@ def run_job(jid):
                     os.killpg(p.pid, signal.SIGSTOP)
                 paused_at = time.monotonic()
                 transition(db, jid, "paused", state="paused", cores=None, paused_at=time.time())
-                log.write(("=== tinyshed: paused %s ===\n" % time.strftime("%F %T")).encode())
+                log.write(("=== tshed: paused %s ===\n" % time.strftime("%F %T")).encode())
                 log.flush()
     if kind:
-        log.write(("=== tinyshed: killing job (%s%s) ===\n" % (kind, why)).encode())
+        log.write(("=== tshed: killing job (%s%s) ===\n" % (kind, why)).encode())
         log.flush()
         kill_group(p)
     else:
@@ -828,7 +832,7 @@ def per_core_ticks():
 
 
 def cpu_util(db, cores):
-    """Measured busy % of tinyshed's own cores, from per-core tick deltas since the previous status()
+    """Measured busy % of tshed's own cores, from per-core tick deltas since the previous status()
     call. The snapshot lives in host.db meta because every rpc is a fresh process. None until two
     samples exist, or where the OS exposes no per-core counters."""
     ticks = per_core_ticks()
@@ -1447,7 +1451,7 @@ def boot_persist(enable):
                 return None
             os.makedirs(os.path.dirname(link), exist_ok=True)
             with open(unit, "w") as f:  # oneshot: just launches the detached agent; never kills jobs on stop
-                f.write("[Unit]\nDescription=tinyshed agent\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nKillMode=process\n"
+                f.write("[Unit]\nDescription=tshed agent\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nKillMode=process\n"
                         "ExecStart=%s\n\n[Install]\nWantedBy=default.target\n" % start)
             os.symlink(unit, link)
             user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
@@ -1511,6 +1515,8 @@ CREATE TABLE IF NOT EXISTS hosts(name TEXT PRIMARY KEY, dest TEXT, epoch TEXT, c
 CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, host TEXT, prio INT, state TEXT, created REAL,
   sent INT DEFAULT 0, cancel INT DEFAULT 0, eid INT DEFAULT 0, j TEXT, stage TEXT);
 CREATE TABLE IF NOT EXISTS events(host TEXT, eid INT, ts REAL, job TEXT, kind TEXT, data TEXT, PRIMARY KEY(host, eid));
+CREATE INDEX IF NOT EXISTS jobs_out ON jobs(host, state, sent, cancel);  -- per-host sync + caps scans
+CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(state, prio DESC, created);  -- dispatch + terminal sweeps
 """
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=15",
        "-o", "ControlMaster=auto", "-o", "ControlPath=~/.ssh/tinyshed-%C", "-o", "ControlPersist=300"]
@@ -1554,7 +1560,7 @@ def remote(dest, args, input=None, timeout=45, pre=""):
                 _route[dest] = d
                 break
     if r.returncode:
-        raise Fail((r.stderr.strip().splitlines() or ["exit %d" % r.returncode])[-1].replace("tinyshed: ", ""))
+        raise Fail((r.stderr.strip().splitlines() or ["exit %d" % r.returncode])[-1].replace("tinyshed: ", "").replace("tshed: ", ""))
     return r.stdout
 
 
@@ -1742,10 +1748,10 @@ def git_snapshot(path, jid):
         if head and tree == git_run("rev-parse", "HEAD^{tree}", cwd=top):
             sha = head
         else:
-            sha = git_run("commit-tree", tree, *(["-p", head] if head else []), "-m", "tinyshed snapshot for job " + jid, cwd=top, env=env)
+            sha = git_run("commit-tree", tree, *(["-p", head] if head else []), "-m", "tshed snapshot for job " + jid, cwd=top, env=env)
     branch = subprocess.run(["git", "symbolic-ref", "-q", "--short", "HEAD"], cwd=top, capture_output=True, text=True).stdout.strip()
     key = re.sub(r"[^\w.-]", "_", os.path.basename(top)) + "-" + uuid.uuid5(uuid.NAMESPACE_URL, top).hex[:8]
-    # kept in tinyshed's own store, not as a ref in your repo (no clutter in `git log --all`); the commit
+    # kept in tshed's own store, not as a ref in your repo (no clutter in `git log --all`); the commit
     # object left in your repo is unreferenced and goes with git's normal gc
     store = ensure_bare(P("snapshots", key + ".git"))
     git_run("push", "-q", "--no-verify", store, "%s:refs/tinyshed/%s" % (sha, jid), cwd=top)
@@ -1813,18 +1819,18 @@ def stage_bg(jid, host, st):
 
 
 def self_ignore(path):
-    """A results folder tinyshed creates inside a git work tree ignores itself, so results never ride along in
+    """A results folder tshed creates inside a git work tree ignores itself, so results never ride along in
     the next --git snapshot (or in a commit)."""
     parent = os.path.dirname(path)
     inside = subprocess.run(["git", "-C", parent, "rev-parse", "--is-inside-work-tree"], capture_output=True, text=True)
     if inside.returncode == 0 and subprocess.run(["git", "-C", parent, "check-ignore", "-q", path]).returncode != 0:
         with open(os.path.join(path, ".gitignore"), "w") as f:
-            f.write("# results pulled by tinyshed: kept out of git and out of --git snapshots\n*\n")
+            f.write("# results pulled by tshed: kept out of git and out of --git snapshots\n*\n")
 
 
 def pull_job(db, jid, to=None, srcs=None):
     """Copy a job's results from its host into local folders: the job's --pull list, or srcs into `to`.
-    A directory's contents land in the folder, a file lands inside it. Each folder gets tinyshed-ID.json."""
+    A directory's contents land in the folder, a file lands inside it. Each folder gets tshed-ID.json."""
     r = db.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone()
     st, b = json.loads(r["stage"]) if r["stage"] else {}, unpack(r["j"])
     pulls = [[x, to or d] for x, d in st.get("pull") or []] if not srcs else [[x, to or os.path.abspath("results/{name}/{id}")] for x in srcs]
@@ -1854,7 +1860,7 @@ def pull_job(db, jid, to=None, srcs=None):
         except Fail as e:
             errs.append("%s: %s" % (src, e))
             continue
-        with open(os.path.join(dst, "tinyshed-%s.json" % jid), "w") as f:
+        with open(os.path.join(dst, "tshed-%s.json" % jid), "w") as f:
             json.dump(dict(id=jid, name=b.get("name"), host=r["host"], state=r["state"], rc=b.get("rc"), cmd=b.get("cmd"),
                            started=b.get("started"), ended=b.get("ended"), git=st.get("git"), source="%s:%s" % (r["host"], path),
                            pulled=time.time()), f, indent=2)
@@ -1902,7 +1908,7 @@ def clean_job(db, jid):
         try:
             got = json.loads(remote(h["dest"], ["rpc"], json.dumps(dict(clean=[jid]))))
             if "cleaned" not in got:
-                raise Fail("host runs an older tinyshed")
+                raise Fail("host runs an older tshed")
             if got["cleaned"].get(jid) not in ("cleaned", "absent"):
                 raise Fail("still %s there" % got["cleaned"].get(jid))
         except Exception as e:
@@ -1973,6 +1979,8 @@ def submit_parser(**kw):
     p.add_argument("--keep-work", action="store_true", help="keep the job's work dir on the host after it ends (default: deleted "
                    "once its results are pulled; the code stays recoverable with tshed checkout)")
     p.add_argument("-e", "--env", action="append", default=[], metavar="K=V")
+    p.add_argument("--owner", type=owner_id, help="who submits (default: AGENT-ROOT-SESSION from the agent's session, "
+                   "e.g. clau-myproj-<session id>; $TINYSHED_OWNER inside jobs)")
     p.add_argument("cmd", nargs=argparse.REMAINDER, help="command (run with bash -c)")
     return p
 
@@ -2019,6 +2027,97 @@ def stage_spec(a, jid):
     return st, cwd
 
 
+OWNER_AGENTS = (("CLAUDE_CODE_SESSION_ID", "clau"), ("MAKI_SESSION_ID", "maki"))  # session env var -> agent prefix
+
+
+def _git_out(cwd, *args):
+    try:
+        r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() or None if r.returncode == 0 else None
+
+
+def owner_id(s):
+    """An owner id: 1-128 printable characters, no whitespace."""
+    s = str(s).strip()
+    if not s or len(s) > 128 or not s.isprintable() or any(c.isspace() for c in s):
+        raise argparse.ArgumentTypeError("an owner is 1-128 characters without spaces (got %r)" % s)
+    return s
+
+
+def owner_origin(cwd=None, explicit=None):
+    """Who is submitting, as (owner id, origin). The id is AGENT-ROOT-SESSION (clau-tinyshed-cf93301b-…), so it
+    leads back to the agent's session: AGENT from its session variable (CLAUDE_CODE_SESSION_ID -> clau,
+    MAKI_SESSION_ID -> maki; neither: user, without a session), ROOT the project folder (the main repository's,
+    so all its worktrees share it). --owner, or $TINYSHED_OWNER (set inside jobs), is taken verbatim.
+    origin records the rest: agent, session, root, cwd, repo, branch, worktree (when not the main one), commit."""
+    cwd = os.path.abspath(cwd or os.getcwd())
+    o = dict(cwd=cwd)
+    top = _git_out(cwd, "rev-parse", "--show-toplevel")
+    if top:
+        common = _git_out(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        main = os.path.dirname(common) if common and os.path.basename(common) == ".git" else top
+        o.update(repo=main, branch=_git_out(cwd, "branch", "--show-current"), commit=_git_out(cwd, "rev-parse", "-q", "--verify", "HEAD"))
+        if os.path.realpath(top) != os.path.realpath(main):
+            o["worktree"] = top
+    agent, session = next(((name, os.environ[var]) for var, name in OWNER_AGENTS if os.environ.get(var)), ("user", None))
+    root = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(o.get("repo") or cwd)).strip("_") or "root"  # dashes stay
+    o.update(agent=agent, session=session, root=root)
+    if agent == "user":
+        o["user"] = os.environ.get("USER") or os.environ.get("LOGNAME")
+    given = explicit or os.environ.get("TINYSHED_OWNER")
+    if not given:
+        return "-".join(x for x in (agent, root, session) if x), o
+    if not explicit and os.environ.get("TINYSHED_JOB"):
+        o["parent"] = os.environ["TINYSHED_JOB"]  # submitted from inside that job, under its owner
+    o.update(parse_owner(given) or {})  # an inherited/given id still names its agent session
+    return owner_id(given), o
+
+
+_OWNER_RE = re.compile(r"(%s)-(.+)-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+                       r"|[1-9A-HJ-NP-Za-km-z]{16,24})$"  # a UUID (Claude, older maki) or base58 (maki's MakiId)
+                       % "|".join(name for _, name in OWNER_AGENTS))
+
+
+def parse_owner(oid):
+    """AGENT-ROOT-SESSION back into its parts ({agent, root, session}), or None for other ids."""
+    m = _OWNER_RE.match(oid or "")
+    return dict(agent=m[1], root=m[2], session=m[3]) if m else None
+
+
+def session_file(o):
+    """The agent's own record of the session an origin names (a transcript on this machine), or None."""
+    sid = o.get("session")
+    if not sid or "/" in sid:
+        return None
+    if o.get("agent") == "clau":
+        hits = sorted(glob.glob(os.path.expanduser("~/.claude/projects/*/%s.jsonl" % glob.escape(sid))))
+        return hits[0] if hits else None
+    if o.get("agent") == "maki":
+        path = os.path.expanduser("~/.maki/sessions/%s.jsonl" % sid)
+        return path if os.path.exists(path) else None
+    return None
+
+
+def job_origin(j):
+    try:
+        return json.loads(j.get("origin") or "{}")
+    except (TypeError, ValueError):
+        return {}
+
+
+def owner_segs(j):
+    """'Owner: ID  (branch B, worktree W)' for show and the detail view; nothing for jobs from before owners."""
+    if not j.get("owner"):
+        return []
+    o = job_origin(j)
+    where = ", ".join(x for x in ("branch " + o["branch"] if o.get("branch") else "",
+                                  "worktree " + o["worktree"] if o.get("worktree") else "",
+                                  "commit " + o["commit"][:10] if o.get("commit") else "") if x)
+    return [("", "Owner: "), (BOLD, clean(j["owner"]))] + ([(DIM, "   (%s)" % clean(where))] if where else [])
+
+
 def submit(db, argv, stage_now=False):
     """Queue a job. stage_now (the cli, with -H): copy its files before it is queued, so a failure is reported
     here and nothing is left behind; otherwise the server stages it before delivery."""
@@ -2029,11 +2128,13 @@ def submit(db, argv, stage_now=False):
     if a.stall_on_log and not a.stall:
         raise Fail("--stall-on-log needs --stall DURATION")
     jid = uuid.uuid4().hex[:8]
+    owner, origin = owner_origin(explicit=getattr(a, "owner", None))
     st, cwd = stage_spec(a, jid)
     spec = dict(name=a.name, cmd=cmd[0] if len(cmd) == 1 else shlex.join(cmd), cwd=cwd, env=dict(e.split("=", 1) for e in a.env),
                 prio=a.prio, cpus=a.cpus, mem_mb=a.mem, timeout=a.timeout or 2 * a.expect, retries=a.retries, retry_on=a.retry_on,
                 retry_delay=a.retry_delay, expect=a.expect, stall=a.stall, stall_on_log=int(a.stall_on_log),
-                trace_lines=int(a.trace_lines), work=int(bool(st.get("git") or st.get("push"))), stage=st)
+                trace_lines=int(a.trace_lines), work=int(bool(st.get("git") or st.get("push"))), stage=st,
+                owner=owner, origin=json.dumps(origin))
     staged = None
     if stage_now and a.host and needs_stage(st, a.host):
         h = db.execute("SELECT dest FROM hosts WHERE name=?", (a.host,)).fetchone()
@@ -2046,6 +2147,54 @@ def submit(db, argv, stage_now=False):
             raise Fail("staging on %s failed, job not queued: %s" % (a.host, e))
         staged = a.host
     return add_job(db, spec, a.host, jid, staged)
+
+
+def owners(db, part):
+    """Owners whose id contains part: their jobs' states, last origin, and the session file when it is local."""
+    found = {}
+    for r in db.execute("SELECT id, state, created, j FROM jobs ORDER BY created"):
+        b = _blob(r)
+        if b.get("owner") and part in b["owner"]:
+            g = found.setdefault(b["owner"], dict(owner=b["owner"], jobs=0, states={}, first=r["created"]))
+            g["jobs"] += 1
+            g["states"][r["state"]] = g["states"].get(r["state"], 0) + 1
+            o = job_origin(b)
+            if o and (not o.get("parent") or not g.get("origin")):  # where the owner itself submitted from
+                g["origin"] = o
+            g["last"] = r["created"]
+    for g in found.values():
+        g["origin"] = dict(g.get("origin") or {}, **(parse_owner(g["owner"]) or {}))
+        g["session_file"] = session_file(g["origin"])
+    return sorted(found.values(), key=lambda g: -g["last"])
+
+
+def owner_cmd(db, part, as_json):
+    if not part:
+        oid, o = owner_origin()
+        if as_json:
+            return print(json.dumps(dict(owner=oid, origin=o, session_file=session_file(o))))
+        print(oid)
+        for k in ("agent", "session", "root", "repo", "branch", "worktree", "commit", "cwd"):
+            if o.get(k):
+                print("  %-9s %s" % (k, o[k]))
+        return
+    found = owners(db, part)
+    if not found:
+        raise Fail("no owner matches %r" % part)
+    for g in found:
+        if as_json:
+            print(json.dumps(g))
+            continue
+        o = g["origin"]
+        print(paint(g["owner"], BOLD))
+        print("  jobs      %d (%s), %s .. %s" % (g["jobs"], ", ".join("%d %s" % (n, k) for k, n in sorted(g["states"].items())),
+                                                time.strftime("%Y-%m-%d %H:%M", time.localtime(g["first"])),
+                                                time.strftime("%Y-%m-%d %H:%M", time.localtime(g["last"]))))
+        for k in ("repo", "branch", "worktree", "cwd"):
+            if o.get(k):
+                print("  %-9s %s" % (k, o[k]))
+        if g["session_file"]:
+            print("  session   %s" % g["session_file"])
 
 
 def cancel(db, jid):
@@ -2076,7 +2225,7 @@ def host_answer(res, key, host):
     if res is None:
         raise Fail("host %s is unreachable; nothing changed" % host)
     if key not in res:
-        raise Fail("host %s runs an older tinyshed: run tshed install %s" % (host, host))
+        raise Fail("host %s runs an older tshed: run tshed install %s" % (host, host))
     return res[key]
 
 
@@ -2218,9 +2367,9 @@ def config_cmd(a, known):
     return rc
 
 
-PREFLIGHT = ("command -v python3 >/dev/null || { echo 'tinyshed: python3 not found on PATH' >&2; exit 1; }; "
+PREFLIGHT = ("command -v python3 >/dev/null || { echo 'tshed: python3 not found on PATH' >&2; exit 1; }; "
              "python3 -c 'import sys; sys.exit(sys.version_info < (3, 12))' || "
-             "{ echo \"tinyshed: python >= 3.12 required, found $(python3 -V 2>&1)\" >&2; exit 1; }; "
+             "{ echo \"tshed: python >= 3.12 required, found $(python3 -V 2>&1)\" >&2; exit 1; }; "
              "mkdir -p .tinyshed && cat > .tinyshed/tinyshed.py.new && mv .tinyshed/tinyshed.py.new .tinyshed/tinyshed.py && ")
 
 
@@ -3075,6 +3224,8 @@ def show(j, log):
         out(progress_segs(j))
     if stage_segs(j):
         out(stage_segs(j))
+    if owner_segs(j):
+        out(owner_segs(j))
     out([("", "Cmd: "), (BOLD, j["cmd"])])
     out([(DIM, "cwd %s   env %s   retry on %s   created %s   started %s   ended %s" % (
         j.get("cwd") or "~", j.get("env") if j.get("env") not in (None, "", "{}", {}) else "-", j.get("retry_on"), t("created"), t("started"), t("ended")))])
@@ -3256,7 +3407,7 @@ def tui(interval):
         else:
             up = sum(1 for h in hosts if h["seen"] and not h["err"])
             failed = sum(counts.get(k, 0) for k in FAILURES)
-            segs = [(BOLD_CYAN, "Tinyshed:"), ("", " "), (BOLD, str(total)), ("", " jobs   "),
+            segs = [(BOLD_CYAN, "tshed:"), ("", " "), (BOLD, str(total)), ("", " jobs   "),
                     (GREEN if counts.get("running") else DIM, "%d running" % counts.get("running", 0)), ("", "   "),
                     (YELLOW if counts.get("queued") else DIM, "%d queued" % counts.get("queued", 0))]
             if counts.get("pending"):
@@ -3312,6 +3463,7 @@ def tui(interval):
                                                          (DIM, "(%s on the host)" % ("~/.tinyshed/logs/%s.log" % j["id"]))], W),
              styled(meta_segs(j), W), *([styled(progress_segs(j), W)] if progress_segs(j) else []),
              *([styled(stage_segs(j), W)] if stage_segs(j) else []),
+             *([styled(owner_segs(j), W)] if owner_segs(j) else []),
              styled([("", "Cmd: "), (BOLD, clean(j["cmd"]))], W), "─" * W]
         text = st["log"][1] if st["log"][0] == j["id"] else (j.get("tail") or "")
         lines = [clean(l.rsplit("\r", 1)[-1]) for l in text.rstrip("\n").split("\n")] if text else []
@@ -3330,7 +3482,7 @@ def tui(interval):
         top = last if st["scroll"] is None else max(0, st["scroll"])
         st["rows"] = last  # for scrolling keys
         for l in lines[top:top + room]:
-            L.append((DIM + l[:W] + RESET) if l.startswith("=== tinyshed") else l[:W])
+            L.append((DIM + l[:W] + RESET) if l.startswith(("=== tinyshed", "=== tshed")) else l[:W])
         L.extend([""] * (H - 2 - len(L)))
         L.append(styled([st["msg"]], W) if st["msg"][1] else styled([(DIM, "Scroll: %d-%d/%d%s" % (
             top + 1, min(len(lines), top + room), len(lines), "   (following)" if st["scroll"] is None and j["state"] == "running" else "")
@@ -3350,7 +3502,8 @@ def tui(interval):
                 counts[j["state"]] = counts.get(j["state"], 0) + 1
             words = st["query"].lower().split()
             jobs = [j for j in everything if not (st["hide"] and j["state"] in TERMINAL)
-                    and all(w in ("%s %s %s %s %s" % (j["state"], j["host"], j["id"], j.get("name") or "", j["cmd"])).lower() for w in words)]
+                    and all(w in ("%s %s %s %s %s %s" % (j["state"], j["host"], j["id"], j.get("name") or "", j["cmd"], j.get("owner") or "")).lower()
+                            for w in words)]
             if st["detail"]:  # stay on the same job even as the list reorders
                 st["sel"] = next((i for i, j in enumerate(jobs) if j["id"] == st["detail"]), st["sel"])
             st["sel"] = max(0, min(st["sel"], len(jobs) - 1))
@@ -3634,7 +3787,7 @@ def build_parser():
     p.add_argument("-V", "--version", action="version", version="tshed " + VERSION)
     sub = p.add_subparsers(dest="op", metavar="COMMAND", title="commands")
     s = sub.add_parser("install", help="install or upgrade hosts over ssh and register them",
-                       description="Check each host, copy tinyshed to ~/.tinyshed, (re)start its agent and register it. Safe to "
+                       description="Check each host, copy tshed to ~/.tinyshed, (re)start its agent and register it. Safe to "
                                    "re-run at any time: running jobs are untouched and options you leave out keep their installed value.")
     s.add_argument("hosts", nargs="*", metavar="[NAME=]DEST", help="ssh destination, alternatives tried in order "
                    "(box.local,box), local[:DIR], or the NAME of a registered host; none = every registered host")
@@ -3658,7 +3811,15 @@ def build_parser():
     sub.add_parser("submit", help="queue a job", parents=[submit_parser(add_help=False)])
     s = sub.add_parser("ls", help="list jobs")
     s.add_argument("-a", "--all", action="store_true", help="include finished jobs")
+    s.add_argument("--owner", metavar="TEXT", help="only jobs whose owner contains TEXT (an agent, project or session)")
+    s.add_argument("--mine", action="store_true", help="only jobs submitted with the owner id submit would use here")
     s.add_argument("--json", action="store_true", help="one JSON object per line")
+    s = sub.add_parser("owner", help="who submitted what: your owner id, or an owner's jobs and session",
+                       description="Without ID: print the owner id `submit` would use here, and its origin. With ID (any "
+                                   "part of one): each matching owner's jobs by state, where it submitted from (repo, branch, "
+                                   "worktree, cwd) and the agent's session transcript when it is on this machine.")
+    s.add_argument("id", nargs="?", metavar="ID")
+    s.add_argument("--json", action="store_true", help="one JSON object per owner")
     s = sub.add_parser("overview", help="one-screen snapshot of hosts and active jobs",
                        description="Non-interactive digest of `tshed hosts | head -N; echo ---LS; tshed ls | head -N`: "
                                    "ping once, then print the hosts table and the active-jobs table, each capped at -n lines.")
@@ -3706,7 +3867,7 @@ def build_parser():
     s.add_argument("--since", type=dur, help="only jobs submitted within this long, e.g. 30d")
     s.add_argument("--json", action="store_true", help="one JSON object per name")
     s = sub.add_parser("checkout", help="a --git job's code from its snapshot: into a folder, or its changes as a diff",
-                       description="Rebuild the exact code a --git job ran from tinyshed's snapshot store (no host contact, also "
+                       description="Rebuild the exact code a --git job ran from tshed's snapshot store (no host contact, also "
                                    "after its work dir was cleaned): the files into DIR (default ./NAME-ID, must not exist "
                                    "or be empty), or with --diff the changes the snapshot carried on top of its base commit.")
     s.add_argument("id")
@@ -3716,7 +3877,7 @@ def build_parser():
     s = sub.add_parser("fetch", help="copy a job's results from its host now",
                        description="Copy files from a job's host into local folders now, whatever its state (a running job "
                                    "gives a snapshot). Without SRC: the job's --pull list. A folder's contents land in the "
-                                   "destination folder; a file lands inside it. Each destination gets tinyshed-ID.json.")
+                                   "destination folder; a file lands inside it. Each destination gets tshed-ID.json.")
     s.add_argument("id")
     s.add_argument("srcs", nargs="*", metavar="SRC", help="paths relative to the job's working directory on the host")
     s.add_argument("--to", metavar="DIR", help="local folder for everything (default: each --pull DEST, or results/{name}/{id})")
@@ -3762,7 +3923,7 @@ def build_parser():
     s = sub.add_parser("progress", help="report a checkpoint from inside a job (does nothing outside one)",
                        description="Write a checkpoint for the running job to $TINYSHED_PROGRESS. Every call resets the "
                                    "--stall clock; a leading DONE/TOTAL or PCT% gives the dashboard a percentage and an ETA. "
-                                   "Outside a tinyshed job it does nothing, so scripts run unchanged elsewhere. "
+                                   "Outside a tshed job it does nothing, so scripts run unchanged elsewhere. "
                                    "Without python: printf '%s\\n' \"3/10 msg\" > \"$TINYSHED_PROGRESS\".")
     s.add_argument("words", nargs="*", metavar="[DONE/TOTAL|PCT%] MESSAGE")
     s = sub.add_parser("completion", help="print a shell completion script")
@@ -3983,6 +4144,8 @@ def main():
             print(paint(host_head(gw), BOLD))
             for h in hosts:
                 out(host_segs(h, gw))
+    elif a.op == "owner":
+        owner_cmd(db, a.id, a.json)
     elif a.op == "overview":
         overview(db, a.lines, a.all)
     elif a.op == "submit":
@@ -3997,10 +4160,12 @@ def main():
                               "waiting for a host with enough idle cores; the next sync places it (tshed wait/ls, serve or the dashboard)"), file=sys.stderr)
     elif a.op == "ls":
         sync_all()
-        jobs = [j for j in load_jobs(db, load_hosts(db)) if a.all or j["state"] not in TERMINAL]
+        mine = owner_origin()[0] if a.mine else None
+        jobs = [j for j in load_jobs(db, load_hosts(db)) if (a.all or j["state"] not in TERMINAL)
+                and (not a.owner or a.owner in (j.get("owner") or "")) and (not mine or j.get("owner") == mine)]
         if a.json:
             keys = ("id", "name", "host", "state", "prio", "attempt", "rc", "cmd", "created", "started", "ended", "peak_mb",
-                    "cpus", "mem_mb", "cpu_pct", "rss_mb", "timeout", "expect", "stall", "progress", "beat", "paused_s", "stage")
+                    "cpus", "mem_mb", "cpu_pct", "rss_mb", "timeout", "expect", "stall", "progress", "beat", "paused_s", "stage", "owner")
             for j in jobs:
                 f, left = job_progress(j)
                 print(json.dumps(dict({k: j.get(k) for k in keys}, done=f, eta=left, **{"wait" if j.get("waiting") else "ran": round(j["t"], 1)})))
@@ -4054,7 +4219,7 @@ def main():
         for x in done:
             print(jid, "pulled", x)
         for e in errs:
-            print("tinyshed: %s %s" % (jid, e), file=sys.stderr)
+            print("tshed: %s %s" % (jid, e), file=sys.stderr)
         return 1 if errs else 0
     elif a.op in ("pause", "resume"):
         ids = [resolve(db, i) for i in a.ids]
@@ -4091,7 +4256,7 @@ def main():
             for n, text in [] if a.files else hits:
                 out([(DIM, "%7d: " % n), ("", clean(text))])
         for e in errs:
-            print("tinyshed: grep on %s" % e, file=sys.stderr)
+            print("tshed: grep on %s" % e, file=sys.stderr)
         return 0 if found else 1
     elif a.op == "stats":
         rows = job_stats(db, set(a.names) or None, time.time() - a.since if a.since else 0)
@@ -4186,7 +4351,7 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Fail as e:
-        sys.exit("tinyshed: %s" % e)
+        sys.exit("tshed: %s" % e)
     except KeyboardInterrupt:
         sys.exit(130)
     except BrokenPipeError:  # e.g. `tshed ls -a | head`

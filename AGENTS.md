@@ -1,27 +1,31 @@
-# AGENTS.md — tinyshed
+# AGENTS.md — tshed
 
 Priority-queue scheduler for long jobs: one server, N hosts, ssh between. Everything is in
-`tinyshed.py`; the same file runs on the server and is copied to each host. The user-facing command
+`tshed.py`; the same file runs on the server and is copied to each host. The user-facing command
 is `tshed` (a symlink to it). Never call it `ts`: that name belongs to TypeScript tooling.
 
-To *use* tinyshed (submit/monitor jobs) read `skills/tinyshed/SKILL.md` instead. This file is for
+To *use* tshed (submit/monitor jobs) read `skills/tshed/SKILL.md` instead. This file is for
 changing the code.
 
 ## Files
 
 | file | what |
 |---|---|
-| `tinyshed.py` | all code; sections in order: shared (sqlite, hooks, zstd) → host state → watchdog → agent → rpc/setup → server state/transport → server ops → tables + TUI → cli |
+| `tshed.py` | all code; sections in order: shared (sqlite, hooks, zstd) → host state → watchdog → agent → rpc/setup → server state/transport → server ops → tables + TUI → cli |
 | `README.md` | reference: design, commands, hooks, limits |
 | `HUMANS.md` | tutorial |
-| `skills/tinyshed/SKILL.md` | agent usage skill |
-| `btop-themes/` | btop `.theme` files matching the built-in `tailwind-*` themes (for btop itself; tinyshed does not read them) |
+| `skills/tshed/SKILL.md` | agent usage skill |
+| `btop-themes/` | btop `.theme` files matching the built-in `tailwind-*` themes (for btop itself; tshed does not read them) |
 | `IDEAS_HEAP.md` | considered, not scheduled (binary packaging). Do not build from it unasked |
-| `test_tinyshed.py` | unit tests (stdlib unittest; temp `TINYSHED_HOME`, no ssh, no daemons). Not installed on hosts |
+| `test_tshed.py` | unit tests (stdlib unittest; temp `TINYSHED_HOME`, no ssh, no daemons). Not installed on hosts |
 
 ## Invariants — do not break
 
 - **One file, stdlib only**, Python ≥ 3.12. Install is `cat > ~/.tinyshed/tinyshed.py` over ssh.
+- **Runtime names are frozen** even though the project is `tshed` (repo file `tshed.py`): the home
+  `~/.tinyshed`, the env vars `TINYSHED_*` and the deployed file `tinyshed.py` on hosts are a live
+  compat contract (existing installs, crontab marks, systemd unit, `refs/tinyshed/`); only branding
+  strings say `tshed`.
 - **Host is authoritative.** `host.db` (sqlite WAL) owns the queue and event log; `server.db` is a
   mirror built only from events (`ingest`). Never make a host wait on the server.
 - **Every rpc op is idempotent** (`INSERT OR IGNORE` on job id, cancel flag, event cursor). The server
@@ -51,9 +55,9 @@ and other people's running jobs: never test against it.
 
 ```sh
 export TINYSHED_HOME=/tmp/ts/server
-./tinyshed.py install a=local:/tmp/ts/a b=local:/tmp/ts/b --cores 0-1 --home local
-./tinyshed.py submit -H a -t 2s -- sleep 30 ; ./tinyshed.py wait -i 1 <id> ; ./tinyshed.py ls -a
-./tinyshed.py uninstall a b --purge ; rm -rf /tmp/ts     # agents are daemons: always clean up
+./tshed.py install a=local:/tmp/ts/a b=local:/tmp/ts/b --cores 0-1 --home local
+./tshed.py submit -H a -t 2s -- sleep 30 ; ./tshed.py wait -i 1 <id> ; ./tshed.py ls -a
+./tshed.py uninstall a b --purge ; rm -rf /tmp/ts     # agents are daemons: always clean up
 ```
 
 - `local:DIR` hosts skip ssh; `--home local` exercises phone-home.

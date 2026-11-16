@@ -1,11 +1,11 @@
 ---
-name: tinyshed
-description: Run long jobs on the user's remote hosts with tinyshed / tshed - priority queue, expected runtime and 2x timeout, progress checkpoints with stall detection, memory limit, retries, captured logs; ships a git snapshot of local code (+ files) to the host and pulls results back into local folders. Use when asked to queue, schedule or run something remotely or on another machine, run a repo/script on a GPU or big host, monitor, pause, cancel, debug a stuck or failed job, search job logs, fetch results, estimate how long a job takes, or check which hosts have free cores/memory/GPUs.
+name: tshed
+description: Run long jobs on the user's remote hosts with tshed - priority queue, expected runtime and 2x timeout, progress checkpoints with stall detection, memory limit, retries, captured logs; ships a git snapshot of local code (+ files) to the host and pulls results back into local folders. Use when asked to queue, schedule or run something remotely or on another machine, run a repo/script on a GPU or big host, monitor, pause, cancel, debug a stuck or failed job, search job logs, fetch results, estimate how long a job takes, or check which hosts have free cores/memory/GPUs.
 ---
 
-# tinyshed
+# tshed
 
-CLI: `tshed` (on PATH: a symlink to `tinyshed.py` of the tinyshed repo). Run it from this machine (the
+CLI: `tshed` (on PATH: a symlink to `tshed.py` of the tshed repo). Run it from this machine (the
 server); it reaches hosts over ssh itself. Never run bare `tshed`, `tshed tui` or `tshed logs -f`:
 those are interactive.
 
@@ -23,14 +23,14 @@ those are interactive.
    n=${#files[@]}; i=0
    for f in "${files[@]}"; do
      process "$f"
-     tshed progress "$((++i))/$n" "$f"     # no-op outside tinyshed; ~0.1 s per call
+     tshed progress "$((++i))/$n" "$f"     # no-op outside tshed; ~0.1 s per call
    done
    # tight loops (many iterations per second): write the file directly, no python startup
    printf '%d/%d %s\n' "$i" "$n" "$f" > "$TINYSHED_PROGRESS"
    ```
    ```python
    import os
-   def progress(done, total, msg=""):  # python jobs: same file, no-op outside tinyshed
+   def progress(done, total, msg=""):  # python jobs: same file, no-op outside tshed
        if p := os.environ.get("TINYSHED_PROGRESS"):
            with open(p, "w") as f: f.write(f"{done}/{total} {msg}\n")
    ```
@@ -62,7 +62,7 @@ unfinished job of that name wins).
 - Name every output you need with `--pull SRC:DEST` (SRC relative to the job's working directory,
   DEST a local folder; `{name} {id} {host} {state}`). Results are pulled when the job ends (also on
   failure, not on cancel), by `tshed wait` before it returns, and by `serve`/the dashboard. Each DEST
-  gets `tinyshed-ID.json` (job, host, state, rc, command, times, git snapshot).
+  gets `tshed-ID.json` (job, host, state, rc, command, times, git snapshot).
 - **After the pull the job's work dir on the host is deleted.** Anything not in `--pull` is gone;
   use `--keep-work` only when someone must inspect the host afterwards.
 - `tshed fetch ID [SRC...] [--to DIR]` copies results now, also from a running job (a snapshot).
@@ -78,7 +78,8 @@ tshed submit -n NAME -x SECONDS [flags] -- CMD
 tshed wait ID... [-t 2h]      # blocks; prints "ID STATE [pulled …]"; exit 0 all done, 1 any failed, 2 timeout
 tshed show ID                 # state, limits, rc, times, progress + ETA, code/push/pull status, last 2 kB of output
 tshed logs ID [-n BYTES]      # tail of stdout+stderr (default 20000 bytes)
-tshed ls [-a] --json          # one JSON object per job (-a: finished too); see fields below
+tshed ls [-a] --json [--mine] # one JSON object per job (-a: finished too; --mine: yours only); see fields below
+tshed owner [TEXT]            # your owner id (clau-PROJECT-SESSION); with TEXT: whose jobs, from where
 tshed overview [-n N] [-a]    # one-screen snapshot: hosts + active jobs
 tshed where ID [--json]       # running job: process tree, each bash script's line, python stacks (py-spy)
 tshed grep PATTERN [ID...] [-i] [-l] [--name N] [--state error] [--since 2d] [-m N]   # search logs on all hosts
@@ -92,7 +93,7 @@ tshed config [--host HOST]    # show config.json (cores, name, home)
 ```
 
 `ls --json` fields: `id name host state prio attempt rc cmd created started ended timeout expect
-stall cpus mem_mb peak_mb paused_s stage`; running jobs add `cpu_pct` (% of their `-c` cores) and
+stall cpus mem_mb peak_mb paused_s stage owner`; running jobs add `cpu_pct` (% of their `-c` cores) and
 `rss_mb`; `progress` (last checkpoint), `done` (0-1), `eta` (seconds left); `ran` (run time of this
 attempt, pauses excluded) or `wait` (time waiting so far).
 
@@ -144,7 +145,9 @@ queued job may wait behind a larger one. In `ls`, a waiting job's Time is in bra
 
 ## Rules
 
-- The queue is shared with the user and other agents (`tshed ls` shows their jobs too). Do not
+- The queue is shared with the user and other agents (`tshed ls` shows their jobs too). Every job
+  records its owner, detected from your session (`clau-PROJECT-SESSION`): `tshed ls --mine` lists
+  yours, the `owner` field in `--json` says whose a job is. Do not pass `--owner` unless asked. Do not
   cancel, pause, re-prioritise or edit (`prio`/`edit`, including `--force`) jobs you did not submit,
   and do not `tshed install`/`uninstall`, `tshed config --edit`, or edit `~/.tinyshed/hooks.py`, unless asked.
 - For jobs longer than a few minutes, do not block on `tshed wait` without `-t`; report the ID and

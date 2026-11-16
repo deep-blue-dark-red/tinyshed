@@ -1,8 +1,8 @@
-# tinyshed tutorial
+# tshed tutorial
 
 A walk from nothing to a small cluster running your jobs. `README.md` is the reference; this is the
-guided tour. The command is `tshed`: a symlink to `tinyshed.py` somewhere on your `PATH`
-(`ln -s $PWD/tinyshed.py ~/bin/tshed`).
+guided tour. The command is `tshed`: a symlink to `tshed.py` somewhere on your `PATH`
+(`ln -s $PWD/tshed.py ~/bin/tshed`).
 
 ## 0. What you need
 
@@ -51,7 +51,7 @@ gpu2          ✓ up      1.2   12%    16/16      57/62G   1.5/4.0G      88~ 12t
 ```
 
 `Load` is the machine-wide 1-minute load average; `CPU%` is the busy percentage of the cores
-tinyshed owns (`-` until two polls have happened). `Used/Res` is the live RAM of running jobs over
+tshed owns (`-` until two polls have happened). `Used/Res` is the live RAM of running jobs over
 their combined `-m` limits; `Mem free` is the whole machine's available/total; `Freq` is the mean
 clock of those cores. `Disk free` is free GB on the host's home and `/tmp`; red under 2 GB, which
 also fires `OnCriticalDisk`. `GPU` is NVIDIA utilization and memory used/total per GPU (`88% 9.1/12G :0`;
@@ -131,7 +131,7 @@ done
 ```
 
 `tshed progress` exists on every host inside a job, and does nothing when the script runs outside
-tinyshed. With `-x` and a `DONE/TOTAL` (or `PCT%`) checkpoint, a step that takes more than twice its share of
+tshed. With `-x` and a `DONE/TOTAL` (or `PCT%`) checkpoint, a step that takes more than twice its share of
 the expected time kills the job as `stalled`. The share is measured by what each checkpoint advanced, so
 reporting every item, every 1000th or every 10% all work, and the limit is never below 10 s; `--stall DUR` sets a fixed limit instead. The dashboard's
 Progress column shows percent and ETA. For a command you cannot edit that prints as it works,
@@ -175,7 +175,7 @@ tshed wait sweep                      # ... done pulled out → /home/me/results
 `--git` runs the job on an exact snapshot of your working tree (uncommitted changes and new files
 included, ignored files not), in its own checkout on the host, so you can keep editing while it runs.
 `--push` copies extra files or folders next to it; `--pull` copies results back when the job ends,
-into folders you name, with a `tinyshed-ID.json` that records what produced them. `tshed fetch ID`
+into folders you name, with a `tshed-ID.json` that records what produced them. `tshed fetch ID`
 copies them at any time, also from a running job.
 
 After the pull the job's work dir on the host is deleted (`--keep-work` keeps it), so pull everything

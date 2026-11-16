@@ -1,5 +1,5 @@
 [project]
-name = "tinyshed"
+name = "tshed"
 version = "0.2"
 description = "A minimal priority-queue scheduler for long jobs: one server, N hosts, ssh in between. One file, stdlib only."
 readme = "README.md"
@@ -10,5 +10,5 @@ requires-python = ">=3.12"
 dependencies = []
 
 [tool.uv]
-# not a package: tinyshed is the single file tinyshed.py, installed by copying it (see README)
+# not a package: tshed is the single file tshed.py, installed by copying it (see README)
 package = false

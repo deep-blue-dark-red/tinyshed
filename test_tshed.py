@@ -416,7 +416,8 @@ class TestServerJobs(ServerBase):
             self.add("x", host="ghost")
 
     def test_migrates_old_server_db(self):
-        """A server.db from before the indexes keeps its rows and gains them on connect."""
+        """A server.db from before the indexes keeps its rows and gains them on connect; the first, mis-ordered
+        per-host index goes."""
         self.db.close()
         for suffix in ("", "-wal", "-shm"):
             with contextlib.suppress(FileNotFoundError):
@@ -424,13 +425,27 @@ class TestServerJobs(ServerBase):
         db = sqlite3.connect(os.path.join(self.home, "server.db"))
         db.executescript("CREATE TABLE jobs(id TEXT PRIMARY KEY, host TEXT, prio INT, state TEXT, created REAL,"
                          " sent INT DEFAULT 0, cancel INT DEFAULT 0, eid INT DEFAULT 0, j TEXT, stage TEXT);"
+                         "CREATE INDEX jobs_out ON jobs(host, state, sent, cancel);"
                          "INSERT INTO jobs(id, host, state) VALUES('old1', 'h1', 'done');")
         db.close()
         db = t.sdb()
         idx = {r[1] for r in db.execute("PRAGMA index_list(jobs)")}
-        self.assertTrue({"jobs_out", "jobs_queue"} <= idx)
+        self.assertTrue({"jobs_host", "jobs_queue"} <= idx)
+        self.assertNotIn("jobs_out", idx)
         self.assertEqual(db.execute("SELECT state FROM jobs WHERE id='old1'").fetchone()[0], "done")
         db.close()
+
+    def test_per_host_queries_use_the_whole_index(self):
+        """The three per-host sync queries match every column of jobs_host, the cancel one too (state last)."""
+        plan = lambda q, args: " ".join(r[3] for r in self.db.execute("EXPLAIN QUERY PLAN " + q, args))
+        terminal = ",".join("?" * len(t.TERMINAL))
+        for q, args, cols in (("SELECT id FROM jobs WHERE host=? AND sent=0 AND cancel=0 AND state='pending'", ("h1",),
+                               "host=? AND sent=? AND cancel=? AND state=?"),
+                              ("SELECT id FROM jobs WHERE host=? AND sent=1 AND cancel=1 AND state NOT IN (%s)" % terminal,
+                               ("h1",) + t.TERMINAL, "host=? AND sent=? AND cancel=?"),
+                              ("SELECT j FROM jobs WHERE host=? AND sent=0 AND state='pending'", ("h1",), "host=? AND sent=?")):
+            with self.subTest(q=q):
+                self.assertIn("USING INDEX jobs_host (%s" % cols, plan(q, args))
 
     def test_resolve(self):
         a = t.add_job(self.db, dict(name="train", cmd="true"), jid="abc12345")
@@ -480,6 +495,104 @@ class TestServerJobs(ServerBase):
         t.dispatch(self.db)
         placed = {r[0]: r[1] for r in self.db.execute("SELECT id, host FROM jobs")}
         self.assertEqual((placed[hi], placed[lo]), ("h1", None))
+
+
+class TestJobList(ServerBase):
+    """The dashboard's cached job list must always equal a fresh load_jobs: order, counts, search, positions."""
+
+    def setUp(self):
+        super().setUp()
+        self.rng = __import__("random").Random(7)
+        self.cache = t.JobList()
+        self.clocks = t.host_clocks([])
+
+    def add(self, n):
+        for _ in range(n):
+            t.add_job(self.db, dict(name=self.rng.choice(["train", "eval", "sweep"]), cmd="python run.py --seed %d" % self.rng.randrange(99),
+                                    prio=self.rng.randrange(3), owner=self.rng.choice(["clau-a-x", "maki-b-y", None])))
+
+    def churn(self, n):
+        """What syncs do to rows: state changes (with an end time), re-prioritising, being placed on a host."""
+        ids = [r[0] for r in self.db.execute("SELECT id FROM jobs")]
+        for jid in self.rng.sample(ids, min(n, len(ids))):
+            b = t.unpack(self.db.execute("SELECT j FROM jobs WHERE id=?", (jid,)).fetchone()[0])
+            state = self.rng.choice(["pending", "queued", "running", "done", "error", "cancelled"])
+            b.update(state=state, ended=time.time() + self.rng.random() if state in t.TERMINAL else None,
+                     started=time.time() if state != "pending" else None)
+            self.db.execute("UPDATE jobs SET state=?, prio=?, host=?, j=? WHERE id=?",
+                            (state, self.rng.randrange(3), self.rng.choice([None, "h1"]), t.pack(b), jid))
+
+    def check(self):
+        self.cache.refresh(self.db, self.clocks)
+        fresh = t.load_jobs(self.db, [])
+        self.assertEqual([j["id"] for j in self.cache.jobs], [j["id"] for j in fresh])
+        want = {}
+        for j in fresh:
+            want[j["state"]] = want.get(j["state"], 0) + 1
+        self.assertEqual({k: v for k, v in self.cache.counts.items() if v}, want)
+        for query, hide in (("", True), ("train", False), ("train 1", False), ("clau", True), ("nothing-matches", False)):
+            words = query.lower().split()
+            expect = [j["id"] for j in fresh if not (hide and j["state"] in t.TERMINAL)
+                      and all(w in ("%s %s %s %s %s %s" % (j["state"], j["host"], j["id"], j.get("name") or "", j["cmd"],
+                                                         j.get("owner") or "")).lower() for w in words)]
+            with self.subTest(query=query, hide=hide):
+                shown = self.cache.shown(query, hide)
+                self.assertEqual([j["id"] for j in shown], expect)
+                for n in (0, len(shown) // 2, len(shown) - 1) if shown else ():
+                    self.assertEqual(self.cache.position(shown, shown[n]["id"]), n)
+
+    def test_rev_counts_every_insert_and_update(self):
+        self.add(2)
+        revs = [r[0] for r in self.db.execute("SELECT rev FROM jobs ORDER BY rev")]
+        self.assertEqual(revs, [1, 2])
+        self.db.execute("UPDATE jobs SET prio=5 WHERE rev=1")
+        self.assertEqual(sorted(r[0] for r in self.db.execute("SELECT rev FROM jobs")), [2, 3])
+
+    def test_old_server_db_gains_revs(self):
+        self.db.execute("DROP TRIGGER jobs_rev_insert")
+        self.db.execute("DROP TRIGGER jobs_rev_update")
+        self.db.execute("DROP INDEX jobs_rev")
+        self.db.execute("ALTER TABLE jobs DROP COLUMN rev")
+        self.db.execute("INSERT INTO jobs(id, state, created, j) VALUES('old1', 'done', 1, ?)", (t.pack(dict(t.SPEC, id="old1", cmd="x", created=1.0)),))
+        db = t.sdb()
+        self.assertEqual(db.execute("SELECT rev FROM jobs WHERE id='old1'").fetchone()[0], 0)
+        self.cache.refresh(db, self.clocks)  # rev 0 rows load on the first refresh
+        self.assertEqual([j["id"] for j in self.cache.jobs], ["old1"])
+        db.execute("UPDATE jobs SET state='error' WHERE id='old1'")
+        self.assertGreater(db.execute("SELECT rev FROM jobs WHERE id='old1'").fetchone()[0], 0)
+
+    def test_incremental_changes_match_a_full_load(self):
+        self.add(120)
+        self.check()  # first load: bulk
+        for _ in range(12):  # small batches: each row moved into place
+            self.churn(5)
+            self.add(2)
+            self.check()
+
+    def test_bulk_changes_match_a_full_load(self):
+        self.add(50)
+        self.check()
+        t.JobList.BULK, saved = 4, t.JobList.BULK
+        try:
+            self.churn(30)
+            self.check()
+        finally:
+            t.JobList.BULK = saved
+
+    def test_quiet_frames_read_nothing(self):
+        self.add(10)
+        self.assertTrue(self.cache.refresh(self.db, self.clocks))
+        self.assertFalse(self.cache.refresh(self.db, self.clocks))
+        first = self.cache.shown("train", False)
+        self.assertIs(self.cache.shown("train", False), first)  # same search, no change: the same list
+
+    def test_growing_search_narrows_previous_matches(self):
+        self.add(40)
+        self.cache.refresh(self.db, self.clocks)
+        wide = self.cache.shown("python", False)
+        narrow = self.cache.shown("python run.py --seed 1", False)
+        self.assertTrue(set(map(id, narrow)) <= set(map(id, wide)))
+        self.assertEqual([j["id"] for j in self.cache.shown("python", False)], [j["id"] for j in wide])  # shrinking: from scratch
 
 
 # ───────────────────────────────────────────────────────────────── rendering and cli

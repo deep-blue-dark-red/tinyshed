@@ -22,7 +22,7 @@ Callbacks: put functions in ~/.tinyshed/hooks.py (server and/or host), each taki
   OnJobProgress OnJobPaused OnJobResumed  OnCriticalDisk (~ or /tmp under 2G free)
   OnHostDown OnHostUp (server only)   OnEvent (everything)
 """
-import argparse, contextlib, fcntl, glob, importlib, json, os, re, shlex, shutil, signal, sqlite3, subprocess, sys, tempfile, threading, time, traceback, uuid
+import argparse, bisect, contextlib, fcntl, glob, importlib, json, os, re, shlex, shutil, signal, sqlite3, subprocess, sys, tempfile, threading, time, traceback, uuid
 
 VERSION = "0.2"
 HOME = os.path.abspath(os.path.expanduser(os.environ.get("TINYSHED_HOME") or "~/.tinyshed"))
@@ -1513,9 +1513,9 @@ SERVER_SCHEMA = """
 CREATE TABLE IF NOT EXISTS hosts(name TEXT PRIMARY KEY, dest TEXT, epoch TEXT, cursor INT DEFAULT 0,
   seen REAL DEFAULT 0, err TEXT, status TEXT);
 CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, host TEXT, prio INT, state TEXT, created REAL,
-  sent INT DEFAULT 0, cancel INT DEFAULT 0, eid INT DEFAULT 0, j TEXT, stage TEXT);
+  sent INT DEFAULT 0, cancel INT DEFAULT 0, eid INT DEFAULT 0, j TEXT, stage TEXT, rev INT DEFAULT 0);
 CREATE TABLE IF NOT EXISTS events(host TEXT, eid INT, ts REAL, job TEXT, kind TEXT, data TEXT, PRIMARY KEY(host, eid));
-CREATE INDEX IF NOT EXISTS jobs_out ON jobs(host, state, sent, cancel);  -- per-host sync + caps scans
+CREATE INDEX IF NOT EXISTS jobs_host ON jobs(host, sent, cancel, state);  -- per-host sync + caps (state last: NOT IN)
 CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(state, prio DESC, created);  -- dispatch + terminal sweeps
 """
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=15",
@@ -1523,14 +1523,29 @@ SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliv
 REMOTE_PY = "python3 .tinyshed/tinyshed.py "
 
 
+# jobs.rev: a server-wide counter stamped on every insert and update (old code's writes too, being a trigger),
+# so the dashboard re-reads only the rows that changed since its last frame
+REV_SCHEMA = """
+CREATE INDEX IF NOT EXISTS jobs_rev ON jobs(rev);
+CREATE TRIGGER IF NOT EXISTS jobs_rev_insert AFTER INSERT ON jobs BEGIN
+  UPDATE jobs SET rev=(SELECT coalesce(max(rev), 0) + 1 FROM jobs) WHERE rowid=NEW.rowid; END;
+CREATE TRIGGER IF NOT EXISTS jobs_rev_update AFTER UPDATE ON jobs WHEN NEW.rev IS OLD.rev BEGIN
+  UPDATE jobs SET rev=(SELECT coalesce(max(rev), 0) + 1 FROM jobs) WHERE rowid=NEW.rowid; END;
+"""
+
+
 def sdb():
     db = connect("server.db", SERVER_SCHEMA)
-    if "stage" not in {r[1] for r in db.execute("PRAGMA table_info(jobs)")}:  # v0.2 servers predate file staging
-        try:
-            db.execute("ALTER TABLE jobs ADD COLUMN stage TEXT")
-        except sqlite3.OperationalError as e:
-            if "duplicate" not in str(e):
-                raise
+    have = {r[1] for r in db.execute("PRAGMA table_info(jobs)")}
+    for col, decl in (("stage", "TEXT"), ("rev", "INT DEFAULT 0")):  # v0.2 servers predate file staging, and revs
+        if col not in have:
+            try:
+                db.execute("ALTER TABLE jobs ADD COLUMN %s %s" % (col, decl))
+            except sqlite3.OperationalError as e:
+                if "duplicate" not in str(e):
+                    raise
+    db.executescript(REV_SCHEMA)
+    db.execute("DROP INDEX IF EXISTS jobs_out")  # the first per-host index: state second, so NOT IN stopped it at host
     return db
 
 
@@ -3024,34 +3039,135 @@ def _blob(r):
     return _jcache[r["id"]][1]
 
 
-def load_jobs(db, hosts):
-    skew = {h["name"]: h["s"].get("skew", 0) for h in hosts}
-    live = {h["name"]: h["s"].get("jobs") or {} for h in hosts}
-    out = []
-    for r in db.execute("SELECT * FROM jobs"):
-        j = dict(_blob(r))
-        j.update(id=r["id"], host=r["host"], state=r["state"], prio=r["prio"], sent=r["sent"], cancel=r["cancel"],
-                 stage=json.loads(r["stage"]) if r["stage"] else None)
-        # durations: a run counts from this attempt's start, minus time spent paused; a waiting job shows how
-        # long it has been waiting (since submit, or since its previous attempt ended), rendered in brackets
-        j["now"] = now = time.time() + skew.get(r["host"], 0)  # the host's clock, like started/ended/beat
-        started, paused_s = j.get("started"), j.get("paused_s") or 0
-        if j["state"] in ("running", "paused"):
-            j["t"] = (j.get("paused_at") or now if j["state"] == "paused" else now) - (started or now) - paused_s
-            j["cpu_pct"], j["rss_mb"] = live.get(r["host"], {}).get(r["id"]) or (None, None)
-        elif j["state"] in TERMINAL and started:
-            j["t"] = (j.get("ended") or started) - started - paused_s
-        elif j["state"] in TERMINAL:  # ended before it ever ran (cancelled while waiting)
-            j["t"], j["waiting"] = (j.get("ended") or j["created"]) - j["created"], True
-        else:
-            j["t"], j["waiting"] = (now - j["ended"] if j.get("attempt") and j.get("ended") else time.time() - j["created"]), True
-        out.append(j)
+def job_row(r, blob):
+    """A server jobs row as the tables use it: the job's payload plus the row's own columns."""
+    j = dict(blob)
+    j.update(id=r["id"], host=r["host"], state=r["state"], prio=r["prio"], sent=r["sent"], cancel=r["cancel"],
+             stage=json.loads(r["stage"]) if r["stage"] else None)
+    return j
 
-    def rank(j):  # running, then waiting by priority, then finished most-recent-first
-        if j["state"] in TERMINAL:
-            return (2, -(j.get("ended") or j["created"]), 0)
-        return (0 if j["state"] in ("running", "paused") else 1, -j["prio"], j["created"])
-    return sorted(out, key=rank)
+
+def host_clocks(hosts):
+    """(clock skew per host, live usage per host and job): what job_times needs from the hosts table."""
+    return {h["name"]: h["s"].get("skew", 0) for h in hosts}, {h["name"]: h["s"].get("jobs") or {} for h in hosts}
+
+
+def job_times(j, clocks):
+    """Fill j's time-dependent fields (now, t, waiting, live cpu_pct/rss_mb); returns j.
+    A run counts from this attempt's start, minus time spent paused; a waiting job shows how long it has
+    been waiting (since submit, or since its previous attempt ended), rendered in brackets."""
+    skew, live = clocks
+    j["now"] = now = time.time() + skew.get(j["host"], 0)  # the host's clock, like started/ended/beat
+    started, paused_s = j.get("started"), j.get("paused_s") or 0
+    if j["state"] in ("running", "paused"):
+        j["t"] = (j.get("paused_at") or now if j["state"] == "paused" else now) - (started or now) - paused_s
+        j["cpu_pct"], j["rss_mb"] = live.get(j["host"], {}).get(j["id"]) or (None, None)
+    elif j["state"] in TERMINAL and started:
+        j["t"] = (j.get("ended") or started) - started - paused_s
+    elif j["state"] in TERMINAL:  # ended before it ever ran (cancelled while waiting)
+        j["t"], j["waiting"] = (j.get("ended") or j["created"]) - j["created"], True
+    else:
+        j["t"], j["waiting"] = (now - j["ended"] if j.get("attempt") and j.get("ended") else time.time() - j["created"]), True
+    return j
+
+
+def job_rank(j):
+    """Table order: running, then waiting by priority, then finished most-recent-first; the id breaks ties.
+    Only fields that change with the row (state, prio, created, ended), so a cached rank stays valid."""
+    if j["state"] in TERMINAL:
+        return (2, -(j.get("ended") or j["created"]), 0, j["id"])
+    return (0 if j["state"] in ("running", "paused") else 1, -j["prio"], j["created"], j["id"])
+
+
+def load_jobs(db, hosts):
+    clocks = host_clocks(hosts)
+    return sorted((job_times(job_row(r, _blob(r)), clocks) for r in db.execute("SELECT * FROM jobs")), key=job_rank)
+
+
+class JobList:
+    """The dashboard's jobs, kept between frames in load_jobs order. A frame re-reads only the rows whose rev
+    moved (usually none) and refreshes times only for the rows it draws, so its cost does not grow with the
+    jobs ever run. Few changes are moved into place; many (the first load) are sorted once."""
+    BULK = 256  # changed rows at which re-sorting everything beats moving each row
+
+    def __init__(self):
+        self.rev, self.by_id, self.counts = -1, {}, {}
+        self.keys, self.jobs, self.texts = [], [], []  # aligned: rank, job, lowercase search text
+        self.found = None  # the last search: dict(rev, query, hide, pairs, matches, at)
+
+    @staticmethod
+    def search_text(j):
+        return ("%s %s %s %s %s %s" % (j["state"], j["host"], j["id"], j.get("name") or "", j["cmd"], j.get("owner") or "")).lower()
+
+    def refresh(self, db, clocks):
+        rows = db.execute("SELECT * FROM jobs WHERE rev>? ORDER BY rev", (self.rev,)).fetchall()
+        if not rows:
+            return False
+        bulk = len(rows) >= self.BULK
+        for r in rows:
+            j = job_times(job_row(r, unpack(r["j"])), clocks)
+            old = self.by_id.get(j["id"])
+            if old is not None:
+                self.counts[old["state"]] -= 1
+                if not bulk and not self._take(old):
+                    bulk = True  # not where its rank says: rebuild rather than guess
+            self.by_id[j["id"]] = j
+            self.counts[j["state"]] = self.counts.get(j["state"], 0) + 1
+            if not bulk:
+                k = job_rank(j)
+                i = bisect.bisect_left(self.keys, k)
+                self.keys.insert(i, k)
+                self.jobs.insert(i, j)
+                self.texts.insert(i, self.search_text(j))
+            self.rev = max(self.rev, r["rev"])
+        if bulk:
+            self.jobs = sorted(self.by_id.values(), key=job_rank)
+            self.keys = [job_rank(j) for j in self.jobs]
+            self.texts = [self.search_text(j) for j in self.jobs]
+        self.found = None
+        return True
+
+    def _take(self, old):
+        i = bisect.bisect_left(self.keys, job_rank(old))
+        if i < len(self.jobs) and self.jobs[i] is old:
+            del self.keys[i], self.jobs[i], self.texts[i]
+            return True
+        return False
+
+    def shown(self, query, hide):
+        """The rows the table lists: all, or the unfinished ones (a prefix: they rank first), filtered by every
+        word of query. A search that only grows filters the previous matches."""
+        n = bisect.bisect_left(self.keys, (2,)) if hide else len(self.jobs)
+        q = query.lower()
+        words = q.split()
+        if not words:
+            return self.jobs[:n] if hide else self.jobs
+        f = self.found
+        if f and f["rev"] == self.rev and f["hide"] == hide and f["query"] == q:
+            return f["matches"]
+        if f and f["rev"] == self.rev and f["hide"] == hide and q.startswith(f["query"]):
+            pairs = f["pairs"]  # every match of the longer query matched the shorter one
+        else:
+            pairs = zip(self.jobs[:n], self.texts[:n]) if hide else zip(self.jobs, self.texts)
+        for w in words:  # plain passes over (job, text) pairs: about 30 ns a row
+            pairs = [p for p in pairs if w in p[1]]
+        self.found = dict(rev=self.rev, query=q, hide=hide, pairs=pairs, matches=[p[0] for p in pairs], at=None)
+        return self.found["matches"]
+
+    def position(self, shown, jid):
+        """Index of job jid in a list shown() returned, or None."""
+        j = self.by_id.get(jid)
+        if j is None:
+            return None
+        i = bisect.bisect_left(self.keys, job_rank(j))  # unfiltered and unfinished-only lists share this order
+        if i < len(shown) and shown[i] is j:
+            return i
+        f = self.found
+        if f is None or f["matches"] is not shown:
+            return next((n for n, x in enumerate(shown) if x is j), None)
+        if f["at"] is None:
+            f["at"] = {x["id"]: n for n, x in enumerate(shown)}
+        return f["at"].get(jid)
 
 
 def state_seg(j):
@@ -3394,7 +3510,7 @@ def tui(interval):
             return [HEAD + head[:W].ljust(W) + RESET]
         return [BOLD + head[:W] + RESET, "─" * min(W, len(head) + 12)]
 
-    def draw_main(hosts, jobs, total, counts, cur):
+    def draw_main(hosts, jobs, total, counts, cur, clocks):
         W, H = shutil.get_terminal_size()
         W -= 1
         L = []
@@ -3435,6 +3551,7 @@ def tui(interval):
             st["top"] = st["sel"] - room + 1
         st.update(row0=len(L) + 1, rows=min(room, len(jobs) - st["top"]))
         for i, j in enumerate(jobs[st["top"]:st["top"] + room], st["top"]):
+            job_times(j, clocks)  # only the rows drawn: the cached list's times are as old as their last change
             gutter = (KEY, "◆ ") if j["id"] in st["marks"] else ("", "  ")  # X / ctrl-click marks
             if i == st["sel"]:  # SEL_FLAT (ratatui's reversed row): the bar's own text color, no per-cell colors
                 L.append(styled([("", t) for _, t in [gutter] + job_segs(j)] if SEL_FLAT else [gutter] + job_segs(j), W, HILITE))
@@ -3490,31 +3607,29 @@ def tui(interval):
         L.append(help_line([("Esc/←", "back"), ("↑/↓", "scroll"), ("W", "where"), ("Z", "pause/resume"), ("K", "cancel"), ("E", "rerun"), ("P", "prio"), ("F", "force"), ("M", "move"), ("A", "attach"), ("O", "shell"), ("C", "config"), ("R", "refresh")], W))
         return L, H
 
+    cache = JobList()
     threading.Thread(target=syncer, daemon=True).start()
     try:
         screen(True)
         while True:
             hosts = load_hosts(db)
             dests = {h["name"]: h["dest"] for h in hosts}
-            everything = load_jobs(db, hosts)
-            counts = {}
-            for j in everything:
-                counts[j["state"]] = counts.get(j["state"], 0) + 1
-            words = st["query"].lower().split()
-            jobs = [j for j in everything if not (st["hide"] and j["state"] in TERMINAL)
-                    and all(w in ("%s %s %s %s %s %s" % (j["state"], j["host"], j["id"], j.get("name") or "", j["cmd"], j.get("owner") or "")).lower()
-                            for w in words)]
+            clocks = host_clocks(hosts)
+            cache.refresh(db, clocks)
+            everything = cache.jobs
+            jobs = cache.shown(st["query"], st["hide"])
             if st["detail"]:  # stay on the same job even as the list reorders
-                st["sel"] = next((i for i, j in enumerate(jobs) if j["id"] == st["detail"]), st["sel"])
+                at = cache.position(jobs, st["detail"])
+                st["sel"] = st["sel"] if at is None else at
             st["sel"] = max(0, min(st["sel"], len(jobs) - 1))
-            cur = jobs[st["sel"]] if jobs else None
+            cur = job_times(jobs[st["sel"]], clocks) if jobs else None
             if st["detail"] and not (cur and cur["id"] == st["detail"]):
                 st["detail"] = None  # filtered away
             if cur and st["detail"] and cur["sent"] and cur["host"] in dests and not st["fetching"] and time.time() - st["fetched"] > 2 \
                     and (cur["state"] == "running" or st["log"][0] != cur["id"]):
                 st["fetching"] = True
                 threading.Thread(target=fetch_log, args=(cur, dests[cur["host"]]), daemon=True).start()
-            L, H = draw_detail(cur) if st["detail"] else draw_main(hosts, jobs, len(everything), counts, cur)
+            L, H = draw_detail(cur) if st["detail"] else draw_main(hosts, jobs, len(everything), cache.counts, cur, clocks)
             OUT.write("\x1b[?2026h\x1b[H" + RESET + "\x1b[K\n".join(L[:H]) + "\x1b[K\x1b[J\x1b[?2026l")  # one atomic frame
             OUT.flush()
             key = get_key(0.5)

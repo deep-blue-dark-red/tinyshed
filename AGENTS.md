@@ -44,6 +44,9 @@ changing the code.
 - **cli and TUI share row renderers** (`host_segs`/`job_segs`/`meta_segs` → `styled`); the theme follows gitss.
 - Watchdogs are detached from the agent; `install` must stay safe to run while jobs are running.
 - Schema changes need a migration path: existing `host.db` files hold live queues.
+- **The dashboard's job list is incremental** (`JobList`): it re-reads only `server.db` rows whose `rev` moved,
+  and triggers stamp `rev` on every insert and update, so new write paths are covered by themselves. It does
+  not see deletes: anything that ever deletes job rows must also reset the dashboard's `JobList`.
 
 ## Testing
 

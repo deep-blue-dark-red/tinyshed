@@ -43,7 +43,7 @@ changing the code.
 
 ## Testing
 
-Unit tests: `python3 -m unittest -v test_tinyshed` (under a second). They cover parsers, the host queue (rpc idempotency,
+Unit tests: `./run_tests.sh` (under a second; `-k PATTERN` for a subset). They cover parsers, the host queue (rpc idempotency,
 retries, scheduling), server ingest/dispatch/resolve, host-row rendering and the cli; each test gets its own temporary
 `TINYSHED_HOME` and `detach`/`fire` are stubbed. Add a test with each fix. Agents, watchdogs and ssh are not covered:
 exercise those with fake hosts on this machine. The default `~/.tinyshed` is the user's live server, with real hosts

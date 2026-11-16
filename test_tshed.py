@@ -24,7 +24,8 @@ class Base(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="tshed-test-")
         self.home = self._tmp.name
-        self._saved = {k: getattr(t, k) for k in ("HOME", "detach", "fire", "agent_alive", "disk_free", "sync_all", "tx", "connect")}
+        self._saved = {k: getattr(t, k) for k in ("HOME", "detach", "fire", "agent_alive", "disk_free", "sync_all", "tx", "connect",
+                                                  "cpu_topology")}
         self._dbs = []
         t.connect = lambda *a, _c=t.connect: self._dbs.append(_c(*a)) or self._dbs[-1]  # closed in tearDown
         t.HOME = self.home
@@ -33,6 +34,7 @@ class Base(unittest.TestCase):
         t.fire = lambda ev: self.fired.append(ev)
         t.detach = lambda args, **kw: self.launched.append(args) or FakeProc()
         t.agent_alive = lambda: True
+        t.cpu_topology = lambda cfg: {}  # hermetic: not the test machine's own CPU layout
         self.cfg({"name": "h1", "cores": "0-1"})
 
     def tearDown(self):
@@ -159,7 +161,8 @@ class TestHostDb(Base):
         db.close()
         db = t.hdb()
         cols = {r[1] for r in db.execute("PRAGMA table_info(jobs)")}
-        self.assertTrue({"force", "name", "expect", "stall", "progress", "pause", "work", "owner", "origin"} <= cols)
+        self.assertTrue({"force", "name", "expect", "stall", "progress", "pause", "work", "owner", "origin",
+                         "gpus", "vram_mb", "adjust", "gpu", "mem_claim"} <= cols)
         self.assertEqual(db.execute("SELECT state FROM jobs WHERE id='old1'").fetchone()[0], "queued")
 
 
@@ -762,6 +765,519 @@ class TestHostRow(unittest.TestCase):
         self.assertIn("agent down", row(status(agent=False)))
         self.assertIn("ssh: no route", row(status(), err="ssh: no route"))
         self.assertNotIn("disk", row(status(disk_free={"~": 0.1})))
+
+
+# ───────────────────────────────────────────────────────────────── GPU and RAM claims
+
+def free_gpus(*shares, total=24000):
+    """gpu_free() as a host with these free shares per GPU (index order) reports it; VRAM free in proportion."""
+    return {i: [f, round(f * total), total] for i, f in enumerate(shares)}
+
+
+class TestFitGpus(unittest.TestCase):
+    def test_share_packs_onto_the_first_gpu_with_room(self):
+        self.assertEqual(t.fit_gpus(0.25, 0, free_gpus(0.5, 1, 1)), [[0, 0.25, 6000]])
+        self.assertEqual(t.fit_gpus(0.25, 0, free_gpus(0.2, 1)), [[1, 0.25, 6000]])
+        self.assertIsNone(t.fit_gpus(0.25, 0, free_gpus(0.2, 0.1)))
+
+    def test_whole_gpus_need_untouched_ones(self):
+        self.assertEqual(t.fit_gpus(1, 0, free_gpus(0.75, 1, 1)), [[1, 1.0, 24000]])
+        self.assertEqual(t.fit_gpus(2, 0, free_gpus(1, 0.9, 1, 1)), [[0, 1.0, 24000], [2, 1.0, 24000]])
+        self.assertIsNone(t.fit_gpus(4, 0, free_gpus(1, 1, 1, 0.95)))  # 3 of 4: it waits
+
+    def test_vram_per_gpu(self):
+        free = free_gpus(1, 1)
+        free[0][1] = 4000  # someone's share claims little compute but most of the memory
+        free[0][0] = 0.9
+        self.assertEqual(t.fit_gpus(0.1, 6000, free), [[1, 0.1, 6000]])
+        self.assertEqual(t.fit_gpus(0.1, 3000, free), [[0, 0.1, 3000]])
+        self.assertEqual(t.fit_gpus(0.5, 99999, free_gpus(1)), [[0, 0.5, 24000]])  # never more than the GPU has
+
+    def test_shares_add_up_exactly(self):
+        free = free_gpus(1)
+        for _ in range(10):
+            gpu = t.fit_gpus(0.1, 0, free)
+            self.assertIsNotNone(gpu)
+            t.take_gpus(free, gpu)
+        self.assertIsNone(t.fit_gpus(0.1, 0, free))
+
+    def test_force_takes_the_least_claimed(self):
+        self.assertEqual(t.fit_gpus(1, 0, free_gpus(0.2, 0.6, 0.1), force=True), [[1, 1.0, 24000]])
+
+    def test_gpu_count(self):
+        for s, want in (("0.25", 0.25), ("1", 1), ("2", 2), ("2.0", 2), ("0", 0)):
+            self.assertEqual(t.gpu_count(s), want)
+        for s in ("1.5", "-1", "x", "inf", "nan"):
+            with self.subTest(s=s), self.assertRaises(t.argparse.ArgumentTypeError):
+                t.gpu_count(s)
+
+    def test_fmt_share(self):
+        self.assertEqual([t.fmt_share(v) for v in (2, 1, 0.25, 0.3, 1.5, 0.05)], ["2", "1", ".25", ".3", "1.5", ".05"])
+
+
+class TestScheduleClaims(Base):
+    def setUp(self):
+        super().setUp()
+        self._inv = t.gpu_inventory
+        t.gpu_inventory = lambda cfg: {i: 24000 for i in range(4)}
+
+    def tearDown(self):
+        t.gpu_inventory = self._inv
+        super().tearDown()
+
+    def run_queue(self, *specs, cfg=None):
+        t.rpc(dict(submit=[dict(job(jid, **kw), created=i + 1) for i, (jid, kw) in enumerate(specs)]))
+        db = t.hdb()
+        t.schedule(db, cfg or dict(cores="0-15", mem="64G"), [])
+        return db, {r["id"]: (json.loads(r["gpu"]) if r["gpu"] else None) for r in db.execute("SELECT id, gpu FROM jobs WHERE state='running'")}
+
+    def test_one_gpu_each_first_come_first_served(self):
+        _, run = self.run_queue(*[("j%d" % i, dict(gpus=1)) for i in range(5)])
+        self.assertEqual(run, {"j%d" % i: [[i, 1.0, 24000]] for i in range(4)})  # j4 waits for a GPU
+
+    def test_head_waiting_for_gpus_blocks_gpus_not_cores(self):
+        db = t.hdb()
+        db.execute("INSERT INTO jobs(id, state, cores, cpus, prio, created, gpu) VALUES('busy', 'running', '0', 1, 0, 0, ?)",
+                   (json.dumps([[0, 1.0, 24000]]),))
+        _, run = self.run_queue(("four", dict(gpus=4, cpus=4, prio=9)), ("one", dict(gpus=1)), ("cpu", dict(cpus=4)))
+        self.assertEqual(sorted(run), ["busy", "cpu"])  # 'one' would fit on a free GPU, but 'four' is ahead of it
+        cores = {r["id"]: r["cores"] for r in db.execute("SELECT id, cores FROM jobs WHERE state='running'")}
+        self.assertEqual(cores["cpu"], "6,7,8,9")  # 1-4 are held back for 'four', 5 for 'one'
+
+    def test_shares_pack(self):
+        _, run = self.run_queue(*[("q%d" % i, dict(gpus=0.25)) for i in range(5)], ("w", dict(gpus=1)))
+        self.assertEqual([run["q%d" % i][0][0] for i in range(5)], [0, 0, 0, 0, 1])
+        self.assertEqual(run["w"], [[2, 1.0, 24000]])
+
+    def test_ram_claims_gate(self):
+        db, run = self.run_queue(("a", dict(mem_mb=40000)), ("b", dict(mem_mb=30000)), ("c", dict(mem_mb=0)))
+        self.assertEqual(sorted(run), ["a", "c"])  # b waits for RAM and holds back what is free; c claims none
+        self.assertEqual(t.mem_claimed(db), 40000)
+        db.execute("UPDATE jobs SET mem_claim=10000 WHERE id='a'")  # fitted to its use
+        t.schedule(db, dict(cores="0-15", mem="64G"), [])
+        self.assertEqual(sorted(r[0] for r in db.execute("SELECT id FROM jobs WHERE state='running'")), ["a", "b", "c"])
+
+    def test_no_gpus_here_waits_without_blocking(self):
+        t.gpu_inventory = lambda cfg: {}
+        _, run = self.run_queue(("g", dict(gpus=1, prio=9)), ("cpu", dict(cpus=16)))
+        self.assertEqual(sorted(run), ["cpu"])
+
+    def test_paused_job_keeps_its_gpu(self):
+        db = t.hdb()
+        db.execute("INSERT INTO jobs(id, state, cpus, prio, created, gpu, mem_claim) VALUES('p', 'paused', 1, 0, 0, ?, 60000)",
+                   (json.dumps([[0, 1.0, 24000]]),))
+        _, run = self.run_queue(("g", dict(gpus=1)), ("m", dict(mem_mb=8000)))
+        self.assertEqual(run["g"], [[1, 1.0, 24000]])
+        self.assertNotIn("m", run)
+
+    def test_finish_releases_claims(self):
+        db, run = self.run_queue(("g", dict(gpus=1, mem_mb=1000)))
+        t.finish(db, "g", "done", rc=0)
+        r = db.execute("SELECT gpu, mem_claim FROM jobs WHERE id='g'").fetchone()
+        self.assertEqual((r[0], r[1]), (None, None))
+        self.assertEqual(t.gpu_claims(db), {})
+
+    def test_status_reports_claims(self):
+        db, _ = self.run_queue(("g", dict(gpus=0.5, mem_mb=1000)), ("q", dict(gpus=4)))
+        with mock.patch.object(t.shutil, "which", lambda name: None):  # no nvidia-smi, taskset or py-spy here
+            s = t.status(db, dict(cores="0-15", mem="64G"))
+        self.assertEqual((s["mem_claimed_mb"], s["mem_cap_mb"], s["queued_gpus"]), (1000, 65536, 4))
+        self.assertEqual(s["gpu_claimable"], [0, 1, 2, 3])
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 1_000_000.0
+
+    def __call__(self):
+        return self.now
+
+
+class TestAdjust(Base):
+    """The agent fits a running job's claims to its peak use after ADJUST_WINDOW seconds of samples."""
+
+    def setUp(self):
+        super().setUp()
+        self.clock = FakeClock()
+        self.cpu_s, self.rss, self.swap, self.vram, self.util = 0.0, 1000, 0, 2000, 20  # rss: resident + swapped
+        self.repinned = []
+        patches = [mock.patch.object(t.time, "time", self.clock),
+                   mock.patch.object(t, "session_usage", lambda sids, swap=False: {str(s): [self.rss - self.swap, self.cpu_s] + [self.swap] * swap
+                                                                                    for s in sids}),
+                   mock.patch.object(t, "per_core_ticks", lambda: {c: [self.clock.now * 100, self.clock.now * (100 - 30 * (c >= 2))]
+                                                                     for c in range(4)}),  # cores 2, 3 busy
+                   mock.patch.object(t, "repin", lambda sid, cores: self.repinned.append(cores)),
+                   mock.patch.object(t, "gpu_inventory", lambda cfg: {0: 24000}),
+                   mock.patch.object(t, "sample_gpus_bg", lambda st: st.__setitem__(
+                       "gpu", (self.clock.now, {0: [self.util, self.vram]}, [[4242, "4242", 0, self.vram, self.util]])))]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        t.rpc(dict(submit=[job("j", cpus=4, mem_mb=5000, gpus=1)]))
+        self.db = t.hdb()
+        self.db.execute("UPDATE jobs SET state='running', pid=4242, cores='0,1,2,3', mem_claim=5000, gpu=? WHERE id='j'",
+                        (json.dumps([[0, 1.0, 24000]]),))
+        self.st = {}
+
+    def run_for(self, seconds, cores=0.9):
+        for _ in range(int(seconds / t.ADJUST_EVERY)):
+            self.clock.now += t.ADJUST_EVERY
+            self.cpu_s += cores * t.ADJUST_EVERY
+            t.adjust(self.db, {}, self.st)
+
+    def row(self):
+        r = self.db.execute("SELECT cores, mem_claim, gpu FROM jobs WHERE id='j'").fetchone()
+        return r[0], r[1], json.loads(r[2])
+
+    def test_fits_claims_to_peak_use(self):
+        self.run_for(t.ADJUST_WINDOW - 10)
+        self.assertEqual(self.row(), ("0,1,2,3", 5000, [[0, 1.0, 24000]]))  # not yet
+        self.run_for(20)
+        # 0.9 cores / 0.8 -> 2 cores, the busiest; 1000M / 0.8 -> 1300M; 20% / 0.8 -> 25%; 2000M / 0.8 -> 2500M
+        self.assertEqual(self.row(), ("2,3", 1300, [[0, 0.25, 2500]]))
+        self.assertEqual(self.repinned, ["2,3"])
+        ev = [e for e in self.fired if e["kind"] == "adjust"][-1]["data"]
+        self.assertEqual((ev["why"], ev["before"]["cores"], ev["after"]["cores"]), ("fit", "0,1,2,3", "2,3"))
+
+    def test_memory_grows_back_compute_does_not(self):
+        self.run_for(t.ADJUST_WINDOW + 10)
+        self.rss, self.vram = 1500, 4000
+        self.run_for(4, cores=3.5)
+        cores, mem, gpu = self.row()
+        self.assertEqual((cores, mem, gpu[0][1:]), ("2,3", 1900, [0.25, 5000]))  # up to 1500/0.8, 4000/0.8
+        self.rss = 99999
+        self.run_for(4)
+        self.assertEqual(self.row()[1], 5000)  # never past what was submitted
+
+    def test_settles_then_samples_a_fresh_window(self):
+        self.run_for(t.ADJUST_WINDOW + 10)
+        self.assertEqual(self.row()[0], "2,3")
+        n = len(self.fired)
+        self.run_for(t.ADJUST_WINDOW, cores=0.5)
+        self.assertEqual(len(self.fired), n)  # 0.5 / 0.8 -> 1 core, but the new window has not closed yet
+        self.run_for(t.ADJUST_SETTLE + 2 * t.ADJUST_EVERY, cores=0.5)
+        self.assertEqual(self.row()[0], "2")  # equally busy: the lower core stays
+
+    def test_unused_gpu_is_not_fitted(self):
+        self.vram, self.util = 5, 0  # still loading data on the CPU: it has not touched its GPU yet (idle GPUs report a few MB)
+        self.run_for(t.ADJUST_WINDOW + 10)
+        self.assertEqual(self.row()[2], [[0, 1.0, 24000]])
+
+    def test_swapped_out_memory_still_counts(self):
+        """bigd, live: zram swapped an idle 500 MB buffer out; RSS fell to 1 MB, but the job still holds it."""
+        self.rss, self.swap = 500, 499
+        self.run_for(t.ADJUST_WINDOW + 10)
+        self.assertEqual(self.row()[1], 700)  # 500 / 0.8, not 1 / 0.8
+
+    def test_no_adjust(self):
+        self.db.execute("UPDATE jobs SET adjust=0")
+        self.run_for(t.ADJUST_WINDOW + 10)
+        self.assertEqual(self.row(), ("0,1,2,3", 5000, [[0, 1.0, 24000]]))
+
+    def test_slack_from_config(self):
+        self.run_for(10)
+        self.run_for(t.ADJUST_WINDOW)
+        self.db.execute("UPDATE jobs SET cores='0,1,2,3', mem_claim=5000")
+        st = {}
+        for _ in range(int((t.ADJUST_WINDOW + 10) / t.ADJUST_EVERY)):
+            self.clock.now += t.ADJUST_EVERY
+            self.cpu_s += 0.9 * t.ADJUST_EVERY
+            t.adjust(self.db, dict(slack=0.5), st)
+        self.assertEqual(self.row()[:2], ("2,3", 2000))  # 0.9 / 0.5 -> 2 cores, 1000M / 0.5 -> 2000M
+        with self.assertRaises(t.Fail):
+            t.check_cfg(dict(slack=1))
+
+
+PMON = """# gpu         pid   type     sm    mem    enc    dec    jpg    ofa    command
+# Idx           #    C/G      %      %      %      %      %      %    name
+    0    1748482     C     98     68      -      -      -      -    python
+    0    3579225   C+G      -      -      -      0      -      -    kwin_wayland
+    0    3579339     G      -      -      -      -      -      -    Xwayland
+    0    3579340     G      -      -      -      -      -      -    kscreenlocker_g
+"""
+
+
+class TestGpuProcs(unittest.TestCase):
+    def test_real_output(self):
+        """nvidia-smi 5xx on a desktop: a CUDA job next to the compositor's graphics processes."""
+        answers = {"--query-gpu=index,uuid,utilization.gpu,memory.used": "0, GPU-5f1c, 99, 21300\n",
+                   "--query-compute-apps=pid,gpu_uuid,used_memory": "1748482, GPU-5f1c, 20480\n3579225, GPU-5f1c, 312\n",
+                   "pmon": PMON}
+        smi = lambda *a: answers.get(a[0], "")
+        with mock.patch.object(t, "nvidia_smi", smi), \
+                mock.patch.object(t, "pid_sids", lambda pids: {1748482: "1748400", 3579225: "3579000"}):
+            gpus, procs = t.gpu_procs()
+        self.assertEqual(gpus, {0: [99, 21300]})
+        self.assertEqual(procs, [[1748482, "1748400", 0, 20480, 98], [3579225, "3579000", 0, 312, None],
+                                 [3579339, None, 0, 0, None], [3579340, None, 0, 0, None]])
+        # the job is the python process's session: 98% of the GPU, its 20 GB; the desktop is nobody's
+        use = t.job_gpu_usage({"j": (1748400, [[0, 1.0, 24000]])}, gpus, procs)
+        self.assertEqual(use, {"j": {0: [98, 20480]}})
+
+    def test_idle_job_next_to_a_busy_stranger(self):
+        """bigd, live: a light tshed job ('-' in pmon) shares GPU 0 with someone's 99% training run outside tshed.
+        The GPU's 100% is not the job's: pmon measures this GPU, so '-' means idle."""
+        procs = [[1748482, "4095563", 0, 11266, 99], [1773238, "1773238", 0, 458, None], [3579225, "3167", 0, 18, None]]
+        use = t.job_gpu_usage({"j": (1773238, [[0, 1.0, 16376]])}, {0: [100, 12231]}, procs)
+        self.assertEqual(use, {"j": {0: [0, 458]}})
+
+
+class TestJobGpuUsage(unittest.TestCase):
+    def test_processes_are_summed_per_job_and_gpu(self):
+        jobs = {"a": (100, [[0, 0.5, 1000]]), "b": (200, [[0, 0.5, 1000]])}
+        procs = [[101, "100", 0, 300, 10], [102, "100", 0, 200, 5], [201, "200", 0, 700, None], [999, "999", 0, 50, 1]]
+        self.assertEqual(t.job_gpu_usage(jobs, {0: [40, 2000]}, procs), {"a": {0: [15, 500]}, "b": {0: [0, 700]}})  # b: '-' where pmon measures
+
+    def test_invisible_processes_fall_back_to_a_sole_claimant(self):
+        jobs = {"a": (100, [[0, 1.0, 24000]]), "b": (200, [[1, 0.5, 1000]]), "c": (300, [[1, 0.5, 1000]])}
+        self.assertEqual(t.job_gpu_usage(jobs, {0: [60, 9000], 1: [80, 5000]}, []), {"a": {0: [60, 9000]}})
+        # a listed process without SM %: the GPU's utilization stands in when the job is alone on it
+        self.assertEqual(t.job_gpu_usage(jobs, {0: [60, 9000]}, [[101, "100", 0, 8000, None]]), {"a": {0: [60, 8000]}})
+        # ... but not when another process loads that GPU
+        self.assertEqual(t.job_gpu_usage(jobs, {0: [60, 9000]}, [[101, "100", 0, 8000, None], [7, "7", 0, 900, None]]),
+                         {"a": {0: [None, 8000]}})
+        self.assertEqual(t.job_gpu_usage(jobs, {0: [60, 9000]}, [[101, "100", 0, 8000, None], [7, "7", 0, 18, None]]),
+                         {"a": {0: [60, 8000]}})  # a compositor's 18 MB is not load
+        # a --no-adjust or paused job also holds GPU 0: the GPU's readings are no longer a's alone
+        self.assertEqual(t.job_gpu_usage(jobs, {0: [60, 9000]}, [], holders={0: 2, 1: 2}), {})
+
+
+class TestGpuDispatch(ServerBase):
+    def status(self, name, ngpu, claimed=0.0, free=8, queued_gpus=0):
+        gpus = [dict(index=i, util=0, mem_used=0, mem_total=24000, claimed=claimed if i == 0 else 0, vram_claimed=0) for i in range(ngpu)]
+        self.db.execute("INSERT OR REPLACE INTO hosts(name, dest, seen, status) VALUES(?,?,?,?)", (name, "local", time.time(), json.dumps(dict(
+            free=free, cores=8, queued_cpus=0, gpus=gpus, gpu_claimable=list(range(ngpu)), queued_gpus=queued_gpus,
+            mem_cap_mb=64000, mem_claimed_mb=0, queued_mem_mb=0))))
+
+    def add(self, name, **spec):
+        return t.add_job(self.db, dict(name=name, cmd="true", **spec))
+
+    def test_gpu_jobs_go_where_gpus_are_free(self):
+        self.db.execute("DELETE FROM hosts")
+        self.status("cpu", 0, free=64)
+        self.status("g1", 1, claimed=0.5)
+        self.status("g2", 2, claimed=1.0)
+        a = self.add("a", gpus=1)
+        b = self.add("b", gpus=0.5)
+        c = self.add("c", cpus=4)
+        t.dispatch(self.db)
+        host = lambda jid: self.db.execute("SELECT host FROM jobs WHERE id=?", (jid,)).fetchone()[0]
+        self.assertEqual((host(a), host(b), host(c)), ("g2", "g1", "cpu"))
+
+    def test_job_no_host_can_run_is_passed_over(self):
+        self.db.execute("DELETE FROM hosts")
+        self.status("g1", 1)
+        never = self.add("never", gpus=2, prio=9)
+        later = self.add("later", gpus=1)
+        t.dispatch(self.db)
+        host = lambda jid: self.db.execute("SELECT host FROM jobs WHERE id=?", (jid,)).fetchone()[0]
+        self.assertEqual((host(never), host(later)), (None, "g1"))
+
+    def test_waiting_gpu_job_holds_back_the_queue(self):
+        self.db.execute("DELETE FROM hosts")
+        self.status("g1", 1, queued_gpus=1)
+        first = self.add("first", gpus=1, prio=9)
+        cpu = self.add("cpu")
+        t.dispatch(self.db)
+        host = lambda jid: self.db.execute("SELECT host FROM jobs WHERE id=?", (jid,)).fetchone()[0]
+        self.assertEqual((host(first), host(cpu)), (None, None))
+
+    def test_submit_refuses_impossible_gpu_claims(self):
+        self.db.execute("DELETE FROM hosts")
+        self.status("g1", 1)
+        self.db.execute("INSERT INTO hosts(name, dest, seen, status) VALUES('old', 'x', ?, ?)",
+                        (time.time(), json.dumps(dict(free=8, cores=8, queued_cpus=0))))
+        sub = lambda *argv: t.submit(self.db, ["-n", "x", *argv, "--", "true"])
+        with mock.patch.dict(os.environ, NO_AGENT):
+            self.assertTrue(sub("-g", "1"))
+            self.assertTrue(sub("-g", "0.5", "-H", "g1", "--vram", "4G"))
+            with self.assertRaisesRegex(t.Fail, "no host has 2 GPUs"):
+                sub("-g", "2")
+            with self.assertRaisesRegex(t.Fail, "run tshed install"):
+                sub("-g", "1", "-H", "old")
+            with self.assertRaisesRegex(t.Fail, "--vram needs --gpus"):
+                sub("--vram", "4G")
+        j = t.unpack(self.db.execute("SELECT j FROM jobs WHERE host='g1'").fetchone()[0])
+        self.assertEqual((j["gpus"], j["vram_mb"], j["adjust"]), (0.5, 4096, 1))
+
+
+class TestJobRow(unittest.TestCase):
+    def test_columns_follow_the_header_and_show_fitted_claims(self):
+        j = dict(state="running", cancel=0, cpus=4, cores="2,3", gpus=1, gpu=json.dumps([[0, 0.25, 2500]]), mem_mb=5000,
+                 mem_claim=1300, rss_mb=900, prio=0, host="h1", id="abcd1234", t=60, attempt=1, retries=0, name="n", cmd="c",
+                 cpu_pct=40.0, now=time.time())
+        text = "".join(x for _, x in t.job_segs(j))
+        head = t.JOB_HEAD
+        cell = lambda name: text[:re.search(r"\b%s\b" % re.escape(name), head).end()].split()[-1]  # right-aligned cells
+        self.assertEqual((cell("CPU"), cell("GPU"), cell("Mem")), ("2", ".25", "0.9/1.3G"))
+        self.assertEqual(text.index("abcd1234"), head.index("ID"))
+        self.assertIn("0 25% 2.4G", t.gpu_desc(j))
+        meta = "".join(x for _, x in t.meta_segs(j))
+        self.assertIn("(asked 4)", meta)
+        self.assertIn("RAM claim: 1.3G (asked 4.9G)", meta)
+
+
+# ───────────────────────────────────────────────────────────────── CPU topology (read off the real hosts)
+
+BIGD_RANK = [216, 216, 211, 206, 201, 196, 191, 186, 181, 166, 176, 171]
+# bigd: Ryzen 9 3900X, 12 cores x SMT (cpu N and N+12), four L3 groups (CCX) of 3 cores
+BIGD = {c: (c % 12, c % 12 // 3 * 3, BIGD_RANK[c % 12]) for c in range(24)}
+LLAMA_RANK = [236, 221, 236, 226, 231, 216, 211, 206, 196, 201, 191, 186, 181, 176, 166, 171]
+# mina-llama: Ryzen 9 9955HX in an LXC that has CPUs 2-31 of 32: two L3 groups (CCD) of 8 cores; cores 0 and 1 keep only
+# their second threads (16, 17). A core is named by its lowest sibling, present or not, as sysfs lists them.
+LLAMA = {c: (c % 16, 0 if c % 16 < 8 else 8, LLAMA_RANK[c % 16]) for c in range(2, 32)}
+
+
+class TestPickCores(unittest.TestCase):
+    def test_flat_is_the_old_order(self):
+        self.assertEqual(t.pick_cores(3, [4, 1, 7, 9], {}), [1, 4, 7])
+        self.assertEqual(t.pick_cores(3, [4, 1], {}), [1, 4])  # not enough: what there is
+
+    def test_gpu_job_gets_the_fastest_group(self):
+        self.assertEqual(t.pick_cores(2, range(24), BIGD, fast=True, pack=False), [0, 1])
+        # a tighter fit elsewhere does not beat speed: CCX1 has exactly 2 whole cores left, CCX0 stays fastest
+        free = [c for c in range(24) if c not in (3, 15)]
+        self.assertEqual(sorted(t.pick_cores(2, free, BIGD, fast=True, pack=False)), [0, 1])
+
+    def test_cpu_job_packs_from_the_slow_end_on_a_gpu_host(self):
+        self.assertEqual(sorted(t.pick_cores(3, range(24), BIGD, fast=False, pack=True)), [9, 10, 11])
+        free = [c for c in range(24) if c not in (0, 12)]  # CCX0 has 2 whole cores left: the tightest fit for 2
+        self.assertEqual(sorted(t.pick_cores(2, free, BIGD, fast=False, pack=True)), [1, 2])
+
+    def test_one_l3_group_when_it_fits(self):
+        for n in (1, 2, 3):
+            got = t.pick_cores(n, range(24), BIGD)
+            self.assertEqual(len({BIGD[c][1] for c in got}), 1, got)
+        got = t.pick_cores(4, range(24), BIGD)  # bigger than a CCX: one whole group, then the rest
+        self.assertEqual((sorted(got), len({BIGD[c][1] for c in got})), ([0, 1, 2, 3], 2))
+        got = t.pick_cores(8, range(2, 32), LLAMA)
+        self.assertEqual((len(got), {LLAMA[c][1] for c in got}, len({LLAMA[c][0] for c in got})), (8, {0}, 8))
+
+    def test_jobs_do_not_share_a_core_while_whole_cores_are_free(self):
+        free, jobs = list(range(24)), []
+        for _ in range(13):
+            jobs.append(t.pick_cores(1, free, BIGD))
+            free = [c for c in free if c not in jobs[-1]]
+        cores = [BIGD[j[0]][0] for j in jobs]
+        self.assertEqual(len(set(cores[:12])), 12)  # twelve jobs, twelve physical cores
+        self.assertIn(cores[12], cores[:12])  # only the thirteenth takes a sibling thread
+
+    def test_own_siblings_before_strangers(self):
+        free = [c for c in range(24) if c != 9]  # another job holds cpu 9; its sibling 21 is free
+        got = t.pick_cores(14, free, BIGD)
+        self.assertEqual(len({BIGD[c][0] for c in got}), 11)  # the 11 whole cores, then 3 of their own siblings
+        self.assertNotIn(21, got)
+
+    def test_container_with_missing_cpus(self):
+        got = t.pick_cores(16, range(2, 32), LLAMA)
+        self.assertEqual(len({LLAMA[c][0] for c in got}), 16)  # 16 cores: 14 with both threads, 2 with one
+        self.assertEqual(sorted(t.pick_cores(30, range(2, 32), LLAMA)), list(range(2, 32)))
+        # what the live run on mina-llama gave a -c 3 job: the three fastest cores, 16 standing in for core 0
+        self.assertEqual(sorted(t.pick_cores(3, range(2, 32), LLAMA)), [2, 4, 16])
+
+    def test_cpus_near_the_gpu(self):
+        self.assertEqual(sorted(t.pick_cores(2, range(24), BIGD, local={6, 7, 8, 18})), [6, 7])
+        self.assertEqual(len(t.pick_cores(6, range(24), BIGD, local={6, 7})), 6)  # too few near it: anywhere
+
+    def test_shrink_keeps_one_thread_per_core_in_the_busiest_group(self):
+        busy = {0: 90, 12: 80, 1: 50, 13: 10, 6: 5}
+        self.assertEqual(t.shrink_cores([0, 12, 1, 13, 6], 2, BIGD, busy), [0, 1])  # not 0 and its sibling 12
+        self.assertEqual(t.shrink_cores([0, 12, 1, 13, 6], 3, BIGD, busy), [0, 1, 6])  # a third core before a sibling thread
+        self.assertEqual(t.shrink_cores([0, 12, 1, 13, 6], 4, BIGD, busy), [0, 1, 6, 12])
+        self.assertEqual(t.shrink_cores([0, 6, 7], 2, BIGD, {0: 50, 6: 40, 7: 40}), [6, 7])  # one group: CCX2 did more
+        self.assertEqual(t.shrink_cores([3, 1], 1, {}, {1: 5, 3: 9}), [3])  # flat: the busiest
+
+    def test_cpu_list(self):
+        self.assertEqual(t.cpu_list([0, 1, 2, 12, 13, 14, 7]), "0-2,7,12-14")
+        self.assertEqual(t.cpu_list([]), "")
+
+
+class TestScheduleTopology(Base):
+    def test_gpu_job_fast_cores_cpu_job_slow_end(self):
+        t.cpu_topology = lambda cfg: BIGD
+        with mock.patch.object(t, "gpu_inventory", lambda cfg: {0: 16376}):
+            t.rpc(dict(submit=[dict(job("cpu", cpus=3), created=1), dict(job("gpu", cpus=2, gpus=1), created=2)]))
+            db = t.hdb()
+            t.schedule(db, dict(cores="0-23", mem="31G"), [])
+        cores = {r[0]: r[1] for r in db.execute("SELECT id, cores FROM jobs")}
+        self.assertEqual(cores, {"cpu": "9,10,11", "gpu": "0,1"})
+
+
+def clpeak_run(ncpu, cpu_rates, gpus=()):
+    """A clpeak 3 run as stdbench stores it: cpu_rates in G/s summed over all CPUs; gpus as (fp32 TFLOPS, GB/s)."""
+    test = lambda tid, v: dict(id=tid, metrics=[dict(id="x", value=v * 0.9), dict(id="y", value=v)])
+    devs = [dict(type="cpu", name="cpu", tests=[test(k, v * 1e9) for k, v in cpu_rates.items()])]
+    devs += [dict(type="gpu", name="gpu%d" % i, tests=[test("single_precision_compute", tf * 1e12), test("global_memory_bandwidth", bw * 1e9)])
+             for i, (tf, bw) in enumerate(gpus)]
+    return dict(schema="clpeak/run", host=dict(logical_cores=ncpu), devices=devs)
+
+
+class TestScores(ServerBase):
+    def setUp(self):
+        super().setUp()
+        self.db.execute("DELETE FROM hosts")
+        self.bench = os.path.join(self.home, "bench")
+        for name, ncpu, run in (("bigd", 24, clpeak_run(24, dict(integer_compute=382, string_scan=1240, crc32c=381, utf8_validate=210),
+                                                        [(34.3, 466)])),
+                                ("cachy", 16, clpeak_run(16, dict(integer_compute=937, string_scan=1510, crc32c=602, utf8_validate=468),
+                                                         [(9.97, 400)])),
+                                ("llama", 30, clpeak_run(8, dict(integer_compute=1140, string_scan=2290, crc32c=635, utf8_validate=353)))):
+            os.makedirs(os.path.join(self.bench, name))
+            for stamp, body in (("2026-10-25_20-00-00", dict(schema="other")), ("2026-10-25_21-01-43", run)):
+                with open(os.path.join(self.bench, name, "%s_%s.json" % (name, stamp)), "w") as f:
+                    json.dump(body, f)
+            with open(os.path.join(self.bench, name, "%s_2026-10-26_00-00-00.partial.json" % name), "w") as f:
+                f.write("{")  # a run that died part-way is ignored
+            self.status(name, free=ncpu, cores=ncpu, ngpu=1 if name != "llama" else 0)
+
+    def status(self, name, free, cores, ngpu=0, gpu_claimed=0.0):
+        gpus = [dict(index=i, claimed=gpu_claimed) for i in range(ngpu)]
+        self.db.execute("INSERT INTO hosts(name, dest, seen, status) VALUES(?, 'local', ?, ?) ON CONFLICT(name) DO UPDATE SET "
+                        "status=excluded.status, seen=excluded.seen", (name, time.time(), json.dumps(dict(
+                            free=free, cores=cores, queued_cpus=0, gpus=gpus, gpu_claimable=list(range(ngpu)), queued_gpus=0))))
+
+    def score(self, *argv):
+        a = t.build_parser()[0].parse_args(["score", *argv])
+        buf, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            t.score_cmd(self.db, a)
+        return buf.getvalue(), err.getvalue()
+
+    def test_import_from_stdbench(self):
+        found = t.bench_scores(self.bench)
+        self.assertEqual((found["bigd"]["cpu"], found["bigd"]["gpu"], found["cachy"]["cpu"], found["cachy"]["gpu"]), (18.4, 12.6, 49.7, 6.3))
+        self.assertTrue(found["bigd"]["src"].endswith("bigd_2026-10-25_21-01-43.json"))
+        out, err = self.score("--from", self.bench)
+        self.assertIn("llama: CPU score skipped: benchmarked with 8 CPUs, the host now has 30", err)  # the container was smaller
+        self.assertIn("host-less CPU jobs try: cachy > bigd > llama", out)
+        self.assertIn("host-less GPU jobs try: bigd > cachy", out)
+        self.score("llama", "--cpu", "41")
+        self.assertIn("CPU jobs try: cachy > llama > bigd", self.score()[0])
+        self.score("--from", self.bench)  # a re-import does not drop the score set by hand
+        self.assertEqual(self.db.execute("SELECT cpu_score FROM hosts WHERE name='llama'").fetchone()[0], 41)
+
+    def test_dispatch_goes_to_the_best_host_with_room(self):
+        self.score("--from", self.bench)
+        add = lambda name, **kw: t.add_job(self.db, dict(name=name, cmd="true", **kw))
+        jobs = [add("c%d" % i, cpus=8) for i in range(3)] + [add("g", gpus=1, cpus=2)]
+        t.dispatch(self.db)
+        host = {r[0]: r[1] for r in self.db.execute("SELECT id, host FROM jobs")}
+        # cachy (16 CPUs) takes two 8-CPU jobs, then it is full: the third goes to the next best, bigd
+        self.assertEqual([host[j] for j in jobs], ["cachy", "cachy", "bigd", "bigd"])
+
+    def test_unscored_hosts_come_last(self):
+        self.score("--from", self.bench)
+        self.score("cachy", "--clear")
+        jid = t.add_job(self.db, dict(name="x", cmd="true", cpus=4))
+        t.dispatch(self.db)
+        self.assertEqual(self.db.execute("SELECT host FROM jobs WHERE id=?", (jid,)).fetchone()[0], "bigd")
+
+    def test_full_gpu_host_falls_to_the_next(self):
+        self.score("--from", self.bench)
+        self.status("bigd", free=24, cores=24, ngpu=1, gpu_claimed=1.0)
+        jid = t.add_job(self.db, dict(name="g", cmd="true", gpus=1))
+        t.dispatch(self.db)
+        self.assertEqual(self.db.execute("SELECT host FROM jobs WHERE id=?", (jid,)).fetchone()[0], "cachy")
 
 
 SID = "cf93301b-ae23-4aed-8cf3-f5ee3fa033ed"

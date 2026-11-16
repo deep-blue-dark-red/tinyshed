@@ -42,7 +42,7 @@ those are interactive.
 ```sh
 cd ~/proj/train                                   # local git repo with the code (edits need not be committed)
 tshed stats train-lr3 --json                      # earlier runtimes, if any -> pick -x
-tshed hosts --json                                # where is there room (free cores, memory, GPUs)?
+tshed ls >/dev/null; tshed hosts --json           # where is there room? (hosts shows the last sync; ls refreshes)
 tshed submit -n train-lr3 -H gpu1 -c 8 -m 32G -x 5400 \
     --git --push ~/data/imgs:data --pull out:~/results/{name}/{id} \
     -- python train.py --lr 3e-4                  # prints: ID STATE HOST
@@ -149,7 +149,8 @@ queued job may wait behind a larger one. In `ls`, a waiting job's Time is in bra
   and do not `tshed install`/`uninstall`, `tshed config --edit`, or edit `~/.tinyshed/hooks.py`, unless asked.
 - For jobs longer than a few minutes, do not block on `tshed wait` without `-t`; report the ID and
   stop, or wait with a timeout and check back. Results are pulled by whichever `wait` sees the job end.
-- `tshed hosts` shows `down` + the ssh error for unreachable hosts. Jobs already on a host keep
+- `tshed hosts` shows `down` + the ssh error for unreachable hosts, as of the last sync (`seen` in
+  `--json`); it never contacts hosts itself, `tshed ls` does. Jobs already on a host keep
   running while it is unreachable; state and logs catch up on reconnect. `pause`/`resume`/`prio` need
   the host reachable.
 - No hosts listed → nothing is installed yet; ask the user which hosts to use.

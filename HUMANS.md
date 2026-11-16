@@ -45,15 +45,16 @@ tshed hosts
 ```
 
 ```
-Host          State    Load  CPU%    Cores    Mem free   Used/Res  GPU       Run  Que    Seen    Freq  Notes
-gpu1          ✓ up      0.4    6%    32/32    118/125G   2.0/8.0G  2x 0%       0    0      0s  3.1GHz  65W
-gpu2          ✓ up      1.2   12%    16/16      57/62G   1.5/4.0G  -           0    0      0s  3.2GHz
+Host          State    Load  CPU%    Cores    Mem free   Used/Res    Disk free  GPU       Run  Que    Seen    Freq  Notes
+gpu1          ✓ up      0.4    6%    32/32    118/125G   2.0/8.0G    412~ 3.5t  2x 0%       0    0      0s  3.1GHz  65W
+gpu2          ✓ up      1.2   12%    16/16      57/62G   1.5/4.0G      88~ 12t  -           0    0      0s  3.2GHz
 ```
 
 `Load` is the machine-wide 1-minute load average; `CPU%` is the busy percentage of the cores
 tinyshed owns (`-` until two polls have happened). `Used/Res` is the live RAM of running jobs over
 their combined `-m` limits; `Mem free` is the whole machine's available/total; `Freq` is the mean
-clock of those cores. A red `CPU%` (>100%) or `Used/Res` (used over reserved) means a limit was
+clock of those cores. `Disk free` is free GB on the host's home and `/tmp`; red under 2 GB, which
+also fires `OnCriticalDisk`. A red `CPU%` (>100%) or `Used/Res` (used over reserved) means a limit was
 breached — it should not happen, since the watchdog kills jobs that pass their `-m` limit, and the
 reason appears in Notes, which also carries the host's power draw in watts where the OS reports one.
 
@@ -264,7 +265,7 @@ def OnHostDown(ev):
 ```
 
 Available: `OnJobQueued OnJobStart OnJobCompletion OnJobError OnJobTimeout OnJobOOM OnJobStalled OnJobLost
-OnJobCancel OnJobProgress OnJobPaused OnJobResumed OnHostDown OnHostUp OnEvent`. Anything a hook prints, and any traceback, lands in
+OnJobCancel OnJobProgress OnJobPaused OnJobResumed OnHostDown OnHostUp OnCriticalDisk OnEvent`. Anything a hook prints, and any traceback, lands in
 `~/.tinyshed/hooks.log`. The same file on a *host* runs there, at the moment the event happens, even
 when the server is unreachable. Server hooks run when the server learns of the event — so something
 must be listening: `tshed serve`, the TUI, or phone-home.
@@ -285,7 +286,8 @@ needs: look at `home.cmd` in the host's `~/.tinyshed/config.json` and put it in 
 ## 8. When the network goes away
 
 Nothing special happens, on purpose. Each host keeps its own queue in `~/.tinyshed/host.db` and
-carries on starting, timing out and retrying jobs. `tshed hosts` shows it as `down` with the ssh error.
+carries on starting, timing out and retrying jobs. `tshed hosts` shows it as `down` with the ssh error (as of the last sync: `hosts` itself never
+contacts hosts, `ls` and the dashboard do).
 Jobs you submit meanwhile stay `pending` on the server. On reconnect, queued submissions are
 delivered and the server replays everything it missed — your hooks fire then, each exactly once.
 
@@ -313,4 +315,4 @@ Nothing is ever deleted; payloads and finished logs are zstd-compressed.
 - **`A`/`O` used ssh instead of mosh** — the host has no `mosh-server`, or UDP 60000-61000 doesn't get
   through. ufw: `sudo ufw allow from 192.168.0.0/24 to any port 60000:61000 proto udp`.
 - **"unable to open database file"** in an old dashboard — upgrade and restart it (fixed in 0.2).
-- **Agent died** — any `tshed hosts` restarts it; look at `agent.log` on the host for why.
+- **Agent died** — any `tshed ls` restarts it; look at `agent.log` on the host for why.

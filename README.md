@@ -89,7 +89,7 @@ letting it hang until the timeout. The dashboard shows percent done and an ETA.
 | **hosts** | |
 | `install [[NAME=]DEST…] [--cores 0-15] [--home DEST] [--no-boot]` | check each host, copy the file, (re)start its agent, start it at boot, register it. No hosts = upgrade all. `DEST` is an ssh destination, alternatives tried in order (`gpu1.local,gpu1`: LAN, then VPN name), or `local[:DIR]`. Options left out keep their installed value. Safe while jobs run |
 | `uninstall NAME… [--purge] [--force]` | stop the agent, remove the boot entry, forget the host; data stays unless `--purge` |
-| `hosts [--json] [--rm NAME]` | ping every host: see [Host columns](#host-columns) |
+| `hosts [--json] [--rm NAME]` | last known state of every host, without contacting them (`Seen` = its age; `ls`, `serve` and the dashboard refresh it): see [Host columns](#host-columns) |
 | `config [--edit] [--host HOST…]` | show or edit (in `$VISUAL`/`$EDITOR`) this machine's `config.json`, or a host's over ssh; validated before saving, applied within a second |
 | **jobs** | |
 | `submit -n NAME [flags] -- CMD` | queue a job; prints `ID STATE HOST`. See [Submitting](#submitting) |
@@ -312,7 +312,9 @@ host (runs when the event happens, even while the server is unreachable). Define
 
 `OnJobQueued` `OnJobStart` `OnJobProgress` `OnJobPaused` `OnJobResumed` `OnJobCompletion` `OnJobError`
 `OnJobTimeout` `OnJobOOM` `OnJobStalled` `OnJobLost` `OnJobCancel`, `OnHostDown` `OnHostUp` (server),
-`OnEvent` (everything).
+`OnCriticalDisk` (host: `~` or `/tmp` dropped under 2 GB free; `data` maps the low paths to their
+free GB, plus `min_gb`; if the disk is too full to log the event, the host hook still runs with
+`eid` None and the server never hears of it), `OnEvent` (everything).
 
 ```python
 import subprocess
@@ -363,7 +365,7 @@ hooks need something listening: `serve`, the dashboard, or phone-home.
 
 ### Host columns
 
-`Host State Load CPU% Cores Mem free Used/Res GPU Run Que Seen Freq Notes`
+`Host State Load CPU% Cores Mem free Used/Res Disk free GPU Run Que Seen Freq Notes`
 
 - **`Load`** is the 1-minute load average.
 - **`CPU%`** is the measured busy share of the cores tinyshed owns (`--cores`, or the CPU affinity),
@@ -373,6 +375,9 @@ hooks need something listening: `serve`, the dashboard, or phone-home.
 - **`Mem free`** is whole-machine available / total.
 - **`Used/Res`** is running jobs' live RSS over the sum of their `-m` limits. It is red if used exceeds
   reserved, and `?` if a job set no limit.
+- **`Disk free`** is free GB on the host's home and `/tmp` (`451~ 42t`, `12T` from 10 000 GB); a path that cannot be
+  stat'ed is left out (`18~`), an empty cell means neither was reported. Red, plus an `OnCriticalDisk`
+  event per host, while either stays under 2 GB (re-warned hourly until it recovers).
 - **`Freq`** is the mean clock of tinyshed's cores (`-` on Apple Silicon).
 - **`Notes`** carries host power draw where the OS exposes it (RAPL or battery), version mismatches
   (run `tshed install`) and warnings.

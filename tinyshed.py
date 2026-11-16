@@ -19,7 +19,7 @@ Progress checkpoints: a job writes `DONE/TOTAL message` to $TINYSHED_PROGRESS (o
 
 Callbacks: put functions in ~/.tinyshed/hooks.py (server and/or host), each taking one event dict:
   OnJobQueued OnJobStart OnJobCompletion OnJobError OnJobTimeout OnJobOOM OnJobStalled OnJobLost OnJobCancel
-  OnJobProgress OnJobPaused OnJobResumed
+  OnJobProgress OnJobPaused OnJobResumed  OnCriticalDisk (~ or /tmp under 2G free)
   OnHostDown OnHostUp (server only)   OnEvent (everything)
 """
 import argparse, contextlib, fcntl, importlib, json, os, re, shlex, shutil, signal, sqlite3, subprocess, sys, tempfile, threading, time, traceback, uuid
@@ -32,12 +32,15 @@ FAILURES = ("error", "timeout", "oom", "stalled", "lost")
 TERMINAL = ("done", "cancelled") + FAILURES
 HOOKS = {"queued": "OnJobQueued", "start": "OnJobStart", "done": "OnJobCompletion", "error": "OnJobError",
          "timeout": "OnJobTimeout", "oom": "OnJobOOM", "stalled": "OnJobStalled", "lost": "OnJobLost", "cancelled": "OnJobCancel",
-         "progress": "OnJobProgress", "paused": "OnJobPaused", "resumed": "OnJobResumed", "host_down": "OnHostDown", "host_up": "OnHostUp"}
+         "progress": "OnJobProgress", "paused": "OnJobPaused", "resumed": "OnJobResumed", "host_down": "OnHostDown",
+         "host_up": "OnHostUp", "critical_disk": "OnCriticalDisk"}
 # job fields that travel server -> host, with defaults
 # stall: None = derived from expect once the job reports a total, 0 = off
 SPEC = dict(name=None, cmd=None, cwd=None, env=None, prio=0, cpus=1, mem_mb=0, timeout=0, retries=0,
             retry_on="error,lost", retry_delay=30, created=None, expect=0, stall=None, stall_on_log=0, trace_lines=0, work=0)
 PROGRESS_EVERY = 30  # seconds: a changed checkpoint becomes a `progress` event at most this often
+DISK_MIN_GB = 2  # free space on ~ or /tmp below this is critical (OnCriticalDisk)
+DISK_REWARN_S = 3600  # while a path stays critical, re-emit the event at most this often
 
 
 class Fail(Exception):
@@ -327,6 +330,11 @@ def emit(db, jid, kind, extra=None):
         return None
     data = dict(row)
     data.update(extra or {})
+    return log_event(db, jid, kind, data)
+
+
+def log_event(db, jid, kind, data):
+    """Insert one event row (jid None for host-level events) and return it as hooks see it. Call inside tx()."""
     ts = time.time()
     eid = db.execute("INSERT INTO events(ts,job,kind,data) VALUES(?,?,?,?)", (ts, jid, kind, pack(data))).lastrowid
     return dict(host=load_cfg().get("name"), eid=eid, ts=ts, job=jid, kind=kind, data=data)
@@ -770,6 +778,7 @@ def agent():
             reconcile(db)
             schedule(db, cfg, kids)
             phone_home(db, cfg, st)
+            check_disk(db)
         except Exception:
             traceback.print_exc()
         kids[:] = [k for k in kids if k.poll() is None]  # reap finished watchdogs
@@ -931,6 +940,17 @@ def power_w(db):
     return None
 
 
+def disk_free():
+    """Free GB on the watched paths (~ and /tmp); a path that cannot be stat'ed is left out."""
+    out = {}
+    for p in ("~", "/tmp"):
+        try:
+            out[p] = round(shutil.disk_usage(os.path.expanduser(p)).free / 2 ** 30, 1)
+        except OSError:
+            pass
+    return out
+
+
 def status(db, cfg):
     cores = host_cores(cfg)
     pct = cpu_util(db, cores)
@@ -959,14 +979,42 @@ def status(db, cfg):
         warn.append("CPU% >100%: limit breach")
     if mem_reserved_mb is not None and mem_used_mb > mem_reserved_mb:  # watchdog should have killed it
         warn.append("RAM over reserved")
+    dfree = disk_free()
     return dict(now=time.time(), version=VERSION, ncpu=os.cpu_count(), cores=len(cores), free=len(cores) - len(used_cores(db)),
                 load=os.getloadavg()[0], cpu_pct=pct, cpu_ghz=round(ghz, 2) if ghz is not None else None,
                 mem_total_mb=mem_total, mem_avail_mb=mem_avail,
                 mem_used_mb=mem_used_mb, mem_reserved_mb=mem_reserved_mb, jobs=job_live,
                 power_w=round(watts, 1) if watts is not None else None, warnings=warn,
-                disk_free_gb=round(shutil.disk_usage(HOME).free / 2 ** 30, 1), gpus=gpus, agent=agent_alive(),
+                disk_free_gb=round(shutil.disk_usage(HOME).free / 2 ** 30, 1), disk_free=dfree, gpus=gpus, agent=agent_alive(),
                 counts={r[0]: r[1] for r in db.execute("SELECT state, count(*) FROM jobs GROUP BY state")},
                 queued_cpus=db.execute("SELECT coalesce(sum(cpus),0) FROM jobs WHERE state='queued'").fetchone()[0])
+
+
+_disk_warned = [0.0]  # last alert time in memory too: on a full disk the meta row cannot be written
+
+
+def check_disk(db):
+    """Emit `critical_disk` while free space on ~ or /tmp is under DISK_MIN_GB, re-warned at most
+    hourly; host-level event (no job) rides the normal event log to the server. If the disk is too
+    full to log it, the host hook still fires (eid None) and the server sees the red Disk cell."""
+    low = {p: g for p, g in disk_free().items() if g < DISK_MIN_GB}
+    if not low:
+        _disk_warned[0] = 0.0
+        if meta(db, "disk_warn") is not None:  # recovered: the next drop alerts immediately
+            db.execute("DELETE FROM meta WHERE k='disk_warn'")
+        return
+    now = time.time()
+    if now - max(float(meta(db, "disk_warn") or 0), _disk_warned[0]) < DISK_REWARN_S:
+        return
+    _disk_warned[0] = now
+    data = dict(low, min_gb=DISK_MIN_GB)
+    try:
+        with tx(db):
+            meta(db, "disk_warn", now)
+            ev = log_event(db, None, "critical_disk", data)
+    except sqlite3.OperationalError:  # SQLITE_FULL: nothing reaches the event log, the hook must still run
+        ev = dict(host=load_cfg().get("name"), eid=None, ts=now, job=None, kind="critical_disk", data=data)
+    fire(ev)
 
 
 def state_of(db, jid):
@@ -1013,6 +1061,9 @@ def script_line(path, off):
         return None, None
     n = head.count(b"\n") + (0 if head.endswith(b"\n") else 1)
     return n, head.rstrip(b"\n").rsplit(b"\n", 1)[-1].decode("utf-8", "replace").strip()
+
+
+WHERE_RPC_TIMEOUT = 40  # s: the `where` rpc runs ps and a py-spy dump per python process, slower than other rpcs
 
 
 def where_info(db, jid):
@@ -1472,10 +1523,11 @@ def ingest(db, host, epoch, events):
             d = ev["data"]
             if db.execute("INSERT OR IGNORE INTO events VALUES(?,?,?,?,?,?)",
                           (host, ev["eid"], ev["ts"], ev["job"], ev["kind"], pack(d))).rowcount:
-                db.execute("INSERT INTO jobs(id,host,prio,state,created,sent,eid,j) VALUES(?,?,?,?,?,1,?,?) "
-                           "ON CONFLICT(id) DO UPDATE SET host=excluded.host, prio=excluded.prio, state=excluded.state, "
-                           "sent=1, eid=excluded.eid, j=excluded.j WHERE excluded.eid > jobs.eid AND jobs.host IS excluded.host",
-                           (d["id"], host, d["prio"], d["state"], d["created"], ev["eid"], pack(d)))
+                if ev["job"]:  # host-level events (critical_disk) carry no job to mirror
+                    db.execute("INSERT INTO jobs(id,host,prio,state,created,sent,eid,j) VALUES(?,?,?,?,?,1,?,?) "
+                               "ON CONFLICT(id) DO UPDATE SET host=excluded.host, prio=excluded.prio, state=excluded.state, "
+                               "sent=1, eid=excluded.eid, j=excluded.j WHERE excluded.eid > jobs.eid AND jobs.host IS excluded.host",
+                               (d["id"], host, d["prio"], d["state"], d["created"], ev["eid"], pack(d)))
                 new.append(dict(ev, host=host))
         if events:
             db.execute("UPDATE hosts SET cursor=max(cursor,?) WHERE name=?", (max(e["eid"] for e in events), host))
@@ -2682,7 +2734,7 @@ RESET = DIM = BOLD = GREEN = CYAN = RED = MAGENTA = BLUE = BOLD_YELLOW = BOLD_CY
 HEAD_BAR = SEL_FLAT = False
 STATE_STYLE: dict = {}
 apply_theme("default")
-HOST_HEAD = "%-12s  %-7s %5s %5s  %7s  %10s  %9s  %-8s %4s %4s  %6s  %6s  %s" % ("Host", "State", "Load", "CPU%", "Cores", "Mem free", "Used/Res", "GPU", "Run", "Que", "Seen", "Freq", "Notes")
+HOST_HEAD = "%-12s  %-7s %5s %5s  %7s  %10s  %9s  %11s  %-8s %4s %4s  %6s  %6s  %s" % ("Host", "State", "Load", "CPU%", "Cores", "Mem free", "Used/Res", "Disk free", "GPU", "Run", "Que", "Seen", "Freq", "Notes")
 JOB_HEAD = "%-11s %3s %4s  %-12s  %-8s  %9s  %9s  %5s  %4s  %11s  %-16s  %s" % ("State", "CPU", "Prio", "Host", "ID", "Time", "Progress", "Try", "CPU%", "Mem", "Name", "Command")
 
 
@@ -2810,6 +2862,10 @@ def host_segs(h):
     job_mem = "-" if used is None else "%.1f/%.1fG" % (used / 1024, res / 1024) if res is not None else "%.1f/?G" % (used / 1024)
     over_mem = used is not None and res is not None and used > res
     hot_cpu = s.get("cpu_pct") is not None and s["cpu_pct"] > 100
+    dfree = s.get("disk_free") or {}
+    dg = lambda g: "%.fT" % (g / 1024) if g >= 10000 else "%.f" % g if g >= 10 else "%.1f" % g  # <= 4 chars
+    low_disk = any(g < DISK_MIN_GB for g in dfree.values())
+    disk = " ".join(dg(dfree[p]) + c for p, c in (("~", "~"), ("/tmp", "t")) if p in dfree)
     warnings = s.get("warnings") or []
     notes = h["err"] or "; ".join(n for n in (
         "agent down" if s and not s.get("agent") else "",
@@ -2821,6 +2877,7 @@ def host_segs(h):
             (BOLD_RED if hot_cpu else "", " %5s  " % ("%d%%" % s["cpu_pct"] if s and s.get("cpu_pct") is not None else "-")),
             (NUM, "%7s" % ("%d/%d" % (s["free"], s["cores"]) if s else "-")),
             ("", "  %10s  " % mem), (BOLD_RED if over_mem else "", "%9s  " % job_mem),
+            (BOLD_RED if low_disk else "", "%11s  " % disk),
             ("", "%-8s " % gpu), (GREEN if run else DIM, "%4d" % run), ("", " "), (YELLOW if que else DIM, "%4d" % que),
             (DIM, "  %6s  " % (fmt_dur(time.time() - h["seen"]) if h["seen"] else "never")),
             ("", "%6s  " % ("%.1fGHz" % s["cpu_ghz"] if s.get("cpu_ghz") is not None else "-")),
@@ -3063,7 +3120,7 @@ def tui(interval):
 
     def fetch_where(j, dest):  # on demand only: a py-spy dump briefly pauses python processes
         try:
-            w = json.loads(remote(dest, ["rpc"], json.dumps(dict(where=j["id"])), timeout=40))["where"]
+            w = json.loads(remote(dest, ["rpc"], json.dumps(dict(where=j["id"])), timeout=WHERE_RPC_TIMEOUT))["where"]
             st["where"] = (j["id"], where_lines(w), time.time())
         except Exception as e:
             st["where"] = (j["id"], [[(BOLD_RED, "where: %s" % e)]], time.time())
@@ -3446,7 +3503,7 @@ def tui(interval):
 
 EXAMPLES = """examples (tshed = this file, symlinked into PATH):
   tshed install gpu1=gpu1.local,gpu1 gpu2=me@gpu2    install or upgrade hosts (no hosts given: upgrade all)
-  tshed hosts                                         ping hosts: load, idle cores, memory, GPUs
+  tshed hosts                                         last known load, idle cores, memory, GPUs
   tshed submit -n train -H gpu1 -p 5 -c 8 -m 32G -t 12h -r 2 -- python train.py
   tshed ls -a;  tshed show ID;  tshed logs ID;  tshed where ID;  tshed wait ID;  tshed cancel ID
   tshed edit ID -p 9 -H gpu2 --force                  re-prioritise, move, or start a waiting job now
@@ -3499,7 +3556,7 @@ def build_parser():
     s.add_argument("names", nargs="+", metavar="NAME")
     s.add_argument("--purge", action="store_true", help="also delete ~/.tinyshed on the host (queue, history, logs)")
     s.add_argument("--force", action="store_true", help="proceed although the host has unfinished jobs")
-    s = sub.add_parser("hosts", help="ping every host and show resources")
+    s = sub.add_parser("hosts", help="show each host's last known state (no ssh; ls, serve and the dashboard refresh it)")
     s.add_argument("--json", action="store_true", help="one JSON object per line")
     s.add_argument("--rm", metavar="NAME", help="forget a host without contacting it")
     s = sub.add_parser("config", help="show or edit config.json in $EDITOR",
@@ -3826,11 +3883,10 @@ def main():
     if a.op == "hosts":
         if a.rm and not db.execute("DELETE FROM hosts WHERE name=?", (a.rm,)).rowcount:
             raise Fail("unknown host %r" % a.rm)
-        sync_all()
-        hosts = load_hosts(db)
+        hosts = load_hosts(db)  # last known state, instant: the Seen column says how old it is
         if a.json:
             for h in hosts:
-                print(json.dumps(dict(h["s"], name=h["name"], dest=h["dest"], up=bool(h["seen"] and not h["err"]), err=h["err"])))
+                print(json.dumps(dict(h["s"], name=h["name"], dest=h["dest"], up=bool(h["seen"] and not h["err"]), err=h["err"], seen=h["seen"])))
         elif not hosts:
             print("no hosts yet: tshed install NAME=DEST ...", file=sys.stderr)
         else:
@@ -3971,7 +4027,7 @@ def main():
         r = db.execute("SELECT * FROM jobs WHERE id=?", (resolve(db, a.id),)).fetchone()
         if not r["sent"] or r["host"] not in known:
             raise Fail("job %s is %s and not on a host" % (r["id"], r["state"]))
-        w = json.loads(remote(known[r["host"]], ["rpc"], json.dumps(dict(where=r["id"]))))["where"]
+        w = json.loads(remote(known[r["host"]], ["rpc"], json.dumps(dict(where=r["id"])), timeout=WHERE_RPC_TIMEOUT))["where"]
         if a.json:
             return print(json.dumps(w))
         b = unpack(r["j"])

@@ -378,10 +378,27 @@ hooks need something listening: `serve`, the dashboard, or phone-home.
 - **`Disk free`** is free GB on the host's home and `/tmp` (`451~ 42t`, `12T` from 10 000 GB); a path that cannot be
   stat'ed is left out (`18~`), an empty cell means neither was reported. Red, plus an `OnCriticalDisk`
   event per host, while either stays under 2 GB (re-warned hourly until it recovers).
+- **`GPU`** is NVIDIA utilization and memory used / total per GPU, on one line, in index order. One GPU
+  also shows its index (`88% 9.1/12G :0`); several are separated by `|` (`88% 9.1/12G | 0% 0.3/24G`),
+  and the column widens to fit the host with the most. Models and power per GPU are in `hosts --json`.
 - **`Freq`** is the mean clock of tinyshed's cores (`-` on Apple Silicon).
-- **`Notes`** carries host power draw where the OS exposes it (RAPL or battery), version mismatches
-  (run `tshed install`) and warnings.
+- **`Notes`** carries the host's power draw (see Power below), version mismatches (run `tshed install`)
+  and warnings.
 - `hosts --json` has all of it.
+
+**Power.** `310W` in Notes is the CPU packages (RAPL) plus the NVIDIA GPUs' board power; where one reading
+covers the whole machine (RAPL `psys`, a laptop battery, macOS) that reading alone. `gpu 239W` means only
+the GPUs could be read. On Linux >= 5.10 the RAPL counters are root-only (`energy_uj` is mode 0400), so the
+agent sees no CPU power and `tshed install` says so. To let it read them, on each host:
+
+```sh
+echo 'ACTION=="add", SUBSYSTEM=="powercap", RUN+="/bin/chmod o+r /sys%p/energy_uj"' \
+  | sudo tee /etc/udev/rules.d/99-tinyshed-rapl.rules
+sudo chmod o+r /sys/class/powercap/intel-rapl:*/energy_uj     # now; the rule covers reboots
+```
+
+This reverts a mitigation for the PLATYPUS power side channel (CVE-2020-8694): fine on single-user boxes,
+not on shared ones. `hosts --json` has the parts as `power_parts` (`cpu`, `gpu` or `system`).
 
 **Config.** `~/.tinyshed/config.json` on each host holds `name`, `cores` (the CPU set jobs may use) and
 `home` (the phone-home command). Set it with `install --cores …`, `tshed config --edit`,
@@ -440,8 +457,9 @@ they are used exactly as given.
 
 ## Development
 
-There is no test suite; changes are exercised against fake hosts on one machine. Never point a test at
-your real `~/.tinyshed`:
+Unit tests: `./run_tests.sh` (stdlib unittest, under a second, each test in its own temporary home;
+`-k PATTERN` for a subset). Agents, watchdogs and ssh are exercised against fake hosts on one machine.
+Never point a test at your real `~/.tinyshed`:
 
 ```sh
 export TINYSHED_HOME=/tmp/ts/server

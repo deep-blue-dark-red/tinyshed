@@ -464,6 +464,128 @@ class TestServerJobs(ServerBase):
 
 # ───────────────────────────────────────────────────────────────── rendering and cli
 
+class TestGpu(unittest.TestCase):
+    def test_parse_gpu(self):
+        self.assertEqual(t.parse_gpu("0, NVIDIA GeForce RTX 4070 Ti SUPER, 88, 9318, 16376, 238.63"),
+                         dict(index=0, name="NVIDIA GeForce RTX 4070 Ti SUPER", util=88, mem_used=9318, mem_total=16376, power=238.63))
+        g = t.parse_gpu("1, NVIDIA H100 80GB HBM3, [N/A], [N/A], 81559, [N/A]")  # unreported fields do not drop the GPU
+        self.assertEqual((g["index"], g["util"], g["mem_used"], g["mem_total"], g["power"]), (1, None, None, 81559, None))
+
+    def test_gpu_cell(self):
+        g = lambda i, u, mu, mt: dict(index=i, name="NVIDIA RTX A6000", util=u, mem_used=mu, mem_total=mt, power=100.0)
+        cases = (([], "-"),
+                 ([g(0, 88, 9318, 12282)], "88% 9.1/12G :0"),
+                 ([g(0, None, None, 81559)], "?% ?/80G :0"),
+                 ([dict(util=50, mem_used=1000, mem_total=8000)], "50% 1.0/7.8G"),  # host not yet upgraded: no index
+                 ([g(1, 0, 300, 24576), g(0, 100, 24000, 24564)], "100% 23/24G | 0% 0.3/24G"),  # index order
+                 ([g(0, 7, 100, 8192), g(1, None, None, 8192), g(2, 50, 4096, 0)], "7% 0.1/8.0G | ?% ?/8.0G | 50%"))
+        for gpus, want in cases:
+            with self.subTest(want=want):
+                self.assertEqual(t.gpu_cell(gpus), want)
+
+    def test_gpu_width_fits_the_widest_host(self):
+        hosts = [dict(s={}), dict(s=dict(gpus=[dict(index=0, util=5, mem_used=1, mem_total=8192)])),
+                 dict(s=dict(gpus=[dict(index=i, util=100, mem_used=80000, mem_total=81559) for i in range(8)]))]
+        self.assertEqual(t.gpu_width(hosts[:1]), 3)
+        self.assertEqual(t.gpu_width(hosts), len(t.gpu_cell(hosts[2]["s"]["gpus"])))
+
+class TestPower(Base):
+    def setUp(self):
+        super().setUp()
+        self._rapl, t.RAPL = t.RAPL, os.path.join(self.home, "powercap")
+        self._system_w, t.system_w = t.system_w, lambda: None
+        self.db = t.hdb()
+
+    def tearDown(self):
+        t.RAPL, t.system_w = self._rapl, self._system_w
+        super().tearDown()
+
+    def domain(self, n, uj, name="package-0", mode=0o644):
+        d = os.path.join(t.RAPL, n)
+        os.makedirs(d, exist_ok=True)
+        for f, v in (("energy_uj", uj), ("name", name), ("max_energy_range_uj", 262143328850)):
+            with open(os.path.join(d, f), "w") as fh:
+                fh.write("%s\n" % v)
+        os.chmod(os.path.join(d, "energy_uj"), mode)
+
+    def poll(self, dt=1.0):
+        """Two readings dt apart: the first only stores a baseline."""
+        t.rapl_w(self.db)
+        prev = json.loads(t.meta(self.db, "power"))
+        t.meta(self.db, "power", json.dumps(dict(prev, ts=prev["ts"] - dt)))
+
+    def test_domains_skip_subdomains_and_mmio(self):
+        for n in ("intel-rapl:0", "intel-rapl:0:0", "intel-rapl:1", "intel-rapl-mmio:0"):
+            self.domain(n, 0)
+        self.assertEqual(t.rapl_domains(), ["intel-rapl:0", "intel-rapl:1"])
+
+    def test_packages_summed(self):
+        self.domain("intel-rapl:0", 1_000_000)
+        self.domain("intel-rapl:1", 1_000_000, "package-1")
+        self.domain("intel-rapl-mmio:0", 1_000_000)  # same package again: must not double the reading
+        self.poll()
+        for n, uj in (("intel-rapl:0", 41_000_000), ("intel-rapl:1", 21_000_000), ("intel-rapl-mmio:0", 41_000_000)):
+            self.domain(n, uj)
+        w, kind = t.rapl_w(self.db)
+        self.assertEqual(kind, "cpu")
+        self.assertAlmostEqual(w, 60, delta=1)
+
+    def test_psys_is_the_whole_machine(self):
+        self.domain("intel-rapl:0", 0)
+        self.domain("intel-rapl:1", 0, "psys")
+        self.poll()
+        self.domain("intel-rapl:0", 20_000_000)
+        self.domain("intel-rapl:1", 35_000_000, "psys")
+        w, kind = t.rapl_w(self.db)
+        self.assertEqual(kind, "system")
+        self.assertAlmostEqual(w, 35, delta=1)
+
+    def test_counter_wrap(self):
+        self.domain("intel-rapl:0", 262143328850 - 5_000_000)
+        self.poll()
+        self.domain("intel-rapl:0", 5_000_000)
+        self.assertAlmostEqual(t.rapl_w(self.db)[0], 10, delta=0.5)
+
+    def test_first_reading_is_only_a_baseline(self):
+        self.domain("intel-rapl:0", 1)
+        self.assertEqual(t.rapl_w(self.db), (None, None))
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads anything")
+    def test_unreadable_rapl(self):
+        self.domain("intel-rapl:0", 1, mode=0o400)
+        os.chmod(os.path.join(t.RAPL, "intel-rapl:0", "energy_uj"), 0)
+        self.assertIs(t.rapl_readable(), False)
+        self.assertEqual(t.rapl_w(self.db), (None, None))
+        self.assertIn("RAPL", t.install_notes(dict(agent=True, taskset=True, boot="systemd", mosh=True, rapl=False)))
+
+    def test_no_rapl(self):
+        self.assertIsNone(t.rapl_readable())
+        self.assertEqual(t.power_parts(self.db, []), {})
+
+    def test_parts_cpu_plus_gpu(self):
+        self.domain("intel-rapl:0", 0)
+        self.poll()
+        self.domain("intel-rapl:0", 65_000_000)
+        parts = t.power_parts(self.db, [dict(power=200.0), dict(power=39.0), dict(power=None)])
+        self.assertAlmostEqual(parts["cpu"], 65, delta=1)
+        self.assertEqual(parts["gpu"], 239.0)
+
+    def test_parts_gpu_only_when_rapl_unreadable(self):
+        self.assertEqual(t.power_parts(self.db, [dict(power=238.63)]), {"gpu": 238.63})
+
+    def test_system_reading_already_includes_gpu(self):
+        t.system_w = lambda: 90.0  # battery / macOS
+        self.assertEqual(t.power_parts(self.db, [dict(power=50.0)]), {"system": 90.0})
+
+    def test_power_note(self):
+        self.assertEqual(t.power_note(dict(power_w=303.6, power_parts=dict(cpu=65, gpu=238.6))), "304W")
+        self.assertEqual(t.power_note(dict(power_w=238.6, power_parts=dict(gpu=238.6))), "gpu 239W")
+        self.assertEqual(t.power_note(dict(power_w=12.0, power_parts=dict(system=12.0))), "12W")
+        self.assertEqual(t.power_note(dict(power_w=65.0)), "65W")  # host not yet upgraded: no breakdown
+        self.assertEqual(t.power_note(dict(power_w=None)), "")
+        self.assertIn("gpu 239W", row(status(power_w=238.6, power_parts=dict(gpu=238.6))))
+
+
 def status(**kw):
     s = dict(load=0.4, cpu_pct=6, free=32, cores=32, mem_avail_mb=118 << 10, mem_total_mb=125 << 10, mem_used_mb=2048,
              mem_reserved_mb=8192, gpus=[], counts={}, cpu_ghz=3.1, power_w=None, agent=True, version=t.VERSION,
@@ -478,8 +600,8 @@ def row(s, **h):
 
 class TestHostRow(unittest.TestCase):
     def col(self, text, name):
-        """The text under column `name`: HOST_HEAD right-aligns, so take the header cell's span."""
-        m = re.search(r"\s*" + re.escape(name), t.HOST_HEAD)
+        """The text under column `name`: the header right-aligns, so take the header cell's span."""
+        m = re.search(r"\s*" + re.escape(name), t.host_head())
         return text[m.start():m.end()].strip()
 
     def test_disk_cell(self):
@@ -489,13 +611,18 @@ class TestHostRow(unittest.TestCase):
                 self.assertEqual(self.col(row(status(disk_free=dfree)), "Disk free"), want)
 
     def test_columns_stay_aligned(self):
-        """Every cell before Notes has a fixed width, whatever the values: Notes starts where its header does."""
-        notes_at = t.HOST_HEAD.index("Notes")
-        for s in (status(), status(disk_free={"~": 9999, "/tmp": 12345}), status(disk_free={}),
-                  status(gpus=[dict(util=50)] * 8, cpu_pct=150, mem_used_mb=9000, power_w=65.0), {}):
-            with self.subTest(s=s):
-                segs = t.host_segs(dict(name="a-very-long-hostname", err=None if s else "ssh: timeout", seen=time.time(), s=s))
-                self.assertEqual(sum(len(x) for _, x in segs[:-1]), notes_at)
+        """Every cell before Notes has a fixed width, whatever the values: Notes starts where its header does,
+        with the GPU column sized to the widest host in the table."""
+        eight = [dict(index=i, util=100, mem_used=80000, mem_total=81559) for i in range(8)]
+        table = [status(), status(disk_free={"~": 9999, "/tmp": 12345}), status(disk_free={}),
+                 status(gpus=[dict(util=50)] * 3, cpu_pct=150, mem_used_mb=9000, power_w=65.0),
+                 status(gpus=[dict(index=0, util=88, mem_used=9318, mem_total=12282)]), status(gpus=eight), {}]
+        hosts = [dict(name="a-very-long-hostname", err=None if s else "ssh: timeout", seen=time.time(), s=s) for s in table]
+        gw = t.gpu_width(hosts)
+        notes_at = t.host_head(gw).index("Notes")
+        for h in hosts:
+            with self.subTest(s=h["s"]):
+                self.assertEqual(sum(len(x) for _, x in t.host_segs(h, gw)[:-1]), notes_at)
 
     def test_notes(self):
         self.assertIn("run tshed install", row(status(version="0.1")))

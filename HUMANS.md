@@ -45,16 +45,18 @@ tshed hosts
 ```
 
 ```
-Host          State    Load  CPU%    Cores    Mem free   Used/Res    Disk free  GPU       Run  Que    Seen    Freq  Notes
-gpu1          ✓ up      0.4    6%    32/32    118/125G   2.0/8.0G    412~ 3.5t  2x 0%       0    0      0s  3.1GHz  65W
-gpu2          ✓ up      1.2   12%    16/16      57/62G   1.5/4.0G      88~ 12t  -           0    0      0s  3.2GHz
+Host          State    Load  CPU%    Cores    Mem free   Used/Res    Disk free  GPU                      Run  Que    Seen    Freq  Notes
+gpu1          ✓ up      0.4    6%    32/32    118/125G   2.0/8.0G    412~ 3.5t  97% 40/48G | 0% 1.1/48G    1    0      0s  3.1GHz  412W
+gpu2          ✓ up      1.2   12%    16/16      57/62G   1.5/4.0G      88~ 12t  88% 9.1/12G :0             1    0      0s  3.2GHz  gpu 239W
 ```
 
 `Load` is the machine-wide 1-minute load average; `CPU%` is the busy percentage of the cores
 tinyshed owns (`-` until two polls have happened). `Used/Res` is the live RAM of running jobs over
 their combined `-m` limits; `Mem free` is the whole machine's available/total; `Freq` is the mean
 clock of those cores. `Disk free` is free GB on the host's home and `/tmp`; red under 2 GB, which
-also fires `OnCriticalDisk`. A red `CPU%` (>100%) or `Used/Res` (used over reserved) means a limit was
+also fires `OnCriticalDisk`. `GPU` is NVIDIA utilization and memory used/total per GPU (`88% 9.1/12G :0`;
+several are separated by `|`). Notes shows watts: CPU plus GPUs, or `gpu 239W` when the CPU's RAPL counters
+are root-only (README, Power, has the one-time fix). A red `CPU%` (>100%) or `Used/Res` (used over reserved) means a limit was
 breached — it should not happen, since the watchdog kills jobs that pass their `-m` limit, and the
 reason appears in Notes, which also carries the host's power draw in watts where the OS reports one.
 

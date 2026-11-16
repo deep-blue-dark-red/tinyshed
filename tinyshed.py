@@ -888,33 +888,59 @@ def cpu_freq_ghz(cores):
     return None
 
 
-def power_w(db):
-    """Whole-host power draw in watts, best effort; None where the OS exposes no power counter.
-    RAPL package energy is a delta between polls, so the last reading lives in host.db meta."""
-    uj = {}
+RAPL = "/sys/class/powercap"
+
+
+def rapl_domains():
+    """Top-level RAPL domains: CPU packages, plus 'psys' (the whole platform) on some Intel machines. Not the
+    subdomains (core, uncore, dram: inside a package) nor intel-rapl-mmio (a second view of the same package)."""
     with contextlib.suppress(OSError):
-        for n in sorted(os.listdir("/sys/class/powercap")):
-            if n.startswith("intel-rapl") and n.count(":") == 1:  # packages, not subdomains
-                with contextlib.suppress(OSError, ValueError):
-                    uj[n] = int(open("/sys/class/powercap/%s/energy_uj" % n).read())
-    if uj:
-        try:
-            prev = json.loads(meta(db, "power") or "null")
-        except ValueError:
-            prev = None
-        meta(db, "power", json.dumps(dict(ts=time.time(), uj=uj)))
-        span = time.time() - prev["ts"] if prev else 0
-        if prev and 0.2 <= span <= 300:
-            joules = 0
-            for n, e in uj.items():
-                d = e - prev["uj"].get(n, e)
-                if d < 0:  # counters wrap at max_energy_range_uj
-                    with contextlib.suppress(OSError, ValueError):
-                        d += int(open("/sys/class/powercap/%s/max_energy_range_uj" % n).read())
-                if d > 0:
-                    joules += d
-            if joules:
-                return joules / span / 1e6
+        return [n for n in sorted(os.listdir(RAPL)) if n.startswith("intel-rapl:") and n.count(":") == 1]
+    return []
+
+
+def rapl_readable():
+    """None without RAPL, else whether this user can read it (root-only since Linux 5.10: see README, Power)."""
+    doms = rapl_domains()
+    return os.access(os.path.join(RAPL, doms[0], "energy_uj"), os.R_OK) if doms else None
+
+
+def rapl_w(db):
+    """(watts, 'cpu' | 'system') from RAPL energy counters, a delta between polls (last reading in host.db meta);
+    psys alone when present, since it already contains the packages. (None, None) if absent or unreadable."""
+    uj, psys = {}, None
+    for n in rapl_domains():
+        with contextlib.suppress(OSError, ValueError):
+            with open(os.path.join(RAPL, n, "energy_uj")) as f:
+                uj[n] = int(f.read())
+            with contextlib.suppress(OSError), open(os.path.join(RAPL, n, "name")) as f:
+                psys = n if f.read().strip() == "psys" else psys
+    if not uj:
+        return None, None
+    try:
+        prev = json.loads(meta(db, "power") or "null")
+    except ValueError:
+        prev = None
+    now = time.time()
+    meta(db, "power", json.dumps(dict(ts=now, uj=uj)))
+    span = now - prev["ts"] if prev else 0
+    if not prev or not 0.2 <= span <= 300:
+        return None, None
+    watts = {}
+    for n, e in uj.items():
+        d = e - prev["uj"].get(n, e)
+        if d < 0:  # counters wrap at max_energy_range_uj
+            with contextlib.suppress(OSError, ValueError), open(os.path.join(RAPL, n, "max_energy_range_uj")) as f:
+                d += int(f.read())
+        if d > 0:
+            watts[n] = d / span / 1e6
+    if psys in watts:
+        return watts[psys], "system"
+    return (sum(watts.values()), "cpu") if watts else (None, None)
+
+
+def system_w():
+    """Whole-machine draw where the OS reports one without root: battery discharge rate, or macOS ioreg."""
     try:  # battery discharge rate
         for bat in sorted(os.listdir("/sys/class/power_supply")):
             if bat.startswith("BAT"):
@@ -940,6 +966,21 @@ def power_w(db):
     return None
 
 
+def power_parts(db, gpus):
+    """Host power draw by source, best effort: {'system': W} where one reading covers the whole machine (RAPL psys,
+    battery, macOS), else {'cpu': RAPL packages, 'gpu': NVIDIA board power}, either missing when unreadable."""
+    w, kind = rapl_w(db)
+    parts = {kind: w} if w else {}
+    if not parts:
+        w = system_w()
+        if w:
+            parts["system"] = w
+    gw = [g["power"] for g in gpus if g.get("power") is not None]
+    if gw and "system" not in parts:
+        parts["gpu"] = sum(gw)
+    return parts
+
+
 def disk_free():
     """Free GB on the watched paths (~ and /tmp); a path that cannot be stat'ed is left out."""
     out = {}
@@ -951,12 +992,23 @@ def disk_free():
     return out
 
 
+def parse_gpu(line):
+    """One nvidia-smi csv line (index, name, util %, mem used MiB, mem total MiB, power W) -> dict; a field the GPU
+    does not report ('[N/A]') is None rather than dropping every GPU on the host."""
+    f = [x.strip() for x in line.split(",")]
+    num = lambda x: int(x) if x.isdigit() else None
+    try:
+        watts = float(f[-1])
+    except ValueError:
+        watts = None
+    return dict(index=num(f[0]), name=",".join(f[1:-4]), util=num(f[-4]), mem_used=num(f[-3]), mem_total=num(f[-2]), power=watts)
+
+
 def status(db, cfg):
     cores = host_cores(cfg)
     pct = cpu_util(db, cores)
     job_live, mem_used_mb, mem_reserved_mb = job_usage(db)
     ghz = cpu_freq_ghz(cores)
-    watts = power_w(db)
     mem_total = mem_avail = None
     try:
         mem_total = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") >> 20
@@ -969,11 +1021,12 @@ def status(db, cfg):
     gpus = []
     if shutil.which("nvidia-smi"):
         try:
-            out = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"],
-                                 capture_output=True, text=True, timeout=5).stdout
-            gpus = [dict(zip(("util", "mem_used", "mem_total"), map(int, l.split(",")))) for l in out.splitlines() if l.strip()]
-        except (OSError, ValueError, subprocess.SubprocessError):
+            out = subprocess.run(["nvidia-smi", "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,power.draw",
+                                  "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5).stdout
+            gpus = [parse_gpu(l) for l in out.splitlines() if l.strip()]
+        except (OSError, subprocess.SubprocessError):
             pass
+    power = {k: round(v, 1) for k, v in power_parts(db, gpus).items()}
     warn = []
     if pct is not None and pct > 100:  # impossible with sound counters: jobs are pinned to their cores
         warn.append("CPU% >100%: limit breach")
@@ -984,7 +1037,7 @@ def status(db, cfg):
                 load=os.getloadavg()[0], cpu_pct=pct, cpu_ghz=round(ghz, 2) if ghz is not None else None,
                 mem_total_mb=mem_total, mem_avail_mb=mem_avail,
                 mem_used_mb=mem_used_mb, mem_reserved_mb=mem_reserved_mb, jobs=job_live,
-                power_w=round(watts, 1) if watts is not None else None, warnings=warn,
+                power_w=round(sum(power.values()), 1) if power else None, power_parts=power, warnings=warn,
                 disk_free_gb=round(shutil.disk_usage(HOME).free / 2 ** 30, 1), disk_free=dfree, gpus=gpus, agent=agent_alive(),
                 counts={r[0]: r[1] for r in db.execute("SELECT state, count(*) FROM jobs GROUP BY state")},
                 queued_cpus=db.execute("SELECT coalesce(sum(cpus),0) FROM jobs WHERE state='queued'").fetchone()[0])
@@ -1429,7 +1482,7 @@ def setup(a):
         time.sleep(0.1)
     print(json.dumps(dict(status(db, cfg), python=sys.version.split()[0], zstd=("stdlib" if z.__name__.startswith("compression") else z.__name__) if z else "binary",
                           taskset=bool(shutil.which("taskset")), mosh=bool(shutil.which("mosh-server")), boot=boot,
-                          git=bool(shutil.which("git")), rsync=bool(shutil.which("rsync")),
+                          git=bool(shutil.which("git")), rsync=bool(shutil.which("rsync")), rapl=rapl_readable(),
                           phone_home=bool(cfg.get("home")), cores_cfg=cfg.get("cores"))))
 
 
@@ -2201,6 +2254,8 @@ def install_notes(r):
         notes.append("no git: --git unavailable")
     if not r.get("rsync", True):
         notes.append("no rsync: --push/--pull unavailable")
+    if r.get("rapl") is False:
+        notes.append("CPU watts need read access to RAPL (root-only): see README, Power")
     return "; ".join(notes)
 
 
@@ -2734,7 +2789,11 @@ RESET = DIM = BOLD = GREEN = CYAN = RED = MAGENTA = BLUE = BOLD_YELLOW = BOLD_CY
 HEAD_BAR = SEL_FLAT = False
 STATE_STYLE: dict = {}
 apply_theme("default")
-HOST_HEAD = "%-12s  %-7s %5s %5s  %7s  %10s  %9s  %11s  %-8s %4s %4s  %6s  %6s  %s" % ("Host", "State", "Load", "CPU%", "Cores", "Mem free", "Used/Res", "Disk free", "GPU", "Run", "Que", "Seen", "Freq", "Notes")
+def host_head(gpu_w=3):
+    """The host table's header; gpu_w = gpu_width(hosts), the same value host_segs gets."""
+    return "%-12s  %-7s %5s %5s  %7s  %10s  %9s  %11s  %-*s %4s %4s  %6s  %6s  %s" % (
+        "Host", "State", "Load", "CPU%", "Cores", "Mem free", "Used/Res", "Disk free", gpu_w, "GPU", "Run", "Que", "Seen", "Freq", "Notes")
+
 JOB_HEAD = "%-11s %3s %4s  %-12s  %-8s  %9s  %9s  %5s  %4s  %11s  %-16s  %s" % ("State", "CPU", "Prio", "Host", "ID", "Time", "Progress", "Try", "CPU%", "Mem", "Name", "Command")
 
 
@@ -2851,12 +2910,11 @@ def state_seg(j):
     return style, ("%s %s%s" % (glyph, j["state"], "…" if j["cancel"] and j["state"] not in TERMINAL else "")).ljust(11)
 
 
-def host_segs(h):
+def host_segs(h, gpu_w=3):
     s, c = h["s"], h["s"].get("counts", {})
     state = (BOLD_RED, "● down") if h["err"] else (GREEN, "✓ up") if h["seen"] else (DIM, "◌ new")
     mem = "%s/%dG" % ("?" if s.get("mem_avail_mb") is None else "%d" % (s["mem_avail_mb"] >> 10), s["mem_total_mb"] >> 10) if s.get("mem_total_mb") else "-"
-    gpus = s.get("gpus") or []
-    gpu = "%dx %d%%" % (len(gpus), sum(g["util"] for g in gpus) / len(gpus)) if gpus else "-"
+    gpu = gpu_cell(s.get("gpus") or [])
     run, que = c.get("running", 0), c.get("queued", 0)
     used, res = s.get("mem_used_mb"), s.get("mem_reserved_mb")
     job_mem = "-" if used is None else "%.1f/%.1fG" % (used / 1024, res / 1024) if res is not None else "%.1f/?G" % (used / 1024)
@@ -2870,7 +2928,7 @@ def host_segs(h):
     notes = h["err"] or "; ".join(n for n in (
         "agent down" if s and not s.get("agent") else "",
         "v%s, server is v%s: run tshed install" % (s.get("version"), VERSION) if s and s.get("version") != VERSION else "",
-        "%.0fW" % s["power_w"] if s.get("power_w") is not None else "",
+        power_note(s),
         *warnings) if n)
     return [(HOST, "%-12s" % h["name"][:12]), ("", "  "), (state[0], "%-7s" % state[1]),
             ("", " %5s" % ("%.1f" % s["load"] if s else "-")),
@@ -2878,10 +2936,39 @@ def host_segs(h):
             (NUM, "%7s" % ("%d/%d" % (s["free"], s["cores"]) if s else "-")),
             ("", "  %10s  " % mem), (BOLD_RED if over_mem else "", "%9s  " % job_mem),
             (BOLD_RED if low_disk else "", "%11s  " % disk),
-            ("", "%-8s " % gpu), (GREEN if run else DIM, "%4d" % run), ("", " "), (YELLOW if que else DIM, "%4d" % que),
+            ("", "%-*s " % (gpu_w, gpu)), (GREEN if run else DIM, "%4d" % run), ("", " "), (YELLOW if que else DIM, "%4d" % que),
             (DIM, "  %6s  " % (fmt_dur(time.time() - h["seen"]) if h["seen"] else "never")),
             ("", "%6s  " % ("%.1fGHz" % s["cpu_ghz"] if s.get("cpu_ghz") is not None else "-")),
             (BOLD_RED if h["err"] else YELLOW, clean(notes))]
+
+
+def power_note(s):
+    """Host draw for Notes: '310W' when it covers the CPU or the whole machine, else what it covers ('gpu 239W')."""
+    parts, w = s.get("power_parts"), s.get("power_w")
+    if w is None:
+        return ""
+    return "gpu %.0fW" % w if parts and set(parts) == {"gpu"} else "%.0fW" % w
+
+
+def gpu_cell(gpus):
+    """The host row's GPU cell, one line: each GPU's utilization and memory used/total, in index order.
+    One GPU also shows its index ('88% 9.1/12G :0'); several are separated by '|' ('88% 9.1/12G | 0% 0.3/24G')."""
+    if not gpus:
+        return "-"
+    gb = lambda v: "%.1f" % v if v < 10 else "%.f" % v
+    one = lambda g: ("?" if g.get("util") is None else "%d" % g["util"]) + "%" + (
+        " %s/%sG" % ("?" if g.get("mem_used") is None else gb(g["mem_used"] / 1024), gb(g["mem_total"] / 1024))
+        if g.get("mem_total") else "")
+    gpus = sorted(gpus, key=lambda g: g.get("index") if g.get("index") is not None else 1 << 30)
+    if len(gpus) == 1:
+        idx = gpus[0].get("index")
+        return one(gpus[0]) + (" :%d" % idx if idx is not None else "")
+    return " | ".join(map(one, gpus))
+
+
+def gpu_width(hosts):
+    """The GPU column fits the widest cell in the table (several GPUs need more than one)."""
+    return max([len("GPU")] + [len(gpu_cell(h["s"].get("gpus") or [])) for h in hosts])
 
 
 def fmt_mem(used, limit):
@@ -3154,7 +3241,7 @@ def tui(interval):
     def table_head(head, W):
         if HEAD_BAR:  # a colored bar replaces the rule under the header
             return [HEAD + head[:W].ljust(W) + RESET]
-        return [BOLD + head[:W] + RESET, "─" * min(W, len(HOST_HEAD) + 12)]
+        return [BOLD + head[:W] + RESET, "─" * min(W, len(head) + 12)]
 
     def draw_main(hosts, jobs, total, counts, cur):
         W, H = shutil.get_terminal_size()
@@ -3180,9 +3267,10 @@ def tui(interval):
                      ("", "   "), (DIM, "[Type to filter, Esc to exit]")]
             L.append(styled(segs, W))
         # 2. hosts
-        L.extend(table_head(HOST_HEAD, W))
         shown = hosts[:max(1, H // 3 - 2)]
-        L.extend(styled(host_segs(h), W, ALT if i % 2 else "") for i, h in enumerate(shown))
+        gw = gpu_width(shown)
+        L.extend(table_head(host_head(gw), W))
+        L.extend(styled(host_segs(h, gw), W, ALT if i % 2 else "") for i, h in enumerate(shown))
         if not hosts:
             L.append(DIM + "  (no hosts yet: tshed install NAME=DEST)" + RESET)
         elif len(shown) < len(hosts):
@@ -3525,9 +3613,10 @@ def overview(db, n=30, show_all=False):
     jobs = [j for j in load_jobs(db, hosts) if show_all or j["state"] not in TERMINAL]
     width = shutil.get_terminal_size().columns - 1 if colors() else 10 ** 6
     if hosts:
-        print(paint(HOST_HEAD, BOLD))
+        gw = gpu_width(hosts[:n - 1])
+        print(paint(host_head(gw), BOLD))
         for h in hosts[:n - 1]:
-            out(host_segs(h))
+            out(host_segs(h, gw))
     else:
         print("no hosts yet: tshed install NAME=DEST ...")
     print(paint("---LS", DIM))
@@ -3890,9 +3979,10 @@ def main():
         elif not hosts:
             print("no hosts yet: tshed install NAME=DEST ...", file=sys.stderr)
         else:
-            print(paint(HOST_HEAD, BOLD))
+            gw = gpu_width(hosts)
+            print(paint(host_head(gw), BOLD))
             for h in hosts:
-                out(host_segs(h))
+                out(host_segs(h, gw))
     elif a.op == "overview":
         overview(db, a.lines, a.all)
     elif a.op == "submit":

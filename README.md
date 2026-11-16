@@ -3,7 +3,8 @@
 A minimal priority-queue scheduler for long jobs: one server commanding a handful of machines over ssh.
 
 You have a laptop and a few boxes with cores and GPUs. tshed queues jobs on them by priority,
-pins each job to its own cores, enforces runtime and memory limits, notices when a job stops making
+gives each job its own cores, RAM and GPUs (or a share of one), fits those claims to what the job really
+uses, enforces runtime and memory limits, notices when a job stops making
 progress, retries what failed, keeps every log, and moves your code there and your results back.
 It is one file, `tshed.py` (the command is `tshed`), stdlib-only Python, with no daemon on the
 server and nothing to install on the hosts except that same file.
@@ -52,14 +53,16 @@ tshed completion fish > ~/.config/fish/completions/tshed.fish   # or zsh / bash
 ```sh
 cd ~/proj/train                         # a git repo; uncommitted edits are fine
 tshed stats train --json                # earlier runtimes of this name, to pick -x
-tshed submit -n train -H gpu1 -c 8 -m 32G -x 3h -r 1 \
+tshed submit -n train -H gpu1 -c 8 -m 32G -g 1 -x 3h -r 1 \
     --git --push ~/data/imgs:data --pull out:~/results/{name}/{id} \
     -- python train.py --lr 3e-4
 tshed wait -t 4h train                  # → 1a2b3c4d done pulled out → /Users/me/results/train/1a2b3c4d
 ```
 
 The job runs on gpu1 in its own checkout of your working tree, in the same subdirectory, with
-`data/` copied next to it. It gets 8 pinned cores and a 32 GB RSS limit, and a 6 h timeout (2 × `-x`).
+`data/` copied next to it. It gets 8 pinned cores, 32 GB of RAM (also its RSS limit), one GPU of its own
+(`CUDA_VISIBLE_DEVICES`) and a 6 h timeout (2 × `-x`). If after two minutes it uses less of any of these,
+the claim shrinks to fit, so other jobs can use the rest.
 If it exits with an error (or its host reboots), it is retried once. When it ends, `out/` is copied to the local folder, along with
 `tshed-ID.json` recording what produced it. The checkout on gpu1 is then deleted. The code stays
 recoverable with `tshed checkout ID`.
@@ -90,6 +93,7 @@ letting it hang until the timeout. The dashboard shows percent done and an ETA.
 | `install [[NAME=]DEST…] [--cores 0-15] [--home DEST] [--no-boot]` | check each host, copy the file, (re)start its agent, start it at boot, register it. No hosts = upgrade all. `DEST` is an ssh destination, alternatives tried in order (`gpu1.local,gpu1`: LAN, then VPN name), or `local[:DIR]`. Options left out keep their installed value. Safe while jobs run |
 | `uninstall NAME… [--purge] [--force]` | stop the agent, remove the boot entry, forget the host; data stays unless `--purge` |
 | `hosts [--json] [--rm NAME]` | last known state of every host, without contacting them (`Seen` = its age; `ls`, `serve` and the dashboard refresh it): see [Host columns](#host-columns) |
+| `score [HOST] [--from DIR] [--cpu N] [--gpu N] [--clear]` | each host's CPU and GPU score: the order host-less jobs try hosts in. See [Host scores](#host-scores) |
 | `config [--edit] [--host HOST…]` | show or edit (in `$VISUAL`/`$EDITOR`) this machine's `config.json`, or a host's over ssh; validated before saving, applied within a second |
 | **jobs** | |
 | `submit -n NAME [flags] -- CMD` | queue a job; prints `ID STATE HOST`. See [Submitting](#submitting) |
@@ -122,16 +126,19 @@ Output is colored on a terminal and plain in a pipe; `NO_COLOR` is respected.
 ## Submitting
 
 ```sh
-tshed submit -n NAME [-H HOST] [-p PRIO] [-c CPUS] [-m MEM] [-x EXPECT] [-t TIMEOUT] [flags] -- CMD
+tshed submit -n NAME [-H HOST] [-p PRIO] [-c CPUS] [-m MEM] [-g GPUS [--vram MEM]] [-x EXPECT] [-t TIMEOUT] [flags] -- CMD
 ```
 
 | flag | |
 |---|---|
 | `-n NAME` | required: 1-16 printable characters, no spaces; usable instead of the id |
-| `-H HOST` | run on this host. Without it the server places the job on the live host with the most idle cores at the next sync (any `tshed` command, `serve` or the dashboard) |
+| `-H HOST` | run on this host. Without it the server places the job on the best-scoring live host with room for it, else the next best (see [Host scores](#host-scores)), at the next sync (any `tshed` command, `serve` or the dashboard) |
 | `-p N` | priority, higher first (default 0) |
-| `-c N` | cores to reserve and pin with `taskset` (default 1) |
-| `-m 8G` | RSS limit of the whole process tree → `oom` |
+| `-c N` | cores to claim and pin with `taskset` (default 1) |
+| `-m 8G` | RAM to claim, and the RSS limit of the whole process tree → `oom` |
+| `-g N` | GPUs to claim: a share of one (`0.25`) or a whole number (`2`). See [Claims](#claims-cores-ram-gpus) |
+| `--vram 6G` | GPU memory to claim on each of its GPUs (default: the claimed share of the GPU's memory) |
+| `--no-adjust` | keep the claims as submitted instead of fitting them to measured use |
 | `-x 2h` | expected runtime: sets the default timeout and stall limit, gives an ETA. See [Progress](#progress-and-stalls) |
 | `-t 12h` | runtime limit per attempt → `timeout` (default 2 × `-x`, else none) |
 | `--stall DUR` · `--stall-on-log` | kill after DUR without a checkpoint → `stalled`; log output counts as one too |
@@ -146,6 +153,8 @@ tshed submit -n NAME [-H HOST] [-p PRIO] [-c CPUS] [-m MEM] [-x EXPECT] [-t TIME
 conda/modules need `bash -lc '…'`. Quote it as one argument if it has shell syntax:
 `-- 'make 2>&1 | tail'`. Jobs see `TINYSHED_JOB`, `TINYSHED_ATTEMPT`, `TINYSHED_CORES` and
 `TINYSHED_PROGRESS` (and `TINYSHED_OWNER`), and `~/.tinyshed/bin` first on `PATH` (so `tshed progress` works on every host).
+A job with `-g` also gets `CUDA_VISIBLE_DEVICES` and `TINYSHED_GPUS` (its GPUs' indices) and `CUDA_DEVICE_ORDER=PCI_BUS_ID`,
+so CUDA numbers GPUs as `nvidia-smi` does.
 
 ### Owners
 
@@ -170,6 +179,103 @@ machine. `tshed ls --mine` / `--owner TEXT` filter the job list. Jobs from befor
 **States.** `pending` (on the server: not placed yet, or its files are being staged) → `queued` →
 `running` (⇄ `paused`) → `done` | `error` | `timeout` | `oom` | `stalled` | `lost` | `cancelled`.
 `lost` means the job's watchdog died (kill -9, reboot); a retry, if allowed, starts it again.
+
+## Claims: cores, RAM, GPUs
+
+A job claims cores (`-c`), RAM (`-m`) and GPUs (`-g`, `--vram`). A host starts it only once all of them are
+free; until then it stays queued.
+
+- **Cores** are pinned with `taskset`, placed by the CPU's layout: see [Which cores](#which-cores).
+  **RAM** is reserved against the host's physical memory (config `mem` overrides that). A job without `-m`
+  claims no RAM.
+- **GPUs.** `-g 1` is one GPU nobody else claims; `-g 2` is two; `-g 0.25` is a quarter of one, which
+  other quarter-jobs may share. `--vram 6G` claims that much memory on each of its GPUs; without it a job
+  claims the same share of the GPU's memory as of its compute (all of it for whole GPUs). Shares are
+  placed first-fit by GPU index, so small claims pack together and whole GPUs stay whole. A job with
+  GPUs never runs on a host without one; `submit` refuses a claim no host can meet.
+- **Order.** Strict priority, FIFO within a priority, as before. A job that does not fit is never overtaken
+  on what it waits for. If the head of the queue wants four GPUs and three are free, no job behind it gets
+  a GPU until it starts (change its priority if that is not what you want). It also holds back the free
+  cores and RAM it needs; jobs behind it may still use cores and RAM beyond that.
+- **Paused** jobs keep their RAM and GPUs (their memory stays allocated) and give back their cores.
+- **Forced** jobs (`edit --force`) take what they need at once, sharing busy cores and GPUs if they must.
+
+### Which cores
+
+`-c` counts logical CPUs, and a host picks them from its CPU layout (Linux sysfs, re-read every 10 minutes).
+Each CPU has a physical core (SMT threads share one), an L3 group (the CPUs sharing a last-level cache: an
+AMD CCX or CCD, an Intel cluster) and a speed rank (`amd_pstate`'s preferred-core ranking, else
+`cpu_capacity`, else the top clock). Greedily, with no solver, a job gets:
+
+1. **Wholly free physical cores** first: no two jobs share a core's threads while a whole core is free anywhere.
+2. **As few L3 groups as possible.** A job that fits in one group gets the group it fills most tightly, so
+   big groups stay free for big jobs. A job larger than any group takes whole groups first, then the rest.
+3. **Then its own cores' second threads**, then, last, threads on cores another job uses.
+
+GPU jobs get the fastest group that fits, near their GPU (the GPU's PCIe-local CPUs on multi-socket or
+NPS machines), so feeder threads run on fast cores with an L3 of their own. CPU-only jobs on a host with
+claimable GPUs fill from the slow end and leave the fast cores to GPU jobs; elsewhere they take the fast
+cores first. On bigd (Ryzen 9 3900X: four CCXs of 3 cores, threads N and N+12), an idle host puts a
+`-g 1 -c 2` job on CPUs 0,1 (the fastest CCX), a `-c 3` job on 9-11 (one whole CCX at the slow end), and twelve
+`-c 1` jobs on twelve different physical cores. Where sysfs says nothing (macOS, VMs that hide their
+topology) every CPU counts as its own core in one group: CPUs in order, as before. `hosts --json` has
+`topology`: the L3 groups and whether cores have SMT siblings.
+
+### Fitting claims to use
+
+Most jobs claim more than they use: a CPU-starved CUDA job reaches 25% of its GPU, a job that claimed
+5 GB settles at 1 GB. Each host's agent samples every running job every 2 s: CPU (cores busy), RSS and,
+per GPU, utilization and VRAM (`nvidia-smi`, per process). After 120 s it cuts every claim larger than
+`peak / (1 - slack)` down to that; `slack` is 0.2 by default (host config `slack`).
+
+| claim | fitted to | step |
+|---|---|---|
+| cores | `peak cores busy / (1 - slack)`, at least 1. The job keeps one thread per physical core before both threads of one, in the L3 groups it used most, busiest cores first; every thread of the job is re-pinned (`sched_setaffinity`, as `taskset -acp`) | 1 CPU |
+| RAM | `peak (RSS + swapped-out) / (1 - slack)`: swapped pages are still held (with zram, in RAM) | 100 MB |
+| GPU share | `peak utilization / (1 - slack)`, per GPU | 5% |
+| VRAM | `peak VRAM / (1 - slack)`, per GPU | 100 MB |
+
+All are rounded up. Then the peaks are reset and sampling resumes after 10 s (threads migrate, caches
+refill), for the next 120 s window. Each change is an `adjust` event (`OnJobAdjusted`: `before`, `after`
+and the `peak` it was fitted to). The `CPU`, `GPU` and `Mem` columns show the current claims, amber where
+fitted below what was asked; `show` prints both.
+
+- Cores and GPU share only shrink. RAM and VRAM claims grow back as soon as use passes them, up to what
+  was submitted, so the host never counts on memory a job holds.
+- The `-m` RSS limit stays as submitted: fitting frees the claim for scheduling, not the job's headroom.
+- GPU claims are fitted only once the job is seen using its GPU (256 MB of VRAM or any utilization), so a
+  job that preprocesses on the CPU first keeps its GPU. CPU claims have no such guard: a job that runs
+  single-threaded for its first two minutes keeps 2 cores afterwards. Use `--no-adjust` for jobs whose use
+  comes in phases.
+- GPU utilization is per process (`nvidia-smi pmon`), so other work on the GPU, inside tshed or not, is
+  not charged to the job; a process `pmon` shows `-` for ran no kernel in its sample. Where `nvidia-smi`
+  cannot see the job's pids (inside a container) or reports no per-process SM %, the GPU's own readings
+  stand in, but only for a job alone on its GPU with nothing else loading it; otherwise the share is not fitted.
+- A retry starts again from the submitted claims. A resumed job gets its submitted number of cores back;
+  its RAM and GPU claims, held while it was paused, stay as fitted.
+
+### Host scores
+
+A job without `-H` goes to the best host first: the live host with the highest score that has room for it
+now, else the next best, and so on. GPU jobs go by GPU score, all others by CPU score. Hosts without a
+score come after those with one, by idle cores (GPU jobs: free GPU share). If no host has room, the job
+waits on the server, and so do the jobs behind it.
+
+```sh
+tshed score --from ~/git/stdbench/bench-results   # import from stdbench's clpeak runs
+tshed score                                       # the scores, and the order jobs try hosts in
+tshed score mina-llama --cpu 41                   # set one by hand (0 = none); --clear drops both
+```
+
+- **CPU score:** the speed of one claimed CPU, from clpeak's newest complete run: the geometric mean of its
+  integer, string-scan, CRC32C and UTF-8 rates per logical CPU, in G/s. clpeak's fp32 CPU kernels are left out
+  because they miss Apple cores' SIMD and would put an M4 Pro below a Zen 2.
+- **GPU score:** the host's best GPU, as the geometric mean of fp32 TFLOPS and memory bandwidth in 100 GB/s
+  (RTX 4070 Ti SUPER 12.7, RTX 2070 SUPER 6.3). It matters only on hosts with claimable GPUs.
+- A run made with a different CPU count than the host has now (a benchmark in a smaller container) is not
+  imported for the CPU score: rerun it, or set the score by hand. Scores set by hand survive re-imports for
+  hosts that have no usable run.
+- Scores live in the server's registry (`server.db`), not on the hosts.
 
 ## Progress and stalls
 
@@ -333,7 +439,7 @@ Put a `hooks.py` in `~/.tinyshed/` on the server (runs when the server learns of
 host (runs when the event happens, even while the server is unreachable). Define any of:
 
 `OnJobQueued` `OnJobStart` `OnJobProgress` `OnJobPaused` `OnJobResumed` `OnJobCompletion` `OnJobError`
-`OnJobTimeout` `OnJobOOM` `OnJobStalled` `OnJobLost` `OnJobCancel`, `OnHostDown` `OnHostUp` (server),
+`OnJobTimeout` `OnJobOOM` `OnJobStalled` `OnJobLost` `OnJobCancel` `OnJobAdjusted`, `OnHostDown` `OnHostUp` (server),
 `OnCriticalDisk` (host: `~` or `/tmp` dropped under 2 GB free; `data` maps the low paths to their
 free GB, plus `min_gb`; if the disk is too full to log the event, the host hook still runs with
 `eid` None and the server never hears of it), `OnEvent` (everything).
@@ -366,12 +472,13 @@ hooks need something listening: `serve`, the dashboard, or phone-home.
   events to the server over ssh as they happen, backing off while it is unreachable. Push and pull
   overlap safely. A host's key can be restricted with a forced command in `authorized_keys`; the exact
   command is in the host's `config.json`.
-- **Scheduling.** On a host: highest priority first, FIFO within a priority, strictly, so a big job at
-  the head is never overtaken by smaller ones. Unpinned jobs wait on the server and go, highest priority
-  first, to the live host with the most idle cores.
+- **Scheduling.** On a host: highest priority first, FIFO within a priority, strictly, over cores, RAM and
+  GPUs, so a big job at the head is never overtaken on what it waits for (see [Claims](#claims-cores-ram-gpus)).
+  Unpinned jobs wait on the server and go, highest priority first, to the best-scoring live host with room
+  for them (see [Host scores](#host-scores)).
 - **Watchdog.** Each running job has its own watchdog process, detached from the agent so agents can be
   upgraded mid-job. The watchdog:
-  - pins the job with `taskset` and captures its output to `~/.tinyshed/logs/ID.log`;
+  - pins the job with `taskset`, gives it its GPUs and captures its output to `~/.tinyshed/logs/ID.log`;
   - enforces the timeout, the memory limit (summed RSS of the process tree, polled every 2 s) and the
     stall limit;
   - kills the whole process group when a limit is hit.
@@ -395,14 +502,15 @@ hooks need something listening: `serve`, the dashboard, or phone-home.
   flagged.
 - **`Cores`** is idle / total.
 - **`Mem free`** is whole-machine available / total.
-- **`Used/Res`** is running jobs' live RSS over the sum of their `-m` limits. It is red if used exceeds
-  reserved, and `?` if a job set no limit.
+- **`Used/Res`** is running jobs' live RSS over the sum of their RAM claims (`-m`, or what it was fitted to).
+  It is red if used exceeds reserved, and `?` if a job set no limit.
 - **`Disk free`** is free GB on the host's home and `/tmp` (`451~ 42t`, `12T` from 10 000 GB); a path that cannot be
   stat'ed is left out (`18~`), an empty cell means neither was reported. Red, plus an `OnCriticalDisk`
   event per host, while either stays under 2 GB (re-warned hourly until it recovers).
 - **`GPU`** is NVIDIA utilization and memory used / total per GPU, on one line, in index order. One GPU
   also shows its index (`88% 9.1/12G :0`); several are separated by `|` (`88% 9.1/12G | 0% 0.3/24G`),
-  and the column widens to fit the host with the most. Models and power per GPU are in `hosts --json`.
+  and the column widens to fit the host with the most. Models, power and what jobs claim (`claimed` share,
+  `vram_claimed` MB) per GPU are in `hosts --json`.
 - **`Freq`** is the mean clock of tshed's cores (`-` on Apple Silicon).
 - **`Notes`** carries the host's power draw (see Power below), version mismatches (run `tshed install`)
   and warnings.
@@ -422,8 +530,10 @@ sudo chmod o+r /sys/class/powercap/intel-rapl:*/energy_uj     # now; the rule co
 This reverts a mitigation for the PLATYPUS power side channel (CVE-2020-8694): fine on single-user boxes,
 not on shared ones. `hosts --json` has the parts as `power_parts` (`cpu`, `gpu` or `system`).
 
-**Config.** `~/.tinyshed/config.json` on each host holds `name`, `cores` (the CPU set jobs may use) and
-`home` (the phone-home command). Set it with `install --cores …`, `tshed config --edit`,
+**Config.** `~/.tinyshed/config.json` on each host holds `name`, `cores` (the CPU set jobs may use),
+`home` (the phone-home command) and, optionally, `gpus` (the GPU indices jobs may claim, `"0-1"`; `""` = none;
+default all), `mem` (RAM claims may add up to, `"120G"`; default physical memory) and `slack` (headroom of
+fitted claims, default 0.2). Set it with `install --cores …`, `tshed config --edit`,
 `tshed config --host NAME --edit` or the dashboard's `C`. Don't rename a host by hand: the name must
 match the server's registry.
 
@@ -467,7 +577,10 @@ they are used exactly as given.
 
 - The memory limit is enforced by polling, not cgroups: a fast allocator can overshoot before it is
   killed. Shared pages are counted once per process.
-- GPUs are reported (`nvidia-smi`) but not allocated: pass `-e CUDA_VISIBLE_DEVICES=…`.
+- GPU claims cover NVIDIA GPUs (`nvidia-smi`). A job without `-g` is not stopped from using a GPU: it just
+  claims none, so tshed may put a `-g` job on the same GPU.
+- Claims are bookkeeping plus `CUDA_VISIBLE_DEVICES`, not cgroups or MPS: a job that uses more GPU or VRAM
+  than it claimed slows down or out-of-memories its neighbours.
 - Core pinning (`taskset`) and process-tree RSS via `/proc` are Linux features. On macOS hosts jobs
   run unpinned, and RSS comes from `ps`, which compressed memory makes unreliable.
 - Attach (`A`, `O`, `logs -f`) uses mosh only where a probe shows its UDP range (60000-61000)

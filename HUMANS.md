@@ -92,22 +92,41 @@ shell: if you need conda or modules, write `bash -lc '…'`, or use `-C dir` and
 ## 3. Limits, priorities, retries
 
 ```sh
-tshed submit -n train -H gpu1 -p 10 -c 8 -m 32G -t 12h -r 2 -C ~/proj -e CUDA_VISIBLE_DEVICES=0 -- python train.py
+tshed submit -n train -H gpu1 -p 10 -c 8 -m 32G -g 1 -t 12h -r 2 -C ~/proj -- python train.py
 ```
 
 | flag | effect |
 |---|---|
 | `-p 10` | priority; higher runs first, FIFO among equals |
 | `-c 8` | reserves 8 cores and pins the job to them with `taskset` |
-| `-m 32G` | kills the job if its whole process tree exceeds 32 GB RSS → `oom` |
+| `-m 32G` | reserves 32 GB of the host's RAM, and kills the job if its whole process tree exceeds 32 GB RSS → `oom` |
+| `-g 1` | reserves one GPU for it alone (`CUDA_VISIBLE_DEVICES` is set); `-g 2` two, `-g 0.25` a quarter of one that others may share; `--vram 6G` reserves GPU memory per GPU |
 | `-t 12h` | kills it after 12 hours → `timeout` |
 | `-x 6h` | expected runtime: the timeout becomes 12h unless `-t` says otherwise, and you get an ETA |
 | `--stall 15m` | kills it after 15 minutes without a progress checkpoint → `stalled` |
 | `-r 2` | up to 2 retries with doubling backoff, by default only after `error` or `lost` |
 
-A host starts jobs strictly in priority order as cores free up. A big job at the head of the queue
-is not overtaken by small ones, so it cannot starve. Change your mind later, while the job is still
-waiting:
+A host starts jobs strictly in priority order as cores, RAM and GPUs free up. A big job at the head of
+the queue is not overtaken by small ones on what it waits for, so it cannot starve: while it waits for
+GPUs, no job behind it gets one. Jobs that need only cores may still use the cores it does not need.
+
+Claims are usually generous, so after two minutes the host fits them to what the job really used, with
+20% headroom: a job given 8 cores that keeps 1.5 busy drops to 2, one that claimed 32 GB and peaks at 4 GB
+drops to 5 GB. Memory claims grow back if use grows. The `CPU`, `GPU` and `Mem` columns turn amber when a
+claim was fitted; `--no-adjust` keeps the claims as submitted.
+
+Which cores a job gets follows the CPU's layout: its own physical cores (no other job on their second
+thread) inside one L3 cache group (an AMD CCX) where it fits. GPU jobs get the fastest cores, CPU-only jobs
+on a GPU box the slowest, so GPU feeders are not starved.
+
+Without `-H`, a job goes to the best box that has room, judged by benchmark scores:
+
+```sh
+tshed score --from ~/git/stdbench/bench-results   # CPU and GPU score per host, from clpeak runs
+tshed score                                       # shows them and the order jobs try hosts in
+```
+
+Change your mind later, while the job is still waiting:
 
 ```sh
 tshed edit train -p 50          # new priority
@@ -267,7 +286,7 @@ def OnHostDown(ev):
 ```
 
 Available: `OnJobQueued OnJobStart OnJobCompletion OnJobError OnJobTimeout OnJobOOM OnJobStalled OnJobLost
-OnJobCancel OnJobProgress OnJobPaused OnJobResumed OnHostDown OnHostUp OnCriticalDisk OnEvent`. Anything a hook prints, and any traceback, lands in
+OnJobCancel OnJobProgress OnJobPaused OnJobResumed OnJobAdjusted OnHostDown OnHostUp OnCriticalDisk OnEvent`. Anything a hook prints, and any traceback, lands in
 `~/.tinyshed/hooks.log`. The same file on a *host* runs there, at the moment the event happens, even
 when the server is unreachable. Server hooks run when the server learns of the event — so something
 must be listening: `tshed serve`, the TUI, or phone-home.
@@ -299,7 +318,7 @@ delivered and the server replays everything it missed — your hooks fire then, 
 |---|---|
 | server `~/.tinyshed/server.db` | mirror of all jobs, hosts, ingested events |
 | host `~/.tinyshed/host.db` | that host's queue and event log (the source of truth) |
-| host `~/.tinyshed/config.json` | `name`, `cores`, `home`; edit with `tshed config --edit [--host NAME]` |
+| host `~/.tinyshed/config.json` | `name`, `cores`, `home`, optional `gpus`, `mem`, `slack`; edit with `tshed config --edit [--host NAME]` |
 | host `~/.tinyshed/logs/ID.log` | live output; becomes `ID.log.zst` when the job is final |
 | host `~/.tinyshed/agent.log` | agent and watchdog diagnostics |
 | `~/.tinyshed/hooks.py`, `hooks.log` | callbacks and their output |

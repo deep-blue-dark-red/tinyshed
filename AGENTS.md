@@ -35,6 +35,14 @@ changing the code.
 - **Job state changes go through `transition`/`finish`** (update + event in one transaction). Claims
   are conditional `UPDATE … WHERE state='queued'`.
 - **Watchdog liveness = flock** on `run/ID.lock`, inherited from the agent. No pid checks.
+- **Claims** (`cores`, `mem_claim`, `gpu` on a running job) are set by `schedule` (start, resume) and changed only by
+  `set_claims` (conditional update on the old values + `adjust` event); `finish` clears them. Adjusting lives in the
+  agent, never the server: the host keeps fitting claims while the server is away.
+- **Core placement** goes through `pick_cores` (topology from `cpu_topology`, sysfs; `{}` = flat, the old in-order
+  behaviour) and shrinking through `shrink_cores`. Tests stub `cpu_topology` to `{}` in `Base`: never let a test read
+  the machine's own layout. Fixtures `BIGD`/`LLAMA` in `test_tshed.py` are the real hosts' layouts.
+- **Host scores** (`cpu_score`, `gpu_score` on the server's `hosts` rows) only order `dispatch`; registration must
+  keep updating `dest` alone so re-installs do not wipe them.
 - **Nothing is pruned; everything at rest is zstd** — except `--git`/`--push` work dirs on hosts, which are
   scratch: deleted (`clean_job`, server-driven) once the job ended and its `--pull` succeeded. Snapshots
   (server store + host mirror), logs and job records stay. Everything kept is zstd (`pack`/`unpack` for payloads, `compress_log` on

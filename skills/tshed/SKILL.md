@@ -89,7 +89,8 @@ tshed checkout ID [DIR] | --diff [--stat]
 tshed pause ID... / tshed resume ID...   # SIGSTOP + release cores / continue once cores are free
 tshed cancel ID...            tshed prio ID N
 tshed edit ID [-p N] [-H HOST|any] [--force]   # waiting jobs only: re-prioritise, move, start now
-tshed config [--host HOST]    # show config.json (cores, name, home)
+tshed config [--host HOST]    # show config.json (cores, name, home, gpus, mem, slack)
+tshed score                   # hosts' CPU/GPU scores: the order host-less jobs try them in
 ```
 
 `ls --json` fields: `id name host state prio attempt rc cmd created started ended timeout expect
@@ -103,10 +104,12 @@ attempt, pauses excluded) or `wait` (time waiting so far).
 |---|---|
 | `-n NAME` | **required**: 1-16 characters, no spaces |
 | `-x 5400` | **required**: expected runtime (seconds, or `s m h d`); `-t` defaults to 2 × this |
-| `-H HOST` | pin to a host. Without it the server places the job on the live host with the most idle cores at the next sync (`wait`, `ls`, …); pin when the job needs a specific GPU, data location or machine |
+| `-H HOST` | pin to a host. Without it the server places the job on the best-scoring live host with room for it (`tshed score`: GPU score for `-g` jobs, CPU score otherwise), else the next, at the next sync (`wait`, `ls`, …); pin when the job needs a specific data location or machine |
 | `-p N` | priority, higher first (default 0) |
 | `-c N` | cores, pinned with taskset (default 1) |
-| `-m 8G` | RSS limit for the process tree → state `oom` |
+| `-m 8G` | RAM to claim (the job waits until it is free) and RSS limit for the process tree → state `oom` |
+| `-g N` · `--vram 6G` | GPUs to claim: a share of one (`0.25`, others may share the GPU) or a whole number (`1`, `2`); `--vram` per GPU (default: the same share of its memory). The job gets `CUDA_VISIBLE_DEVICES`. A queued job at the front that waits for GPUs keeps every job behind it off the GPUs |
+| `--no-adjust` | keep claims as submitted. By default, after 2 min the host shrinks cores, RAM, GPU share and VRAM claims to peak use / 0.8 (memory claims grow back with use, up to the submitted amount; `-m` stays the kill limit) |
 | `-t 12h` | runtime limit per attempt → state `timeout` |
 | `--stall DUR` | killed as `stalled` after DUR without a checkpoint, counted from start; `0` = off (default with `-x`: 2 × the expected time for the last checkpoint's progress, ≥ 10 s) |
 | `--stall-on-log` | log output also counts as a checkpoint (needs `--stall`) |
@@ -117,7 +120,7 @@ attempt, pauses excluded) or `wait` (time waiting so far).
 | `--keep-work` | keep the job's work dir on the host after it ends |
 | `--trace-lines` | record every bash process's exact line, function and command for `tshed where` (~0.1 ms per bash command) |
 | `-C DIR` | working directory on the host (default `~`; with `--git`/`--push`: relative to the repo root / work dir) |
-| `-e K=V` | env var, repeatable (e.g. `CUDA_VISIBLE_DEVICES=0`; GPUs are not allocated for you) |
+| `-e K=V` | env var, repeatable |
 
 CMD runs on the host as `bash -c` with a non-login environment: paths are the **host's** (with
 `--git`, relative paths inside the repo work); use `bash -lc '…'` when conda/modules are needed.

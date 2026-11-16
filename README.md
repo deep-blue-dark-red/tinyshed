@@ -1,4 +1,4 @@
-# tshed
+# tinyshed / tshed
 
 Simple, powerful job scheduling for a handful of machines: one file, one command, ssh in between.
 

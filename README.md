@@ -1,14 +1,33 @@
 # tshed
 
-A minimal priority-queue scheduler for long jobs: one server commanding a handful of machines over ssh.
+Simple, powerful job scheduling for a handful of machines: one file, one command, ssh in between.
 
-You have a laptop and a few boxes with cores and GPUs. tshed queues jobs on them by priority,
-gives each job its own cores, RAM and GPUs (or a share of one), fits those claims to what the job really
-uses, enforces runtime and memory limits, notices when a job stops making
-progress, retries what failed, keeps every log, and moves your code there and your results back.
-It is one file, `tshed.py` (the command is `tshed`), stdlib-only Python, with no daemon on the
-server and nothing to install on the hosts except that same file.
+You have a laptop and a few boxes with cores and GPUs. tshed queues long jobs on them by priority,
+gives each job its own cores, RAM and GPUs (or a share of one), takes back what the job does not use,
+enforces runtime and memory limits, notices when a job stops making progress, retries what failed,
+keeps every log, and moves your code there and your results back.
 
+- **One file, one command to set up.** `tshed install HOST…` copies `tshed.py` to each host and starts
+  its agent, about a second per host. It is stdlib-only Python, with no daemon on the server and nothing
+  else to install on the hosts.
+- **ssh is the transport, and nothing more.** Every server→host interaction is one idempotent `ssh` call,
+  JSON in and out, so a lost connection just means "try again". There is no broker and no protocol of
+  tshed's own: ssh already does authentication and encryption.
+- **mosh for looking in.** Following a running job's log, or opening a shell on its host, goes over mosh
+  (ssh where mosh's UDP does not get through).
+- **Cores claimed with `taskset`, placed by the CPU's layout.** Each job is pinned to cores of its own:
+  whole physical cores before SMT siblings, as few L3 cache groups as possible, the fast cores near the
+  GPU for GPU jobs. See [Which cores](#which-cores).
+- **Over-allocation is reclaimed.** Each host measures what every running job really uses (CPU, RAM, GPU
+  share, VRAM) and cuts claims larger than that down to fit, so waiting jobs get the rest. See
+  [Fitting claims to use](#fitting-claims-to-use).
+- **Strictly greedy by priority.** The highest-priority job is first in line and gets first pick of
+  whatever is free; nothing behind it takes what it is waiting for. See [Claims](#claims-cores-ram-gpus).
+- **Jobs that break their limits are killed.** A job over its RAM limit (`-m`, the whole process tree),
+  its runtime limit or its stall limit is terminated, process group and all, and ends as `oom`,
+  `timeout` or `stalled`: retried if you allowed it.
+- **Disk and RAM are watched.** Every host reports free disk (home and `/tmp`), free memory and each
+  job's live and peak RSS against what it reserved; a disk under 2 GB turns red and fires `OnCriticalDisk`.
 - **Hosts are authoritative.** Each host keeps its own queue and event log in sqlite and keeps
   scheduling, retrying and logging while the server is unreachable; the server catches up later.
 - **Expected runtime and progress.** Every job can declare how long it should take (`-x`; the timeout
@@ -17,7 +36,13 @@ server and nothing to install on the hosts except that same file.
   edits included), `--pull` copies its outputs into local folders when it ends.
 - **Inspectable.** `tshed where` shows a running job's process tree, the line each bash script is on
   and python stacks; `grep` searches every log on every host; `stats` gives runtimes per job name.
-- **A dashboard** with type-to-filter, multi-select, pause/resume, live logs, mosh attach and themes.
+- **Tested.** 132 unit tests in one stdlib file, `./run_tests.sh`, done in under two seconds: no ssh, no
+  daemons, never your live queue. See [Development](#development).
+- **A dashboard** with type-to-filter, multi-select, pause/resume, live logs, attach and themes. It is
+  pure Python like the rest (no curses, just escape codes) and answers a key in 3-4 ms. The mouse works
+  too: the wheel scrolls, a click selects, a second click opens the job, ctrl-click marks it.
+
+![The dashboard: hosts on top, jobs below](screenshots/main.png)
 
 ```
 server (your machine)                   host (each)
@@ -47,6 +72,38 @@ tshed completion fish > ~/.config/fish/completions/tshed.fish   # or zsh / bash
 ```
 
 `HUMANS.md` is a step-by-step tutorial. `skills/tshed/SKILL.md` teaches coding agents to use it.
+
+## Setting up hosts
+
+A host is any machine the server can ssh into. There is nothing to install on it by hand except zstd.
+
+1. **ssh without a password.** `ssh gpu1 true` must work from the server with no prompt: tshed runs ssh
+   in batch mode. `ssh-copy-id gpu1` if it does not; aliases, users and ports from `~/.ssh/config` apply.
+2. **Python ≥ 3.12 and zstd on the host.** `python3` on its `PATH`; before Python 3.14 also the `zstd`
+   package (`apt install zstd`, `pacman -S zstd`) or `pip install pyzstd`.
+3. **Install from the server:**
+
+   ```sh
+   tshed install gpu1                         # the ssh destination is also the host's name
+   tshed install gpu1=gpu1.local,gpu1         # NAME=DEST; alternatives are tried in order (LAN, then VPN)
+   tshed install big=me@big --cores 0-15      # jobs may use only these cores
+   tshed install gpu1 gpu2 --home me@laptop   # hosts push events back to the server (phone home)
+   ```
+
+   This checks the host, copies `tshed.py` to `~/.tinyshed/tinyshed.py`, starts the agent, makes it start
+   at boot (crontab `@reboot`, else a systemd user unit; `--no-boot` skips it) and registers the host on
+   the server. It prints one line per host with its version, Python, zstd, cores and anything missing
+   (`taskset`, `mosh-server`).
+4. **Check:** `tshed hosts` shows it `up` with its cores, memory, disk and GPUs.
+
+- **Upgrade:** `tshed install` with no hosts re-installs every registered host; `tshed install gpu1` one.
+  Running jobs are not disturbed, and options you leave out keep their installed value.
+- **Per-host settings** (cores, claimable GPUs, RAM, slack): `tshed config --host gpu1 --edit`. See
+  [Config](#host-columns).
+- **Remove:** `tshed uninstall gpu1` stops the agent and removes the boot entry; the host's queue and
+  logs stay unless you add `--purge`.
+- **Optional on a host:** `taskset` (core pinning), `git` and `rsync` (`--git`, `--push`, `--pull`),
+  `mosh-server` (attach), `nvidia-smi` (GPUs), `py-spy` (python stacks).
 
 ## A job, end to end
 
@@ -408,7 +465,11 @@ delivered when the host comes back.
 
 `tshed` with no arguments opens a full-screen dashboard of hosts and jobs. It redraws atomically
 (synchronized frames), takes mouse wheel and clicks, and filters as you type lowercase letters
-(`Esc` or `Ctrl-U` clears). Capital letters are commands:
+(`Esc` or `Ctrl-U` clears):
+
+![Typing `running` narrows 501 jobs to the two that are running](screenshots/fuz.png)
+
+Capital letters are commands:
 
 | key | |
 |---|---|
@@ -424,6 +485,10 @@ delivered when the host comes back.
 | `H` `R` `C` | hide finished jobs / refresh / edit this machine's config |
 | `T` `B` `D` | next theme / more / less contrast |
 | `Q`, `Esc` | quit (`Esc` first clears the filter, then the marks) |
+
+`Enter` opens a job: its state, claims as fitted and as asked, progress, owner and command, above its live log.
+
+![Job detail with its live log](screenshots/log.png)
 
 With jobs marked, `E` reruns all of them and asks for a host. Enter keeps each job's own host;
 `any` or a host name also work. `K` cancels them all, `P` re-prioritizes the waiting ones, and `Z`
@@ -592,8 +657,18 @@ they are used exactly as given.
 
 ## Development
 
-Unit tests: `./run_tests.sh` (stdlib unittest, under a second, each test in its own temporary home;
-`-k PATTERN` for a subset). Agents, watchdogs and ssh are exercised against fake hosts on one machine.
+**Unit tests** live in `test_tshed.py` (stdlib `unittest`, nothing to install):
+
+```sh
+./run_tests.sh                 # all 132, verbose, under two seconds
+./run_tests.sh -k Ingest       # only tests whose name contains Ingest; any unittest option works
+```
+
+They cover the parsers, the host queue (rpc idempotency, retries, scheduling, claims, core placement),
+server ingest and dispatch, row rendering and the cli. Each test gets its own temporary `TINYSHED_HOME`,
+and nothing starts a daemon or opens an ssh connection.
+
+**Agents, watchdogs and ssh** are not unit-tested: exercise them against fake hosts on one machine.
 Never point a test at your real `~/.tinyshed`:
 
 ```sh

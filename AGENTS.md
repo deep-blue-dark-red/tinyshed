@@ -4,20 +4,20 @@ Priority-queue scheduler for long jobs: one server, N hosts, ssh between. Everyt
 `tshed.py`; the same file runs on the server and is copied to each host. The user-facing command
 is `tshed` (a symlink to it). Never call it `ts`: that name belongs to TypeScript tooling.
 
-To *use* tshed (submit/monitor jobs) read `skills/tshed/SKILL.md` instead. This file is for
+To _use_ tshed (submit/monitor jobs) read `skills/tshed/SKILL.md` instead. This file is for
 changing the code.
 
 ## Files
 
-| file | what |
-|---|---|
-| `tshed.py` | all code; sections in order: shared (sqlite, hooks, zstd) → host state → watchdog → agent → rpc/setup → server state/transport → server ops → tables + TUI → cli |
-| `README.md` | reference: design, commands, hooks, limits |
-| `HUMANS.md` | tutorial |
-| `skills/tshed/SKILL.md` | agent usage skill |
-| `btop-themes/` | btop `.theme` files matching the built-in `tailwind-*` themes (for btop itself; tshed does not read them) |
-| `IDEAS_HEAP.md` | considered, not scheduled (binary packaging). Do not build from it unasked |
-| `test_tshed.py` | unit tests (stdlib unittest; temp `TINYSHED_HOME`, no ssh, no daemons). Not installed on hosts |
+| file                    | what                                                                                                                                                             |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tshed.py`              | all code; sections in order: shared (sqlite, hooks, zstd) → host state → watchdog → agent → rpc/setup → server state/transport → server ops → tables + TUI → cli |
+| `README.md`             | reference: design, commands, hooks, limits                                                                                                                       |
+| `HUMANS.md`             | tutorial                                                                                                                                                         |
+| `skills/tshed/SKILL.md` | agent usage skill                                                                                                                                                |
+| `btop-themes/`          | btop `.theme` files matching the built-in `tailwind-*` themes (for btop itself; tshed does not read them)                                                        |
+| `IDEAS_HEAP.md`         | considered, not scheduled (binary packaging). Do not build from it unasked                                                                                       |
+| `test_tshed.py`         | unit tests (stdlib unittest; temp `TINYSHED_HOME`, no ssh, no daemons). Not installed on hosts                                                                   |
 
 ## Invariants — do not break
 
